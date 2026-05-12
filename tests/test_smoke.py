@@ -127,3 +127,32 @@ def test_smoke_a2c_halfcheetah():
     metrics = _train(cfg)
     assert isinstance(metrics, dict)
     assert len(metrics) > 0
+
+
+
+#
+# MFEC
+#
+
+def _mfec_pong_overrides() -> list[str]:
+    return [
+        *BASE_OVERRIDES,
+        "trainer.total_frames=500",
+        "trainer.log_every_n_steps=100",
+        "algorithm.frames_per_batch=100",
+        "algorithm.annealing_frames=500",
+        "algorithm.buffer_size=500",
+        "algorithm.k=2",        # fewer neighbors so lookup works with tiny buffer
+    ]
+
+
+def test_smoke_mfec_pong():
+    """MFEC on ALE/Pong-v5: random projection, QEC tables, MC returns."""
+    pytest.importorskip("ale_py")
+    cfg = load_experiment_cfg("mfec/pong", _mfec_pong_overrides())
+    from src.train import _train
+
+    metrics = _train(cfg)
+    assert isinstance(metrics, dict)
+    assert "train/epsilon" in metrics
+    assert "train/qec_size" in metrics
