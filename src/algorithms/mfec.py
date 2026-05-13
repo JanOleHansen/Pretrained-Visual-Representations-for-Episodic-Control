@@ -160,52 +160,27 @@ class MFECAlgorithm(BaseAlgorithm):
     # 
 
     def setup(self, make_env: Callable[[], EnvBase]) -> None:
-        """Build the encoder, QEC memory, and TorchRL policy wrappers.
-
-        We spin up a temporary proof environment to read the observation
-        shape and number of actions, then close it immediately.  The algorithm
-        does not keep a long-lived reference to any environment.
-        """
-        #   Inspect environment specs
         proof_env = make_env()
-        # obs_shape is typically (C, H, W), e.g. (4, 84, 84) for a stack of four grey-scale Atari frames.
         obs_shape = tuple(proof_env.observation_spec[self.obs_key].shape)
         action_spec = proof_env.action_spec
-        # Total number of discrete actions available (e.g. 18 for Atari).
         num_actions = int(action_spec.space.n)
-        proof_env.close()  # done with the proof environment
 
-        """ Random projection matrix
-        We compress high-dimensional pixel frames into a state_dim-vector by
-        multiplying the flattened, channel-averaged image with a fixed random
-        Gaussian matrix.  "Fixed" means we never update these weights — there
-        is no gradient-based learning in MFEC.
-        Why random projections?  By the Johnson–Lindenstrauss lemma, a random
-        Gaussian matrix approximately preserves pairwise distances, which is
-        all we need for kNN lookups to be meaningful."""
-
-        obs_flat_dim = int(np.prod(obs_shape[1:]))  # H * W (channels are averaged away)
+        obs_flat_dim = int(np.prod(obs_shape))
+        print(f"[MFEC setup] obs_shape={obs_shape}, obs_flat_dim={obs_flat_dim}")
         self.projection = np.random.randn(obs_flat_dim, self.state_dim)
-        # Normalise each column to unit length so no output dimension dominates the Euclidean distance used by the kNN search.
         self.projection /= np.linalg.norm(self.projection, axis=0)
 
-        #   Episodic memory (QEC)
-        # QEC holds one ActionBuffer per discrete action.  Each buffer is an independent nearest-neighbour table of (state_embedding → return).
         self.qec = QEC(range(num_actions), self.buffer_size, self.k)
         self._num_actions = num_actions
 
-        #   Policy wrappers
-        # QECPolicy is an nn.Module that converts a batch of pixel observations into a (batch, num_actions) matrix of Q-value estimates.
         self.qec_policy = QECPolicy(self.qec, self.projection, num_actions)
 
-        # QValueActor wraps QECPolicy so that TorchRL can call it through its TensorDict interface: it reads self.obs_key, calls the module, and writes the argmax action back into the TensorDict.
         self.q_actor = QValueActor(
             module=self.qec_policy,
             spec=action_spec,
             in_keys=[self.obs_key],
         )
 
-        # EGreedyModule replaces the greedy action with a uniformly random one with probability ε.  ε is linearly annealed from eps_start to eps_end over annealing_frames environment steps.
         self.greedy_module = EGreedyModule(
             spec=action_spec,
             eps_init=self.eps_start,
@@ -213,7 +188,6 @@ class MFECAlgorithm(BaseAlgorithm):
             annealing_num_steps=self.annealing_frames,
         )
 
-        # The exploration policy chains the actor (greedy argmax) and the ε-noise module (random override with probability ε).
         self._explore_policy = TensorDictSequential(self.q_actor, self.greedy_module)
 
     #
@@ -387,64 +361,22 @@ class QECPolicy(nn.Module):
         self.num_actions = num_actions
 
     def embed(self, obs: torch.Tensor) -> np.ndarray:
-        """Project a batch of pixel observations to state embeddings.
-
-        Pipeline:
-          1. Average over the channel axis (C) to collapse colour/frame-stack
-             into a single spatial map — shape goes from (B, C, H, W) to (B, H, W).
-          2. Flatten (H, W) into a single vector of length H*W — shape (B, H*W).
-          3. Multiply by the random projection matrix:
-             (B, H*W) @ (H*W, state_dim) → (B, state_dim).
-
-        Parameters
-        ----------
-        obs : torch.Tensor, shape (B, C, H, W)
-
-        Returns
-        -------
-        np.ndarray, shape (B, state_dim)
-        """
-        obs_np = obs.cpu().numpy()                           # (B, C, H, W)
-        # Average over channel axis → (B, H, W); reshape → (B, H*W).
-        flat = obs_np.mean(axis=1).reshape(len(obs_np), -1)  # (B, H*W)
-        # Linear projection: result is (B, state_dim).
+        obs_np = obs.cpu().numpy()
+        # Flatten leading dims; keep last C*H*W as the feature vector
+        flat = obs_np.reshape(-1, self.projection.shape[0])
         return flat @ self.projection
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """Return a (B, num_actions) tensor of Q-value estimates.
-
-        For every observation in the batch and every action, we query the QEC
-        memory.  The result is consumed by QValueActor, which selects argmax.
-
-        Parameters
-        ----------
-        obs : torch.Tensor, shape (B, C, H, W)
-
-        Returns
-        -------
-        torch.Tensor, shape (B, num_actions), dtype float32
-        """
-        states = self.embed(obs)  # (B, state_dim) numpy array
-
-        # Build the full Q-matrix by calling estimate() for every (state, action)
-        # combination.  This is a Python-level loop, acceptable because the QEC
-        # lookup is the computational bottleneck, not Python overhead.
+        states = self.embed(obs)  # (N, state_dim) where N = product of leading dims
         q_values = np.array(
-            [
-                [self.qec.estimate(state, action) for action in range(self.num_actions)]
-                for state in states
-            ],
+            [[self.qec.estimate(s, a) for a in range(self.num_actions)] for s in states],
             dtype=np.float32,
-        )  # (B, num_actions)
-
-        # estimate() returns +inf for under-explored (state, action) pairs to
-        # signal optimism.  We clamp inf to a large finite value so that argmax
-        # behaves consistently across platforms (numpy argmax is stable; torch
-        # argmax with inf can produce NaN gradients on some backends).
+        )
         q_values = np.where(np.isinf(q_values), 1e9, q_values)
-
-        return torch.tensor(q_values, dtype=torch.float32, device=obs.device)
-
+        out = torch.tensor(q_values, dtype=torch.float32, device=obs.device)
+        # Reshape to match input batch dims: leading dims of obs, plus num_actions
+        leading = obs.shape[:-3] if obs.dim() >= 3 else ()
+        return out.reshape(*leading, self.num_actions)
 
 # ---------------------------------------------------------------------------
 # Episodic memory

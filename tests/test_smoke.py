@@ -139,6 +139,7 @@ def _mfec_pong_overrides() -> list[str]:
         *BASE_OVERRIDES,
         "trainer.total_frames=500",
         "trainer.log_every_n_steps=100",
+        "trainer.num_envs=1",
         "algorithm.frames_per_batch=100",
         "algorithm.annealing_frames=500",
         "algorithm.buffer_size=500",
