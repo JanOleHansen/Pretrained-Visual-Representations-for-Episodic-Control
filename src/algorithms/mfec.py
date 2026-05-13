@@ -166,7 +166,6 @@ class MFECAlgorithm(BaseAlgorithm):
         num_actions = int(action_spec.space.n)
 
         obs_flat_dim = int(np.prod(obs_shape))
-        print(f"[MFEC setup] obs_shape={obs_shape}, obs_flat_dim={obs_flat_dim}")
         self.projection = np.random.randn(obs_flat_dim, self.state_dim)
         self.projection /= np.linalg.norm(self.projection, axis=0)
 
