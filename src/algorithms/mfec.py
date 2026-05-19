@@ -165,7 +165,9 @@ class MFECAlgorithm(BaseAlgorithm):
         action_spec = proof_env.action_spec
         num_actions = int(action_spec.space.n)
 
-        obs_flat_dim = int(np.prod(obs_shape))
+        # Strip any leading ParallelEnv batch dims — keep only (C, H, W)
+        sample_shape = obs_shape[-3:]
+        obs_flat_dim = int(np.prod(sample_shape))
         self.projection = np.random.randn(obs_flat_dim, self.state_dim)
         self.projection /= np.linalg.norm(self.projection, axis=0)
 
@@ -366,16 +368,19 @@ class QECPolicy(nn.Module):
         return flat @ self.projection
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        states = self.embed(obs)  # (N, state_dim) where N = product of leading dims
+        states = self.embed(obs)  # (N, state_dim)
         q_values = np.array(
             [[self.qec.estimate(s, a) for a in range(self.num_actions)] for s in states],
             dtype=np.float32,
         )
         q_values = np.where(np.isinf(q_values), 1e9, q_values)
         out = torch.tensor(q_values, dtype=torch.float32, device=obs.device)
-        # Reshape to match input batch dims: leading dims of obs, plus num_actions
-        leading = obs.shape[:-3] if obs.dim() >= 3 else ()
-        return out.reshape(*leading, self.num_actions)
+        # Reshape back to (*leading_dims, num_actions)
+        leading = obs.shape[:-3]
+        if leading:
+            return out.reshape(*leading, self.num_actions)
+        else:
+            return out.squeeze(0)
 
 # ---------------------------------------------------------------------------
 # Episodic memory
