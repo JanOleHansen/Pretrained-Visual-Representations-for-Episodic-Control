@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - override /algorithm: mfec_atari
+  - override /environment: breakout_train
+  - override /environment@eval_environment: breakout_eval
+  - _self_
+
+trainer:
+  total_frames: 40_000_000
+  accelerator: cpu
+  num_envs: 1

@@ -74,6 +74,7 @@ function UpdateMemory(s, a, G, time):
 
 from __future__ import annotations
 from typing import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -216,6 +217,7 @@ class MFECAlgorithm(BaseAlgorithm):
         dict
             Scalar metrics logged by the trainer (epsilon, average buffer fill).
         """
+
         # Flatten any leading batch/time axes so we have a single sequence of transitions indexed by t = 0 … n-1.
         batch = batch.reshape(-1)
         n = batch.numel()  # total number of transitions
@@ -269,6 +271,7 @@ class MFECAlgorithm(BaseAlgorithm):
 
                 episode_start = t + 1  # next episode begins after this done flag
 
+        self.qec.rebuild_trees()  # one rebuild per step() call instead of per insert
         return {
             # Current ε value — tells us how often the agent acts randomly.
             "train/epsilon": float(self.greedy_module.eps),
@@ -367,20 +370,27 @@ class QECPolicy(nn.Module):
         flat = obs_np.reshape(-1, self.projection.shape[0])
         return flat @ self.projection
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        states = self.embed(obs)  # (N, state_dim)
-        q_values = np.array(
-            [[self.qec.estimate(s, a) for a in range(self.num_actions)] for s in states],
-            dtype=np.float32,
-        )
+    def forward(self, obs):
+        states = self.embed(obs)
+        
+        def estimate_action(action):
+            return [self.qec.estimate(s, action) for s in states]
+        
+        # Query all actions in parallel
+        results = list(self.qec.executor.map(
+            estimate_action, range(self.num_actions)
+        ))
+        
+        # results shape: (num_actions, batch) → transpose to (batch, num_actions)
+        q_values = np.array(results, dtype=np.float32).T
         q_values = np.where(np.isinf(q_values), 1e9, q_values)
+        
         out = torch.tensor(q_values, dtype=torch.float32, device=obs.device)
-        # Reshape back to (*leading_dims, num_actions)
         leading = obs.shape[:-3]
         if leading:
             return out.reshape(*leading, self.num_actions)
         else:
-            return out.squeeze(0)
+            return out.squeeze(0) if out.shape[0] == 1 else out
 
 # ---------------------------------------------------------------------------
 # Episodic memory
@@ -404,6 +414,12 @@ class QEC:
         # reassignment of individual buffers.
         self.buffers = tuple(ActionBuffer(buffer_size) for _ in actions)
         self.k = k
+        self.executor = ThreadPoolExecutor(max_workers=len(self.buffers))
+
+    def rebuild_trees(self):
+            for buf in self.buffers:
+                if buf.states:
+                    buf._tree = KDTree(np.array(buf.states))
 
     def estimate(self, state: np.ndarray, action: int) -> float:
         """Estimate Q(state, action) from the episodic memory.
@@ -526,36 +542,24 @@ class ActionBuffer:
         # [1][0] gives the index array for our single query point.
         return self._tree.query([state], k=k)[1][0]
 
-    def add(self, state: np.ndarray, value: float, time: int) -> None:
-        """Append a new entry, evicting the LRU entry if at capacity.
-
-        Rebuilds the KD-tree after the structural change so that subsequent
-        find_state / find_k_nearest calls are consistent.
-        """
+    def add(self, state, value, time):
         if len(self) < self.capacity:
-            # Buffer has room — append to all three parallel lists.
             self.states.append(state)
             self.values.append(value)
             self.times.append(time)
         else:
-            # Buffer is full.  Replace the least-recently-used entry only if
-            # the incoming entry is strictly more recent (avoids thrashing when
-            # many entries share the same timestamp).
             min_time_index = int(np.argmin(self.times))
             if time > self.times[min_time_index]:
-                self.replace(state, value, time, min_time_index)
-                return  # replace() already rebuilds the tree
+                self.states[min_time_index] = state
+                self.values[min_time_index] = value
+                self.times[min_time_index] = time
+        # tree rebuild deferred!
 
-        # Rebuild the spatial index to include the newly added state.
-        self._tree = KDTree(np.array(self.states))
-
-    def replace(self, state: np.ndarray, value: float, time: int, index: int) -> None:
-        """Overwrite the entry at index in-place and rebuild the KD-tree."""
+    def replace(self, state, value, time, index):
         self.states[index] = state
         self.values[index] = value
-        self.times[index]  = time
-        # Rebuild so that future kNN queries reflect the replaced entry.
-        self._tree = KDTree(np.array(self.states))
+        self.times[index] = time
+        # tree rebuild deferred!
 
     def __len__(self) -> int:
         return len(self.states)
