@@ -2,3 +2,18 @@
 [2026-05-07 14:03:25,101][asyncio][WARNING] - socket.send() raised exception.
 [2026-05-08 08:00:19,089][asyncio][WARNING] - socket.send() raised exception.
 [2026-05-08 08:00:19,090][asyncio][WARNING] - socket.send() raised exception.
+[2026-05-26 09:07:48,054][faiss.loader][INFO] - Loading faiss with AVX2 support.
+[2026-05-26 09:07:48,054][faiss.loader][INFO] - Could not load library with AVX2 support due to:
+ModuleNotFoundError("No module named 'faiss.swigfaiss_avx2'")
+[2026-05-26 09:07:48,055][faiss.loader][INFO] - Loading faiss.
+[2026-05-26 09:07:48,083][faiss.loader][INFO] - Successfully loaded faiss.
+[2026-05-26 09:08:31,285][faiss.loader][INFO] - Loading faiss with AVX2 support.
+[2026-05-26 09:08:31,285][faiss.loader][INFO] - Could not load library with AVX2 support due to:
+ModuleNotFoundError("No module named 'faiss.swigfaiss_avx2'")
+[2026-05-26 09:08:31,285][faiss.loader][INFO] - Loading faiss.
+[2026-05-26 09:08:31,315][faiss.loader][INFO] - Successfully loaded faiss.
+[2026-05-26 09:09:29,890][faiss.loader][INFO] - Loading faiss with AVX2 support.
+[2026-05-26 09:09:29,891][faiss.loader][INFO] - Could not load library with AVX2 support due to:
+ModuleNotFoundError("No module named 'faiss.swigfaiss_avx2'")
+[2026-05-26 09:09:29,892][faiss.loader][INFO] - Loading faiss.
+[2026-05-26 09:09:29,919][faiss.loader][INFO] - Successfully loaded faiss.
