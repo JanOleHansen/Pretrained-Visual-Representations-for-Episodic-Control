@@ -189,7 +189,7 @@ class MFECAlgorithm(BaseAlgorithm):
             annealing_num_steps=self.annealing_frames,
         )
 
-        self._explore_policy = TensorDictSequential(self.q_actor, self.greedy_module)
+        self._explore_policy = _SharedPolicy(self.q_actor, self.greedy_module)
 
     #
     #   Training step — no gradient updates, memory-only update
@@ -413,6 +413,21 @@ class QECPolicy(nn.Module):
             return out.reshape(*leading, self.num_actions)
         else:
             return out.squeeze(0) if out.shape[0] == 1 else out
+
+class _SharedPolicy(TensorDictSequential):
+    """TensorDictSequential that returns itself on deepcopy.
+
+    TorchRL deepcopies the explore policy when setting up the collector.
+    A full deepcopy would give the collector a fresh EGreedyModule with
+    eps=eps_init that never advances — so the collector always acts randomly.
+    Returning self ensures the single EGreedyModule is shared and advanced
+    correctly by algorithm.step().
+    """
+
+    def __deepcopy__(self, memo):
+        memo[id(self)] = self
+        return self
+
 
 # ---------------------------------------------------------------------------
 # Episodic memory
