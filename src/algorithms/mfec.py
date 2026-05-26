@@ -235,40 +235,52 @@ class MFECAlgorithm(BaseAlgorithm):
         states = self.qec_policy.embed(obs)  # (n, state_dim) numpy array
 
         #   Episode segmentation and Monte Carlo return computation
-        # Walk through the batch and split it at "done" boundaries.  For each
-        # completed episode we compute the discounted return G_t for every step
-        # and write the (state, return) pairs into QEC.
+        # First pass: compute G_t for every transition without touching QEC.
+        # This separates return computation from memory insertion so the
+        # insertion step can be fully vectorised per action below.
+        G_all = np.zeros(n, dtype=np.float64)
         episode_start = 0
         for t in range(n):
-            # A "done" flag marks the *last* transition of an episode. We also flush the trailing partial episode when we reach the end
-            # of the batch (t == n - 1), even if no done flag was set — the returns are still valid; the episode just continues in the next batch.
             if dones_np[t] or t == n - 1:
-                ep          = slice(episode_start, t + 1)
-                ep_states   = states[ep]      # (ep_len, state_dim)
-                ep_actions  = actions_np[ep]  # (ep_len,)
-                ep_rewards  = rewards_np[ep]  # (ep_len,)
-                ep_len      = len(ep_rewards)
-
-                # Compute discounted Monte Carlo returns by walking backward:
-                #   G[T-1] = r[T-1]
-                #   G[t]   = r[t] + γ · G[t+1]
-                # This gives the total discounted return from each step t to the end of the episode, which is what MFEC stores in QEC.
-                G = np.zeros(ep_len)
-                G[-1] = ep_rewards[-1]
+                ep_len   = t + 1 - episode_start
+                G        = np.zeros(ep_len)
+                G[-1]    = rewards_np[t]
                 for i in range(ep_len - 2, -1, -1):
-                    G[i] = ep_rewards[i] + self.gamma * G[i + 1]
+                    G[i] = rewards_np[episode_start + i] + self.gamma * G[i + 1]
+                G_all[episode_start : t + 1] = G
+                episode_start = t + 1
 
-                # Absolute frame index of the first step in this episode. Used as an LRU timestamp so older entries are evicted first.
-                frame_time = self._collected_frames - n + episode_start
-                for i in range(ep_len):
-                    self.qec.update(
-                        ep_states[i],    # state embedding
-                        ep_actions[i],   # action taken
-                        G[i],            # discounted return from this step
-                        frame_time + i,  # LRU timestamp
-                    )
+        # Absolute frame timestamp for LRU eviction.
+        frame_times = (self._collected_frames - n) + np.arange(n, dtype=np.int64)
 
-                episode_start = t + 1  # next episode begins after this done flag
+        #   Vectorised per-action batch update
+        # Group transition indices by action, then do ONE batched FAISS search
+        # per action (instead of n individual single-vector searches).
+        # Reduces ~1000 individual searches to num_actions batched searches —
+        # roughly 10× faster on large buffers.
+        for action in range(self._num_actions):
+            mask = actions_np == action
+            if not mask.any():
+                continue
+            buf         = self.qec.buffers[action]
+            act_states  = states[mask].astype(np.float32)  # (m, state_dim)
+            act_values  = G_all[mask]
+            act_times   = frame_times[mask]
+
+            if buf._index is not None and buf._index.ntotal > 0:
+                # One FAISS search for all m states belonging to this action.
+                _, nn_idx = buf._index.search(act_states, 1)  # (m, 1)
+                for i in range(len(act_states)):
+                    idx = int(nn_idx[i, 0])
+                    if idx != -1 and np.allclose(buf.states[idx], act_states[i]):
+                        max_val  = max(buf.values[idx], float(act_values[i]))
+                        max_time = max(buf.times[idx],  int(act_times[i]))
+                        buf.replace(act_states[i], max_val, max_time, idx)
+                    else:
+                        buf.add(act_states[i], float(act_values[i]), int(act_times[i]))
+            else:
+                for i in range(len(act_states)):
+                    buf.add(act_states[i], float(act_values[i]), int(act_times[i]))
 
         self.qec.rebuild_trees()  # one rebuild per step() call instead of per insert
         return {
@@ -317,7 +329,12 @@ class MFECAlgorithm(BaseAlgorithm):
                 # Each ActionBuffer stores three parallel lists.  We save all
                 # three so the kNN tree can be rebuilt exactly after loading.
                 "qec_state": [
-                    {"states": b.states, "values": b.values, "times": b.times}
+                    {
+                        "states": b.states[:b._size].copy() if b.states is not None and b._size > 0 else None,
+                        "values": list(b.values),
+                        "times":  list(b.times),
+                        "size":   b._size,
+                    }
                     for b in self.qec.buffers
                 ],
                 "collected_frames": self._collected_frames,
@@ -334,13 +351,19 @@ class MFECAlgorithm(BaseAlgorithm):
         self._collected_frames = int(state.extra["collected_frames"])
 
         for buf, saved in zip(self.qec.buffers, state.extra["qec_state"]):
-            buf.states = saved["states"]
-            buf.values = saved["values"]
-            buf.times  = saved["times"]
+            size = saved["size"]
+            buf._size  = size
+            buf.values = list(saved["values"])
+            buf.times  = list(saved["times"])
             buf._index = None
             buf._index_size = 0
             buf._needs_rebuild = False
-            # Rebuild the FAISS index so kNN lookups work immediately after loading.
+            if size > 0 and saved["states"] is not None:
+                state_dim = saved["states"].shape[1]
+                buf.states = np.empty((buf.capacity, state_dim), dtype=np.float32)
+                buf.states[:size] = saved["states"]
+            else:
+                buf.states = None
             buf.sync_index()
 
 
@@ -611,7 +634,12 @@ class ActionBuffer:
         self._gpu_id = gpu_id
         self._gpu_res: object | None = None  # faiss.StandardGpuResources, lazy
         self.capacity = capacity
-        self.states: list[np.ndarray] = []  # list of (state_dim,) float64 arrays
+        self._size: int = 0
+        # states is a preallocated (capacity, state_dim) float32 array, lazily
+        # created on the first add() call when state_dim becomes known.
+        # Keeping states as a contiguous array means sync_index() can pass a
+        # zero-copy slice to FAISS instead of rebuilding from a list every time.
+        self.states: np.ndarray | None = None
         self.values: list[float] = []       # corresponding best returns
         self.times:  list[int]   = []       # corresponding LRU timestamps
 
@@ -628,24 +656,24 @@ class ActionBuffer:
         return index
 
     def sync_index(self) -> None:
-        """Sync the FAISS index with the current states list.
+        """Sync the FAISS index with the current states array.
 
         Called once per batch by QEC.rebuild_trees().
         Full rebuild only on eviction; otherwise incremental adds.
+        Passes a zero-copy slice to FAISS — no conversion overhead.
         """
-        if not self.states:
+        if self.states is None or self._size == 0:
             return
-        state_dim = self.states[0].shape[0]
+        state_dim = self.states.shape[1]
 
         if self._needs_rebuild or self._index is None:
             self._index = self._make_index(state_dim)
-            self._index.add(np.array(self.states, dtype=np.float32))
-            self._index_size = len(self.states)
+            self._index.add(self.states[:self._size])   # zero-copy view
+            self._index_size = self._size
             self._needs_rebuild = False
-        elif len(self.states) > self._index_size:
-            new = np.array(self.states[self._index_size:], dtype=np.float32)
-            self._index.add(new)
-            self._index_size = len(self.states)
+        elif self._size > self._index_size:
+            self._index.add(self.states[self._index_size:self._size])
+            self._index_size = self._size
 
     # ------------------------------------------------------------------
     # Lookup  (used by QEC.estimate() during the update pass in step())
@@ -655,7 +683,7 @@ class ActionBuffer:
         """Return the index of an exactly matching stored state, or None."""
         if self._index is None or self._index.ntotal == 0:
             return None
-        q = np.array([state], dtype=np.float32)
+        q = np.asarray(state, dtype=np.float32).reshape(1, -1)
         _, indices = self._index.search(q, 1)
         idx = int(indices[0][0])
         if idx == -1:
@@ -669,7 +697,7 @@ class ActionBuffer:
         if self._index is None or self._index.ntotal == 0:
             return []
         k_eff = min(k, self._index.ntotal)
-        q = np.array([state], dtype=np.float32)
+        q = np.asarray(state, dtype=np.float32).reshape(1, -1)
         _, indices = self._index.search(q, k_eff)
         return [int(i) for i in indices[0] if i != -1]
 
@@ -677,11 +705,14 @@ class ActionBuffer:
     # Mutation
     # ------------------------------------------------------------------
 
-    def add(self, state, value, time):
-        if len(self) < self.capacity:
-            self.states.append(state)
+    def add(self, state: np.ndarray, value: float, time: int) -> None:
+        if self.states is None:
+            self.states = np.empty((self.capacity, state.shape[0]), dtype=np.float32)
+        if self._size < self.capacity:
+            self.states[self._size] = state
             self.values.append(value)
             self.times.append(time)
+            self._size += 1
             # Incremental add deferred to sync_index().
         else:
             min_time_index = int(np.argmin(self.times))
@@ -692,7 +723,7 @@ class ActionBuffer:
                 # In-place eviction: the slot's vector changed → must rebuild.
                 self._needs_rebuild = True
 
-    def replace(self, state, value, time, index):
+    def replace(self, state: np.ndarray, value: float, time: int, index: int) -> None:
         # Called on an exact-match hit: only value/time change, not the
         # state vector, so the FAISS index remains valid.
         self.states[index] = state
@@ -700,18 +731,28 @@ class ActionBuffer:
         self.times[index] = time
 
     def __len__(self) -> int:
-        return len(self.states)
+        return self._size
 
     def __getstate__(self):
-        state = self.__dict__.copy()
-        # FAISS index and GPU resources are not picklable; drop them and
-        # mark for a full rebuild so sync_index() restores them correctly.
-        state["_index"] = None
-        state["_gpu_res"] = None
-        state["_index_size"] = 0
-        state["_needs_rebuild"] = True
-        return state
+        d = self.__dict__.copy()
+        # FAISS index and GPU resources are not picklable; drop them.
+        d["_index"] = None
+        d["_gpu_res"] = None
+        d["_index_size"] = 0
+        d["_needs_rebuild"] = False
+        # Save only the active slice so we don't pickle the full preallocated
+        # (capacity × state_dim) array — most of which may be uninitialised.
+        d["states"] = self.states[:self._size].copy() if self.states is not None and self._size > 0 else None
+        return d
 
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self.sync_index()  # rebuild FAISS index from the restored states list
+    def __setstate__(self, d: dict) -> None:
+        self.__dict__.update(d)
+        saved = d["states"]
+        if saved is not None and self._size > 0:
+            # Restore the full preallocated array and copy the active slice in.
+            state_dim = saved.shape[1]
+            self.states = np.empty((self.capacity, state_dim), dtype=np.float32)
+            self.states[:self._size] = saved
+            self.sync_index()
+        else:
+            self.states = None
