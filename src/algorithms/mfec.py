@@ -330,6 +330,7 @@ class MFECAlgorithm(BaseAlgorithm):
         # Update the reference inside QECPolicy so it uses the restored matrix,
         # not the one initialised in setup().
         self.qec_policy.projection = self.projection
+        self.qec_policy._proj_tensor = None  # force re-cache on next embed()
         self._collected_frames = int(state.extra["collected_frames"])
 
         for buf, saved in zip(self.qec.buffers, state.extra["qec_state"]):
@@ -363,12 +364,18 @@ class QECPolicy(nn.Module):
         self.qec = qec
         self.projection = projection   # fixed (H*W, state_dim) Gaussian matrix
         self.num_actions = num_actions
+        self._proj_tensor: torch.Tensor | None = None  # cached on obs device
 
     def embed(self, obs: torch.Tensor) -> np.ndarray:
-        obs_np = obs.cpu().numpy()
-        # Flatten leading dims; keep last C*H*W as the feature vector
-        flat = obs_np.reshape(-1, self.projection.shape[0])
-        return flat @ self.projection
+        # Keep the matmul on the same device as obs so we only transfer the
+        # compact 64-dim result to CPU rather than the full pixel observation
+        # (4×84×84 ≈ 112 KB per env vs 256 bytes for the embedding).
+        if self._proj_tensor is None or self._proj_tensor.device != obs.device:
+            self._proj_tensor = torch.tensor(
+                self.projection, dtype=torch.float32, device=obs.device
+            )
+        flat = obs.float().reshape(-1, self._proj_tensor.shape[0])
+        return (flat @ self._proj_tensor).cpu().numpy()
 
     def forward(self, obs):
         states = self.embed(obs)
