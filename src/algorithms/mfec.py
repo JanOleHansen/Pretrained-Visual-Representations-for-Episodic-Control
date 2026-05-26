@@ -366,6 +366,23 @@ class QECPolicy(nn.Module):
         self.num_actions = num_actions
         self._proj_tensor: torch.Tensor | None = None  # cached on obs device
 
+    def __deepcopy__(self, memo):
+        # TorchRL deepcopies the policy when setting up the collector (to move
+        # it to the right device).  A full deepcopy would give the collector its
+        # own isolated, empty QEC that never receives updates from step().
+        # Instead we share self.qec by reference so the collector always reads
+        # the latest memory that algorithm.step() writes.
+        cls = self.__class__
+        copy = cls.__new__(cls)
+        memo[id(self)] = copy
+        # nn.Module internals (no learnable params, but must be valid)
+        super(QECPolicy, copy).__init__()
+        copy.qec = self.qec                   # shared reference — intentional
+        copy.projection = self.projection     # immutable numpy array
+        copy.num_actions = self.num_actions
+        copy._proj_tensor = None              # re-cached on first embed() call
+        return copy
+
     def embed(self, obs: torch.Tensor) -> np.ndarray:
         # Keep the matmul on the same device as obs so we only transfer the
         # compact 64-dim result to CPU rather than the full pixel observation
