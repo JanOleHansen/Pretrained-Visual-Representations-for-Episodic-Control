@@ -425,6 +425,15 @@ class QEC:
         for buf in self.buffers:
             buf.sync_index()
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state["executor"]  # ThreadPoolExecutor is not picklable
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.executor = ThreadPoolExecutor(max_workers=len(self.buffers))
+
     def estimate(self, state: np.ndarray, action: int) -> float:
         """Estimate Q(state, action) from the episodic memory.
 
@@ -660,3 +669,17 @@ class ActionBuffer:
 
     def __len__(self) -> int:
         return len(self.states)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # FAISS index and GPU resources are not picklable; drop them and
+        # mark for a full rebuild so sync_index() restores them correctly.
+        state["_index"] = None
+        state["_gpu_res"] = None
+        state["_index_size"] = 0
+        state["_needs_rebuild"] = True
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.sync_index()  # rebuild FAISS index from the restored states list
