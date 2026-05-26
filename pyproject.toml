@@ -18,6 +18,8 @@ dependencies = [
     # Logging
     "wandb>=0.17.0",
     "tensorboard>=2.16.0",
+    # Nearest-neighbour search (install faiss-gpu instead for GPU acceleration)
+    "faiss-cpu>=1.7.0",
     # Utilities
     "tqdm>=4.66.0",
     # Testing

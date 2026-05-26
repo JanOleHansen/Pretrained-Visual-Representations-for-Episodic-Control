@@ -83,7 +83,7 @@ from tensordict import TensorDict
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.envs import EnvBase
 from torchrl.modules import EGreedyModule, QValueActor
-from sklearn.neighbors import KDTree
+import faiss
 
 from src.algorithms.base import BaseAlgorithm, CollectorConfig, TrainingState
 
@@ -110,22 +110,18 @@ class MFECAlgorithm(BaseAlgorithm):
 
             #   Episodic memory
             # Maximum number of (state, return) entries stored per action.
-            # Older entries (by LRU timestamp) are evicted when this is reached.
+            # Older entries are evicted when max this is reached.
             buffer_size: int = 1_000_000,
-            # How many nearest neighbours to average when estimating a Q-value
-            # for an unseen state.  Higher k → smoother estimates, higher cost.
+            # Number of nearest neighbours to average when estimating a Q-value for an unseen state.  Higher k → smoother estimates, higher cost.
             k: int = 11,
-            # Dimensionality of the projected state embedding.  Lower values
-            # reduce memory and kNN cost; higher values preserve more structure.
+            # Dimensionality of the projected state embedding.  Lower values reduce memory and kNN cost; higher values preserve more structure.
             state_dim: int = 64,
 
-            #   Discount
-            # γ — future rewards are worth γ^t times a reward t steps away.
+            #   Discount γ — future rewards are worth γ^t times a reward t steps away.
             gamma: float = 0.99,
 
-            #   ε-greedy exploration schedule
-            # At the start of training, every action is random (eps_start=1.0).
-            # ε is linearly annealed to eps_end over annealing_frames steps.
+            #   eps-greedy exploration schedule
+            # At the start of training, every action is random (eps_start=1.0). eps is linearly annealed to eps_end over annealing_frames steps.
             eps_start: float = 1.0,
             eps_end: float = 0.05,
             annealing_frames: int = 1_000_000,
@@ -139,8 +135,7 @@ class MFECAlgorithm(BaseAlgorithm):
         
         super().__init__(device)
 
-        # Store all hyperparameters as instance attributes so setup() and
-        # step() can access them.
+        # Store all hyperparameters as instance attributes so setup() and step() can access them.
         self.obs_key = obs_key
         self.buffer_size = buffer_size
         self.k = k
@@ -152,8 +147,7 @@ class MFECAlgorithm(BaseAlgorithm):
         self.frames_per_batch = frames_per_batch
         self.max_frames_per_traj = max_frames_per_traj
 
-        # Running count of all environment frames seen so far.  Used as an
-        # LRU timestamp when inserting entries into the QEC buffers.
+        # Running count of all environment frames seen so far.  Used as an LRU timestamp when inserting entries into the QEC buffers.
         self._collected_frames = 0
 
     # 
@@ -172,7 +166,12 @@ class MFECAlgorithm(BaseAlgorithm):
         self.projection = np.random.randn(obs_flat_dim, self.state_dim)
         self.projection /= np.linalg.norm(self.projection, axis=0)
 
-        self.qec = QEC(range(num_actions), self.buffer_size, self.k)
+        if self.device is not None and self.device.type == "cuda":
+            gpu_id = self.device.index if self.device.index is not None else 0
+        else:
+            gpu_id = -1
+
+        self.qec = QEC(range(num_actions), self.buffer_size, self.k, gpu_id=gpu_id)
         self._num_actions = num_actions
 
         self.qec_policy = QECPolicy(self.qec, self.projection, num_actions)
@@ -226,7 +225,7 @@ class MFECAlgorithm(BaseAlgorithm):
         self.greedy_module.step(n)
         self._collected_frames += n
 
-        # Extract arrays from the TensorDict.  We work in numpy because the QEC memory and KD-tree are numpy/scikit-learn objects.
+        # Extract arrays from the TensorDict.  We work in numpy because the QEC memory and FAISS index are numpy objects.
         obs        = batch[self.obs_key]                                           # [n, C, H, W]
         actions_np = batch["action"].cpu().numpy().flatten().astype(int)           # [n]
         rewards_np = batch["next", "reward"].cpu().numpy().flatten().astype(np.float64)  # [n]
@@ -337,10 +336,11 @@ class MFECAlgorithm(BaseAlgorithm):
             buf.states = saved["states"]
             buf.values = saved["values"]
             buf.times  = saved["times"]
-            # Rebuild the spatial index so kNN lookups work immediately after
-            # loading without needing to re-insert every entry.
-            if buf.states:
-                buf._tree = KDTree(np.array(buf.states))
+            buf._index = None
+            buf._index_size = 0
+            buf._needs_rebuild = False
+            # Rebuild the FAISS index so kNN lookups work immediately after loading.
+            buf.sync_index()
 
 
 # ---------------------------------------------------------------------------
@@ -372,13 +372,11 @@ class QECPolicy(nn.Module):
 
     def forward(self, obs):
         states = self.embed(obs)
-        
-        def estimate_action(action):
-            return [self.qec.estimate(s, action) for s in states]
-        
-        # Query all actions in parallel
+
+        # One FAISS search call per action (batched over all states in obs).
         results = list(self.qec.executor.map(
-            estimate_action, range(self.num_actions)
+            lambda a: self.qec.estimate_batch(states, a),
+            range(self.num_actions),
         ))
         
         # results shape: (num_actions, batch) → transpose to (batch, num_actions)
@@ -409,17 +407,16 @@ class QEC:
     k           : number of nearest neighbours for Q-value estimation
     """
 
-    def __init__(self, actions, buffer_size: int, k: int) -> None:
+    def __init__(self, actions, buffer_size: int, k: int, gpu_id: int = -1) -> None:
         # One independent buffer per action.  Using a tuple prevents accidental
         # reassignment of individual buffers.
-        self.buffers = tuple(ActionBuffer(buffer_size) for _ in actions)
+        self.buffers = tuple(ActionBuffer(buffer_size, gpu_id=gpu_id) for _ in actions)
         self.k = k
         self.executor = ThreadPoolExecutor(max_workers=len(self.buffers))
 
-    def rebuild_trees(self):
-            for buf in self.buffers:
-                if buf.states:
-                    buf._tree = KDTree(np.array(buf.states))
+    def rebuild_trees(self) -> None:
+        for buf in self.buffers:
+            buf.sync_index()
 
     def estimate(self, state: np.ndarray, action: int) -> float:
         """Estimate Q(state, action) from the episodic memory.
@@ -458,6 +455,55 @@ class QEC:
         value = sum(buffer.values[idx] for idx in neighbours)
         return value / self.k
 
+    def estimate_batch(self, states: np.ndarray, action: int) -> list[float]:
+        """Estimate Q-values for a batch of states in a single FAISS search call.
+
+        Replaces the per-state loop in QECPolicy.forward() with one batched
+        index.search() invocation, which is significantly faster for large buffers.
+
+        Parameters
+        ----------
+        states : np.ndarray, shape (batch, state_dim)
+        action : int
+
+        Returns
+        -------
+        list[float], length batch
+        """
+        buffer = self.buffers[action]
+        n = len(states)
+
+        if buffer._index is None or buffer._index.ntotal == 0:
+            return [float("inf")] * n
+
+        ntotal = buffer._index.ntotal
+        if ntotal <= self.k:
+            # Too few entries for a meaningful kNN average.
+            return [float("inf")] * n
+
+        # Fetch k+1 neighbours so we can detect exact matches (nearest dist ≈ 0)
+        # without a separate second query.
+        k_fetch = min(self.k + 1, ntotal)
+        queries = np.array(states, dtype=np.float32)
+        _, indices = buffer._index.search(queries, k_fetch)   # (n, k_fetch)
+
+        results: list[float] = []
+        for state, idx_row in zip(states, indices):
+            valid = [int(j) for j in idx_row if j != -1]
+            if not valid:
+                results.append(float("inf"))
+                continue
+            nearest = valid[0]
+            if np.allclose(buffer.states[nearest], state):
+                # Exact hit — return the stored best return directly.
+                results.append(buffer.values[nearest])
+            else:
+                # Average the k nearest neighbours' returns.
+                knn = valid[: self.k]
+                results.append(sum(buffer.values[j] for j in knn) / len(knn))
+
+        return results
+
     def update(self, state: np.ndarray, action: int, return_: float, time: int) -> None:
         """Insert or update a (state, return) entry in the action's buffer.
 
@@ -491,12 +537,14 @@ class ActionBuffer:
     """Fixed-capacity nearest-neighbour memory for a single action.
 
     Internally maintains three parallel lists — states, values, times —
-    along with a scikit-learn KDTree for fast O(log n) kNN queries.
+    alongside a FAISS IndexFlatL2 for fast kNN queries.
 
-    The KDTree is rebuilt after every structural change (add or replace).
-    This keeps the implementation simple at the cost of O(n log n) rebuild
-    time per insert.  For very large buffers a more incremental structure
-    (e.g. FAISS) could be used instead.
+    The index is kept in sync lazily: sync_index() is called once per
+    training batch (by QEC.rebuild_trees()) rather than after every insert.
+    Two cases:
+      * Only appends since last sync  → incremental add, O(new entries).
+      * An in-place eviction occurred → full rebuild, O(n log n), but this
+        only happens once the buffer has reached capacity.
 
     Eviction policy: when at capacity, the entry with the *smallest* timestamp
     (least recently used) is replaced by the incoming entry, provided the
@@ -505,61 +553,103 @@ class ActionBuffer:
     Parameters
     ----------
     capacity : int — maximum number of (state, return) entries to store
+    gpu_id   : int — CUDA device index for FAISS GPU acceleration; -1 = CPU
     """
 
-    def __init__(self, capacity: int) -> None:
-        # KD-tree is built lazily; None means the buffer is empty.
-        self._tree: KDTree | None = None
+    def __init__(self, capacity: int, gpu_id: int = -1) -> None:
+        self._index: faiss.Index | None = None
+        self._index_size: int = 0        # entries currently reflected in _index
+        self._needs_rebuild: bool = False  # True after an in-place eviction
+        self._gpu_id = gpu_id
+        self._gpu_res: object | None = None  # faiss.StandardGpuResources, lazy
         self.capacity = capacity
-        self.states: list[np.ndarray] = []  # list of (state_dim,) arrays
+        self.states: list[np.ndarray] = []  # list of (state_dim,) float64 arrays
         self.values: list[float] = []       # corresponding best returns
         self.times:  list[int]   = []       # corresponding LRU timestamps
 
-    def find_state(self, state: np.ndarray) -> int | None:
-        """Return the index of an exactly matching stored state, or None.
+    # ------------------------------------------------------------------
+    # Index management
+    # ------------------------------------------------------------------
 
-        Uses the KD-tree to find the nearest neighbour and then verifies
-        numerical equality with np.allclose (tolerates floating-point noise).
+    def _make_index(self, state_dim: int) -> faiss.Index:
+        index = faiss.IndexFlatL2(state_dim)
+        if self._gpu_id >= 0 and faiss.get_num_gpus() > 0:
+            if self._gpu_res is None:
+                self._gpu_res = faiss.StandardGpuResources()
+            index = faiss.index_cpu_to_gpu(self._gpu_res, self._gpu_id, index)
+        return index
+
+    def sync_index(self) -> None:
+        """Sync the FAISS index with the current states list.
+
+        Called once per batch by QEC.rebuild_trees().
+        Full rebuild only on eviction; otherwise incremental adds.
         """
-        if self._tree is None:
-            return None  # buffer is empty
+        if not self.states:
+            return
+        state_dim = self.states[0].shape[0]
 
-        # query() returns (distances, indices).  We ask for 1 neighbour and
-        # extract its index: [1][0][0] = indices → first query point → first hit.
-        neighbour_index = self._tree.query([state], k=1)[1][0][0]
-        if np.allclose(self.states[neighbour_index], state):
-            return int(neighbour_index)
+        if self._needs_rebuild or self._index is None:
+            self._index = self._make_index(state_dim)
+            self._index.add(np.array(self.states, dtype=np.float32))
+            self._index_size = len(self.states)
+            self._needs_rebuild = False
+        elif len(self.states) > self._index_size:
+            new = np.array(self.states[self._index_size:], dtype=np.float32)
+            self._index.add(new)
+            self._index_size = len(self.states)
+
+    # ------------------------------------------------------------------
+    # Lookup  (used by QEC.estimate() during the update pass in step())
+    # ------------------------------------------------------------------
+
+    def find_state(self, state: np.ndarray) -> int | None:
+        """Return the index of an exactly matching stored state, or None."""
+        if self._index is None or self._index.ntotal == 0:
+            return None
+        q = np.array([state], dtype=np.float32)
+        _, indices = self._index.search(q, 1)
+        idx = int(indices[0][0])
+        if idx == -1:
+            return None
+        if np.allclose(self.states[idx], state):
+            return idx
         return None
 
     def find_k_nearest(self, state: np.ndarray, k: int) -> list[int]:
-        """Return the buffer indices of the k nearest stored states.
-
-        Returns an empty list when the buffer is empty (tree not built yet).
-        """
-        if self._tree is None:
+        """Return the buffer indices of the k nearest stored states."""
+        if self._index is None or self._index.ntotal == 0:
             return []
-        # query([state], k=k) → (distances, indices), shape (1, k) each.
-        # [1][0] gives the index array for our single query point.
-        return self._tree.query([state], k=k)[1][0]
+        k_eff = min(k, self._index.ntotal)
+        q = np.array([state], dtype=np.float32)
+        _, indices = self._index.search(q, k_eff)
+        return [int(i) for i in indices[0] if i != -1]
+
+    # ------------------------------------------------------------------
+    # Mutation
+    # ------------------------------------------------------------------
 
     def add(self, state, value, time):
         if len(self) < self.capacity:
             self.states.append(state)
             self.values.append(value)
             self.times.append(time)
+            # Incremental add deferred to sync_index().
         else:
             min_time_index = int(np.argmin(self.times))
             if time > self.times[min_time_index]:
                 self.states[min_time_index] = state
                 self.values[min_time_index] = value
                 self.times[min_time_index] = time
-        # tree rebuild deferred!
+                # In-place eviction: the slot's vector changed → must rebuild.
+                self._needs_rebuild = True
 
     def replace(self, state, value, time, index):
+        # Called on an exact-match hit: only value/time change, not the
+        # state vector, so the FAISS index remains valid.
         self.states[index] = state
         self.values[index] = value
         self.times[index] = time
-        # tree rebuild deferred!
 
     def __len__(self) -> int:
         return len(self.states)
