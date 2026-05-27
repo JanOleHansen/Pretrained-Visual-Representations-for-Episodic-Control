@@ -75,8 +75,10 @@ function UpdateMemory(s, a, G, time):
 from __future__ import annotations
 from typing import Callable
 from concurrent.futures import ThreadPoolExecutor
+import heapq
 
 import numpy as np
+from scipy.signal import lfilter
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
@@ -235,20 +237,18 @@ class MFECAlgorithm(BaseAlgorithm):
         states = self.qec_policy.embed(obs)  # (n, state_dim) numpy array
 
         #   Episode segmentation and Monte Carlo return computation
-        # First pass: compute G_t for every transition without touching QEC.
-        # This separates return computation from memory insertion so the
-        # insertion step can be fully vectorised per action below.
-        G_all = np.zeros(n, dtype=np.float64)
-        episode_start = 0
-        for t in range(n):
-            if dones_np[t] or t == n - 1:
-                ep_len   = t + 1 - episode_start
-                G        = np.zeros(ep_len)
-                G[-1]    = rewards_np[t]
-                for i in range(ep_len - 2, -1, -1):
-                    G[i] = rewards_np[episode_start + i] + self.gamma * G[i + 1]
-                G_all[episode_start : t + 1] = G
-                episode_start = t + 1
+        # lfilter([1], [1, -γ], r[::-1])[::-1] computes the discounted return
+        # G[t] = r[t] + γ*r[t+1] + γ²*r[t+2] + … in a single C-level IIR pass,
+        # replacing the O(ep_len) Python inner loop.
+        G_all = np.empty(n, dtype=np.float64)
+        ends = np.flatnonzero(dones_np)
+        if len(ends) == 0 or ends[-1] != n - 1:
+            ends = np.append(ends, n - 1)
+        ep_start = 0
+        for ep_end in ends:
+            r = rewards_np[ep_start : ep_end + 1]
+            G_all[ep_start : ep_end + 1] = lfilter([1.0], [1.0, -self.gamma], r[::-1])[::-1]
+            ep_start = ep_end + 1
 
         # Absolute frame timestamp for LRU eviction.
         frame_times = (self._collected_frames - n) + np.arange(n, dtype=np.int64)
@@ -256,28 +256,41 @@ class MFECAlgorithm(BaseAlgorithm):
         #   Vectorised per-action batch update
         # Group transition indices by action, then do ONE batched FAISS search
         # per action (instead of n individual single-vector searches).
-        # Reduces ~1000 individual searches to num_actions batched searches —
-        # roughly 10× faster on large buffers.
+        # Exact-match detection and value/time updates are then fully vectorised
+        # with numpy; only genuinely new states fall through to the Python loop.
         for action in range(self._num_actions):
             mask = actions_np == action
             if not mask.any():
                 continue
-            buf         = self.qec.buffers[action]
-            act_states  = states[mask].astype(np.float32)  # (m, state_dim)
-            act_values  = G_all[mask]
-            act_times   = frame_times[mask]
+            buf        = self.qec.buffers[action]
+            act_states = states[mask].astype(np.float32)  # (m, state_dim)
+            act_values = G_all[mask]                       # (m,)
+            act_times  = frame_times[mask]                 # (m,)
 
             if buf._index is not None and buf._index.ntotal > 0:
                 # One FAISS search for all m states belonging to this action.
                 _, nn_idx = buf._index.search(act_states, 1)  # (m, 1)
-                for i in range(len(act_states)):
-                    idx = int(nn_idx[i, 0])
-                    if idx != -1 and np.allclose(buf.states[idx], act_states[i]):
-                        max_val  = max(buf.values[idx], float(act_values[i]))
-                        max_time = max(buf.times[idx],  int(act_times[i]))
-                        buf.replace(act_states[i], max_val, max_time, idx)
-                    else:
-                        buf.add(act_states[i], float(act_values[i]), int(act_times[i]))
+                nn_flat = nn_idx[:, 0]                         # (m,)
+                valid   = nn_flat >= 0
+                safe_nn = np.where(valid, nn_flat, 0)
+
+                # Vectorised exact-match check across all m queries at once.
+                nearest_vecs = buf.states[safe_nn]             # (m, state_dim)
+                tol  = 1e-5 * (1.0 + np.abs(act_states))
+                exact = valid & np.all(np.abs(nearest_vecs - act_states) <= tol, axis=1)
+
+                # Batch replace: max-aggregation for all exact-match slots.
+                # np.maximum.at handles duplicate indices correctly.
+                if exact.any():
+                    ex_idx = safe_nn[exact]
+                    np.maximum.at(buf.values, ex_idx, act_values[exact])
+                    np.maximum.at(buf.times,  ex_idx, act_times[exact])
+                    for slot, t in zip(ex_idx.tolist(), buf.times[ex_idx].tolist()):
+                        heapq.heappush(buf._heap, (t, slot))
+
+                # Add new (non-matching) states — eviction logic prevents batching.
+                for i in np.flatnonzero(~exact):
+                    buf.add(act_states[i], float(act_values[i]), int(act_times[i]))
             else:
                 for i in range(len(act_states)):
                     buf.add(act_states[i], float(act_values[i]), int(act_times[i]))
@@ -331,8 +344,8 @@ class MFECAlgorithm(BaseAlgorithm):
                 "qec_state": [
                     {
                         "states": b.states[:b._size].copy() if b.states is not None and b._size > 0 else None,
-                        "values": list(b.values),
-                        "times":  list(b.times),
+                        "values": b.values[:b._size].copy() if b._size > 0 else np.array([], dtype=np.float64),
+                        "times":  b.times[:b._size].copy()  if b._size > 0 else np.array([], dtype=np.int64),
                         "size":   b._size,
                     }
                     for b in self.qec.buffers
@@ -353,17 +366,22 @@ class MFECAlgorithm(BaseAlgorithm):
         for buf, saved in zip(self.qec.buffers, state.extra["qec_state"]):
             size = saved["size"]
             buf._size  = size
-            buf.values = list(saved["values"])
-            buf.times  = list(saved["times"])
             buf._index = None
             buf._index_size = 0
             buf._needs_rebuild = False
+            buf.values = np.empty(buf.capacity, dtype=np.float64)
+            buf.times  = np.empty(buf.capacity, dtype=np.int64)
+            if size > 0:
+                buf.values[:size] = np.asarray(saved["values"])
+                buf.times[:size]  = np.asarray(saved["times"])
             if size > 0 and saved["states"] is not None:
                 state_dim = saved["states"].shape[1]
                 buf.states = np.empty((buf.capacity, state_dim), dtype=np.float32)
                 buf.states[:size] = saved["states"]
             else:
                 buf.states = None
+            buf._heap = [(int(buf.times[i]), i) for i in range(size)]
+            heapq.heapify(buf._heap)
             buf.sync_index()
 
 
@@ -523,8 +541,7 @@ class QEC:
         # General case: retrieve the k nearest stored states and average their
         # returns.  This is the core kNN regression step from the paper.
         neighbours = buffer.find_k_nearest(state, self.k)  # list of buffer indices
-        value = sum(buffer.values[idx] for idx in neighbours)
-        return value / self.k
+        return float(buffer.values[neighbours].mean())
 
     def estimate_batch(self, states: np.ndarray, action: int) -> list[float]:
         """Estimate Q-values for a batch of states in a single FAISS search call.
@@ -555,25 +572,32 @@ class QEC:
         # Fetch k+1 neighbours so we can detect exact matches (nearest dist ≈ 0)
         # without a separate second query.
         k_fetch = min(self.k + 1, ntotal)
-        queries = np.array(states, dtype=np.float32)
+        queries = np.asarray(states, dtype=np.float32)
         _, indices = buffer._index.search(queries, k_fetch)   # (n, k_fetch)
 
-        results: list[float] = []
-        for state, idx_row in zip(states, indices):
-            valid = [int(j) for j in idx_row if j != -1]
-            if not valid:
-                results.append(float("inf"))
-                continue
-            nearest = valid[0]
-            if np.allclose(buffer.states[nearest], state):
-                # Exact hit — return the stored best return directly.
-                results.append(buffer.values[nearest])
-            else:
-                # Average the k nearest neighbours' returns.
-                knn = valid[: self.k]
-                results.append(sum(buffer.values[j] for j in knn) / len(knn))
+        valid   = indices >= 0                                 # (n, k_fetch) bool
+        safe    = np.where(valid, indices, 0)                  # replace -1 with 0
 
-        return results
+        nearest  = safe[:, 0]                                  # (n,) closest slot
+        has_hit  = valid[:, 0]                                 # (n,) at least one result
+
+        # Exact-match: nearest stored vector == query within floating-point tol.
+        nearest_vecs = buffer.states[nearest]                  # (n, state_dim)
+        tol  = 1e-5 * (1.0 + np.abs(queries))
+        exact = has_hit & np.all(np.abs(nearest_vecs - queries) <= tol, axis=1)
+
+        # kNN average for non-exact rows — fully vectorised with numpy indexing.
+        k_use    = min(self.k, k_fetch)
+        knn_idx  = safe[:, :k_use]                             # (n, k_use)
+        knn_ok   = valid[:, :k_use]                            # (n, k_use) mask
+        knn_vals = buffer.values[knn_idx]                      # (n, k_use)
+        knn_vals = np.where(knn_ok, knn_vals, np.nan)
+        with np.errstate(all="ignore"):
+            knn_avg = np.nanmean(knn_vals, axis=1)             # (n,)
+
+        result = np.where(exact, buffer.values[nearest], knn_avg)
+        result = np.where(has_hit, result, np.inf)
+        return result.astype(np.float32)
 
     def update(self, state: np.ndarray, action: int, return_: float, time: int) -> None:
         """Insert or update a (state, return) entry in the action's buffer.
@@ -640,8 +664,13 @@ class ActionBuffer:
         # Keeping states as a contiguous array means sync_index() can pass a
         # zero-copy slice to FAISS instead of rebuilding from a list every time.
         self.states: np.ndarray | None = None
-        self.values: list[float] = []       # corresponding best returns
-        self.times:  list[int]   = []       # corresponding LRU timestamps
+        # Preallocated numpy arrays — enable vectorised indexing in estimate_batch
+        # and eliminate the Python-list → numpy conversion cost in np.argmin.
+        self.values: np.ndarray = np.empty(capacity, dtype=np.float64)
+        self.times:  np.ndarray = np.empty(capacity, dtype=np.int64)
+        # Min-heap of (time, slot_index) for O(log n) LRU eviction.
+        # Lazy deletion: entries become stale when times[slot] != stored time.
+        self._heap: list = []
 
     # ------------------------------------------------------------------
     # Index management
@@ -709,26 +738,38 @@ class ActionBuffer:
         if self.states is None:
             self.states = np.empty((self.capacity, state.shape[0]), dtype=np.float32)
         if self._size < self.capacity:
-            self.states[self._size] = state
-            self.values.append(value)
-            self.times.append(time)
+            idx = self._size
+            self.states[idx] = state
+            self.values[idx] = value
+            self.times[idx]  = time
             self._size += 1
+            heapq.heappush(self._heap, (time, idx))
             # Incremental add deferred to sync_index().
         else:
-            min_time_index = int(np.argmin(self.times))
-            if time > self.times[min_time_index]:
-                self.states[min_time_index] = state
-                self.values[min_time_index] = value
-                self.times[min_time_index] = time
+            # O(log n) LRU eviction via min-heap with lazy deletion.
+            # Pop until we find a non-stale entry (times[slot] matches heap time).
+            while True:
+                t, idx = heapq.heappop(self._heap)
+                if self.times[idx] == t:
+                    break
+            if time > t:
+                self.states[idx] = state
+                self.values[idx] = value
+                self.times[idx]  = time
+                heapq.heappush(self._heap, (time, idx))
                 # In-place eviction: the slot's vector changed → must rebuild.
                 self._needs_rebuild = True
+            else:
+                # Incoming entry is older than the LRU slot — discard it.
+                heapq.heappush(self._heap, (t, idx))
 
     def replace(self, state: np.ndarray, value: float, time: int, index: int) -> None:
         # Called on an exact-match hit: only value/time change, not the
         # state vector, so the FAISS index remains valid.
         self.states[index] = state
         self.values[index] = value
-        self.times[index] = time
+        self.times[index]  = time
+        heapq.heappush(self._heap, (time, index))  # old entry becomes stale
 
     def __len__(self) -> int:
         return self._size
@@ -740,19 +781,35 @@ class ActionBuffer:
         d["_gpu_res"] = None
         d["_index_size"] = 0
         d["_needs_rebuild"] = False
+        # Heap is rebuilt cheaply from times on load; don't pickle it.
+        d["_heap"] = None
         # Save only the active slice so we don't pickle the full preallocated
-        # (capacity × state_dim) array — most of which may be uninitialised.
+        # arrays — most of which may be uninitialised.
         d["states"] = self.states[:self._size].copy() if self.states is not None and self._size > 0 else None
+        d["values"] = self.values[:self._size].copy() if self._size > 0 else np.array([], dtype=np.float64)
+        d["times"]  = self.times[:self._size].copy()  if self._size > 0 else np.array([], dtype=np.int64)
         return d
 
     def __setstate__(self, d: dict) -> None:
         self.__dict__.update(d)
-        saved = d["states"]
-        if saved is not None and self._size > 0:
-            # Restore the full preallocated array and copy the active slice in.
-            state_dim = saved.shape[1]
+        size = self._size
+        # Restore full preallocated values/times arrays from compact slices.
+        saved_values = d["values"]
+        saved_times  = d["times"]
+        self.values = np.empty(self.capacity, dtype=np.float64)
+        self.times  = np.empty(self.capacity, dtype=np.int64)
+        if size > 0:
+            self.values[:size] = saved_values
+            self.times[:size]  = saved_times
+        # Restore full preallocated states array from compact slice.
+        saved_states = d["states"]
+        if saved_states is not None and size > 0:
+            state_dim = saved_states.shape[1]
             self.states = np.empty((self.capacity, state_dim), dtype=np.float32)
-            self.states[:self._size] = saved
-            self.sync_index()
+            self.states[:size] = saved_states
         else:
             self.states = None
+        # Rebuild a fresh, stale-free heap from the stored timestamps.
+        self._heap = [(int(self.times[i]), i) for i in range(size)]
+        heapq.heapify(self._heap)
+        self.sync_index()
