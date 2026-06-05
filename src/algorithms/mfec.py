@@ -114,6 +114,12 @@ class MFECAlgorithm(BaseAlgorithm):
             annealing_frames: int = 1_000_000,
             frames_per_batch: int = 1_000,
             max_frames_per_traj: int = -1,
+            # Quantisation precision for the exact-match hash key.
+            # Each embedding coordinate is multiplied by this factor and rounded
+            # to the nearest integer before being converted to bytes.  Higher
+            # values preserve more precision (fewer false-negatives) but make
+            # keys longer.  1e5 gives five decimal places of float32 stability.
+            key_scale: float = 1e5,
     ) -> None:
 
         super().__init__(device)
@@ -128,6 +134,7 @@ class MFECAlgorithm(BaseAlgorithm):
         self.annealing_frames = annealing_frames
         self.frames_per_batch = frames_per_batch
         self.max_frames_per_traj = max_frames_per_traj
+        self.key_scale = key_scale
 
         self._collected_frames = 0
 
@@ -150,7 +157,10 @@ class MFECAlgorithm(BaseAlgorithm):
             self.device if self.device is not None else torch.device("cpu")
         )
 
-        self.qec = QEC(num_actions, self.buffer_size, self.k, self._buffer_device)
+        self.qec = QEC(
+            num_actions, self.buffer_size, self.k, self._buffer_device,
+            key_scale=self.key_scale,
+        )
         self._num_actions = num_actions
 
         self.qec_policy = QECPolicy(self.qec, self.projection, num_actions)
@@ -179,7 +189,8 @@ class MFECAlgorithm(BaseAlgorithm):
 
         MFEC has no neural-network parameters to optimise.  The update is:
           1. Compute discounted Monte Carlo returns for each episode in the batch.
-          2. Insert (state_embedding, return) pairs into the per-action QEC buffers.
+          2. Exact-match states (hash lookup, O(1)) → max-aggregate the stored value.
+          3. Novel states → insert into the ring buffer via add_batch().
 
         Parameters
         ----------
@@ -189,7 +200,7 @@ class MFECAlgorithm(BaseAlgorithm):
         Returns
         -------
         dict
-            Scalar metrics logged by the trainer.
+            Scalar metrics including train/exact_hit_rate.
         """
 
         batch = batch.reshape(-1)
@@ -204,7 +215,7 @@ class MFECAlgorithm(BaseAlgorithm):
         # actions stay on GPU — no .cpu() needed.
         actions_gpu = batch["action"].to(dev).flatten().long()   # (n,)
 
-        # rewards/dones still go through scipy on CPU (not the bottleneck).
+        # rewards/dones go through scipy on CPU (not the bottleneck).
         rewards_np = batch["next", "reward"].cpu().numpy().flatten().astype(np.float64)
         dones_np   = batch["next", "done"].cpu().numpy().flatten().astype(bool)
 
@@ -226,7 +237,7 @@ class MFECAlgorithm(BaseAlgorithm):
         G_gpu = torch.tensor(G_all, dtype=torch.float64, device=dev)
 
         # Sort transitions by action on GPU — one argsort, no per-action CPU mask.
-        sorted_idx     = torch.argsort(actions_gpu, stable=True)   # (n,)
+        sorted_idx     = torch.argsort(actions_gpu, stable=True)
         sorted_states  = states_gpu[sorted_idx]                    # (n, d)
         sorted_values  = G_gpu[sorted_idx]                         # (n,)
         sorted_actions = actions_gpu[sorted_idx]                   # (n,) sorted
@@ -234,8 +245,11 @@ class MFECAlgorithm(BaseAlgorithm):
         counts  = torch.bincount(sorted_actions, minlength=self._num_actions)
         offsets = torch.zeros(self._num_actions + 1, dtype=torch.long, device=dev)
         offsets[1:] = counts.cumsum(0)
-        # One small CPU sync to read segment boundaries (A+1 integers).
+        # One CPU sync to read A+1 segment boundary integers.
         offsets_cpu = offsets.cpu().tolist()
+
+        total_queries = 0
+        total_hits    = 0
 
         for a in range(self._num_actions):
             s, e = offsets_cpu[a], offsets_cpu[a + 1]
@@ -244,28 +258,45 @@ class MFECAlgorithm(BaseAlgorithm):
 
             act_states = sorted_states[s:e]   # view — zero-copy slice
             act_values = sorted_values[s:e]
+            m = e - s
+            total_queries += m
 
-            if self.qec._sizes[a] > 0:
-                # Batched kNN for all m states of this action in one GPU call.
-                dists, nn_idx = self.qec.knn_action(act_states, a, 1)
-                exact = dists[:, 0] < 1e-5   # (m,) bool
+            # --- Exact-match path: O(m) hash lookup, no kNN needed ------
+            keys_a = self.qec._make_keys(act_states)
+            k_to_s = self.qec._key_to_slot[a]
+            exact_list = [key in k_to_s for key in keys_a]
+            n_hits = sum(exact_list)
+            total_hits += n_hits
 
-                if exact.any():
-                    ex_slots = nn_idx[:, 0][exact]
-                    # In-place max-aggregation; rare duplicate slots overwrite (acceptable).
-                    self.qec.values[a, ex_slots] = torch.maximum(
-                        self.qec.values[a, ex_slots], act_values[exact]
+            if n_hits:
+                hit_positions = [i for i, hit in enumerate(exact_list) if hit]
+                ex_slots = torch.tensor(
+                    [k_to_s[keys_a[i]] for i in hit_positions],
+                    dtype=torch.long, device=dev,
+                )
+                exact_t = torch.tensor(exact_list, dtype=torch.bool, device=dev)
+                # In-place max-aggregation; duplicate slots (rare) overwrite (acceptable).
+                self.qec.values[a, ex_slots] = torch.maximum(
+                    self.qec.values[a, ex_slots], act_values[exact_t]
+                )
+
+            # --- Novel states → ring-buffer insertion ---------------------
+            n_new = m - n_hits
+            if n_new:
+                if n_hits:
+                    novel_mask = torch.tensor(
+                        [not hit for hit in exact_list], dtype=torch.bool, device=dev
                     )
+                    self.qec.add_batch(a, act_states[novel_mask], act_values[novel_mask])
+                else:
+                    self.qec.add_batch(a, act_states, act_values)
 
-                new_mask = ~exact
-                if new_mask.any():
-                    self.qec.add_batch(a, act_states[new_mask], act_values[new_mask])
-            else:
-                self.qec.add_batch(a, act_states, act_values)
+        hit_rate = total_hits / total_queries if total_queries > 0 else 0.0
 
         return {
-            "train/epsilon":  float(self.greedy_module.eps),
-            "train/qec_size": float(np.mean(self.qec._sizes)),
+            "train/epsilon":        float(self.greedy_module.eps),
+            "train/qec_size":       float(np.mean(self.qec._sizes)),
+            "train/exact_hit_rate": hit_rate,
         }
 
     #
@@ -350,11 +381,8 @@ class QECPolicy(nn.Module):
         return flat @ self._proj_tensor
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        states = self.embed(obs)                   # (B, d) on obs.device
-
-        # Single fused call — one batched cdist across ALL actions, no thread pool.
-        q_values = self.qec.estimate_all(states)   # (B, A) on obs.device
-
+        states = self.embed(obs)                    # (B, d) on obs.device
+        q_values = self.qec.estimate_all(states)    # (B, A) — dict-first, kNN for misses
         q_values = torch.where(
             torch.isinf(q_values),
             torch.full_like(q_values, 1e9),
@@ -379,43 +407,92 @@ class _SharedPolicy(TensorDictSequential):
 # ---------------------------------------------------------------------------
 
 class QEC:
-    """Q-value Episodic Controller — fused GPU tensor layout.
+    """Q-value Episodic Controller — fused GPU tensors + per-action hash maps.
 
-    All action buffers share two pre-allocated GPU tensors:
+    GPU tensors (states, values) hold all action buffers in a single allocation:
 
         states : (num_actions, capacity, state_dim)  float32
         values : (num_actions, capacity)             float64
 
-    Each action has its own ring-buffer write pointer and fill count.
-    All kNN queries are batched across actions in a single torch.cdist call
-    (for forward) or chunked per-action (for step, where query counts vary).
+    A pair of Python dicts per action provides O(1) exact-match lookup,
+    implementing the paper's Eq. (2) "case 1" without any distance computation:
+
+        _key_to_slot[a] : bytes → int   (quantised embedding → slot index)
+        _slot_to_key[a] : int   → bytes (slot index → key, for O(1) eviction)
+
+    estimate_all() checks the dicts first and only falls back to kNN (cdist)
+    for novel queries.  add_batch() keeps the dicts consistent with the ring
+    buffer, evicting the stale key whenever a slot is overwritten.
 
     Parameters
     ----------
     num_actions : int
     capacity    : int — max entries per action
-    k           : int — number of nearest neighbours
+    k           : int — number of nearest neighbours for novel states
     device      : torch.device
+    key_scale   : float — multiply embeddings by this before rounding to int32
+                  for the hash key.  Higher → finer quantisation; must keep
+                  values within int32 range (~2.1 × 10⁹).  Default 1e5 gives
+                  five decimal places of float32 precision.
     """
 
     # Maximum intermediate (queries × stored) tensor in bytes before chunking.
-    # 256 MB keeps us well inside typical VRAM budgets.
     _CHUNK_BYTES = 256 * 1024 * 1024
 
     def __init__(
-        self, num_actions: int, capacity: int, k: int, device: torch.device
+        self,
+        num_actions: int,
+        capacity:    int,
+        k:           int,
+        device:      torch.device,
+        key_scale:   float = 1e5,
     ) -> None:
         self.num_actions = num_actions
         self.capacity    = capacity
         self.k           = k
         self.device      = device
+        self._key_scale  = key_scale
 
         self.states: torch.Tensor | None = None   # (A, C, d) — lazy init
         self.values = torch.empty(num_actions, capacity, dtype=torch.float64, device=device)
 
-        # Per-action scalars — updated at most A times per step().
+        # Per-action ring-buffer state.
         self._sizes      = [0] * num_actions
         self._write_ptrs = [0] * num_actions
+
+        # Per-action exact-match hash maps.
+        # _key_to_slot: used for O(1) lookup in estimate_all() and step().
+        # _slot_to_key: used for O(1) eviction when a ring-buffer slot wraps.
+        self._key_to_slot: list[dict[bytes, int]] = [{} for _ in range(num_actions)]
+        self._slot_to_key: list[dict[int, bytes]] = [{} for _ in range(num_actions)]
+
+    # ------------------------------------------------------------------
+    # Key generation
+    # ------------------------------------------------------------------
+
+    def _make_keys(self, states: torch.Tensor) -> list[bytes]:
+        """Convert a batch of float32 embeddings to stable bytes hash keys.
+
+        Each embedding row is multiplied by _key_scale and rounded to the
+        nearest int32, then converted to raw bytes.  This gives a key that
+        is identical for the same observation (the projection is deterministic)
+        and robust to float noise up to 0.5 / _key_scale per coordinate.
+
+        The paper relies on exact state re-encounters: same pixels → same key.
+        The random projection is fixed, so identical pixels always yield the
+        same float32 embedding, and hence the same key.
+
+        Parameters
+        ----------
+        states : (B, d) float32 — on any device
+
+        Returns
+        -------
+        list of B bytes objects (one per row)
+        """
+        q = torch.round(states * self._key_scale).to(torch.int32)
+        q_cpu = q.cpu().contiguous()
+        return [q_cpu[i].numpy().tobytes() for i in range(q_cpu.shape[0])]
 
     # ------------------------------------------------------------------
     # Lazy initialisation
@@ -434,10 +511,11 @@ class QEC:
 
     @torch.no_grad()
     def estimate_all(self, queries: torch.Tensor) -> torch.Tensor:
-        """Estimate Q(s, a) for all actions simultaneously.
+        """Estimate Q(s, a) for all actions.
 
-        One batched torch.cdist replaces A separate calls and eliminates
-        the thread pool that was needed to overlap them.
+        Per-query, per-action strategy (Eq. 2 of Blundell et al. 2016):
+          1. Dict lookup: O(1) — return stored value directly (no cdist).
+          2. kNN fallback: chunked cdist for queries not in the dict.
 
         Parameters
         ----------
@@ -447,8 +525,8 @@ class QEC:
         -------
         (B, A) float32 — on queries.device; +inf where memory is too sparse
         """
-        B   = queries.shape[0]
-        A   = self.num_actions
+        B     = queries.shape[0]
+        A     = self.num_actions
         dev_q = queries.device
 
         max_size = max(self._sizes)
@@ -458,49 +536,57 @@ class QEC:
         if queries.device != self.device:
             queries = queries.to(self.device)
 
-        sizes_t = torch.tensor(self._sizes, dtype=torch.long, device=self.device)
-        k_fetch = min(self.k + 1, max_size)
+        # One GPU→CPU sync to compute all keys (B rows × d int32 values).
+        keys = self._make_keys(queries)   # list[bytes], length B
 
-        # Expand queries to (A, B, d) — view with zero-copy stride trick.
-        # .contiguous() is needed for cdist's GEMM path.
-        q_exp = queries.unsqueeze(0).expand(A, B, -1).contiguous()   # (A, B, d)
+        result = torch.full((A, B), float("inf"), dtype=torch.float32, device=self.device)
 
-        # Single batched cdist across all actions: (A, B, max_size)
-        dists = torch.cdist(q_exp, self.states[:, :max_size, :])
+        for a in range(A):
+            size_a = self._sizes[a]
+            k_to_s = self._key_to_slot[a]
 
-        # Mask slots beyond each action's current fill to +inf.
-        slot_range = torch.arange(max_size, device=self.device)
-        invalid = slot_range[None, :] >= sizes_t[:, None]             # (A, max_size)
-        dists.masked_fill_(invalid[:, None, :], float("inf"))         # broadcast over B
+            # --- Exact-match path: O(B) dict lookups, zero GPU work -----
+            hit_b: list[int]   = []
+            hit_slots: list[int] = []
+            miss_b: list[int]  = []
+            for b, key in enumerate(keys):
+                slot = k_to_s.get(key)
+                if slot is not None:
+                    hit_b.append(b)
+                    hit_slots.append(slot)
+                else:
+                    miss_b.append(b)
 
-        top_dists, top_idx = dists.topk(k_fetch, dim=-1, largest=False)   # (A, B, k_fetch)
+            if hit_b:
+                hit_b_t = torch.tensor(hit_b,    dtype=torch.long, device=self.device)
+                hit_s_t = torch.tensor(hit_slots, dtype=torch.long, device=self.device)
+                result[a, hit_b_t] = self.values[a, hit_s_t].float()
 
-        # Exact match: nearest L2 distance below floating-point tolerance.
-        exact = top_dists[..., 0] < 1e-5   # (A, B)
+            if not miss_b:
+                continue   # all queries hit — no kNN needed for this action
 
-        # kNN average via gathered values.
-        k_use = min(self.k, k_fetch)
-        knn_idx = top_idx[..., :k_use]     # (A, B, k_use)
-        a_idx   = (
-            torch.arange(A, device=self.device)[:, None, None]
-            .expand(A, B, k_use)
-        )
-        knn_vals = self.values[a_idx, knn_idx].float()   # (A, B, k_use)
-        knn_avg  = knn_vals.mean(dim=-1)                 # (A, B)
+            # +inf for actions with too few stored entries (optimistic init)
+            if size_a <= self.k:
+                continue   # result[a, miss_b] stays +inf
 
-        a_idx1     = torch.arange(A, device=self.device)[:, None].expand(A, B)
-        exact_vals = self.values[a_idx1, top_idx[..., 0]].float()   # (A, B)
+            # --- kNN fallback for misses (chunked cdist) -----------------
+            miss_b_t   = torch.tensor(miss_b, dtype=torch.long, device=self.device)
+            miss_q     = queries[miss_b_t]     # (miss_count, d)
+            k_fetch    = min(self.k + 1, size_a)
+            dists, idx = self.knn_action(miss_q, a, k_fetch)  # (miss_count, k_fetch)
 
-        q_values = torch.where(exact, exact_vals, knn_avg)
+            # Near-exact in the kNN result (float safety; should be rare)
+            near_exact = dists[:, 0] < 1e-5
+            k_use      = min(self.k, k_fetch)
+            knn_vals   = self.values[a, idx[:, :k_use]].float()   # (miss_count, k_use)
+            knn_avg    = knn_vals.mean(dim=-1)
+            exact_vals = self.values[a, idx[:, 0]].float()
+            result[a, miss_b_t] = torch.where(near_exact, exact_vals, knn_avg)
 
-        # Actions with too few stored entries return +inf (optimistic exploration).
-        too_few  = sizes_t[:, None] <= self.k   # (A, 1) → broadcasts to (A, B)
-        q_values = torch.where(too_few, torch.full_like(q_values, float("inf")), q_values)
-
-        return q_values.T.to(dev_q)   # (B, A)
+        return result.T.to(dev_q)   # (B, A)
 
     # ------------------------------------------------------------------
-    # kNN for a single action — used in step()
+    # kNN for a single action — used by estimate_all() for misses
     # ------------------------------------------------------------------
 
     @torch.no_grad()
@@ -510,16 +596,15 @@ class QEC:
         action:  int,
         k:       int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Chunked kNN search for one action.
+        """Chunked kNN search for one action (exact L2, GPU-resident).
 
-        Processes the stored vectors in chunks sized to stay within
-        _CHUNK_BYTES, so the intermediate distance matrix never triggers OOM
-        regardless of buffer fill or query count.
+        Chunks the stored vectors to stay within _CHUNK_BYTES so the
+        intermediate distance matrix never triggers OOM.
 
         Returns
         -------
-        dists   : (m, k_eff) — L2 distances, on self.device
-        indices : (m, k_eff) — slot indices into self.states[action], on self.device
+        dists   : (m, k_eff) L2 distances — on self.device
+        indices : (m, k_eff) slot indices into self.states[action]
         """
         size  = self._sizes[action]
         k_eff = min(k, size)
@@ -529,19 +614,18 @@ class QEC:
 
         m = queries.shape[0]
         d = queries.shape[1]
-        # How many stored vectors fit in _CHUNK_BYTES alongside the query batch?
         chunk_size = max(1, self._CHUNK_BYTES // (m * d * 4))
         chunk_size = min(chunk_size, size)
 
         best_dists = torch.full((m, k_eff), float("inf"), device=self.device)
-        best_idx   = torch.zeros((m, k_eff), dtype=torch.long, device=self.device)
+        best_idx   = torch.zeros((m, k_eff), dtype=torch.long,  device=self.device)
 
         for cs in range(0, size, chunk_size):
-            ce = min(cs + chunk_size, size)
-            cd  = torch.cdist(queries, self.states[action, cs:ce])    # (m, chunk)
+            ce  = min(cs + chunk_size, size)
+            cd  = torch.cdist(queries, self.states[action, cs:ce])
             ck  = min(k_eff, ce - cs)
             chd, chi = cd.topk(ck, dim=1, largest=False)
-            chi = chi + cs   # shift to global slot indices
+            chi = chi + cs
 
             merged_d = torch.cat([best_dists, chd], dim=1)
             merged_i = torch.cat([best_idx,   chi], dim=1)
@@ -552,7 +636,7 @@ class QEC:
         return best_dists, best_idx
 
     # ------------------------------------------------------------------
-    # Insertion — ring-buffer scatter for one action
+    # Insertion — ring-buffer scatter + dict maintenance
     # ------------------------------------------------------------------
 
     def add_batch(
@@ -561,6 +645,12 @@ class QEC:
         states: torch.Tensor,   # (n, d) float32
         values: torch.Tensor,   # (n,) float64
     ) -> None:
+        """Insert novel (state, value) pairs via ring-buffer scatter.
+
+        Also registers each new key in _key_to_slot / _slot_to_key and
+        evicts the stale key of any overwritten slot so the dicts stay
+        consistent with the GPU tensors.
+        """
         n = len(states)
         if n == 0:
             return
@@ -571,17 +661,29 @@ class QEC:
 
         self._init_states(states.shape[1])
 
-        # If the batch itself exceeds capacity, keep only the newest entries.
         if n > self.capacity:
             states = states[-self.capacity:]
             values = values[-self.capacity:]
             n = self.capacity
 
-        # Destination slots via modular arithmetic — one GPU op.
         ptr   = self._write_ptrs[action]
         slots = torch.arange(ptr, ptr + n, device=self.device) % self.capacity
         self.states[action, slots] = states
         self.values[action, slots] = values
+
+        # Dict maintenance: O(n) Python operations.
+        new_keys   = self._make_keys(states)   # one GPU→CPU sync (n rows)
+        slots_list = slots.tolist()
+        k_to_s     = self._key_to_slot[action]
+        s_to_k     = self._slot_to_key[action]
+        for slot, key in zip(slots_list, new_keys):
+            # Evict the previous occupant of this slot (ring-buffer overwrite).
+            old_key = s_to_k.get(slot)
+            if old_key is not None:
+                k_to_s.pop(old_key, None)
+            # Register the new entry.
+            k_to_s[key]  = slot
+            s_to_k[slot] = key
 
         self._write_ptrs[action] = int((ptr + n) % self.capacity)
         self._sizes[action]      = min(self._sizes[action] + n, self.capacity)
@@ -592,20 +694,20 @@ class QEC:
 
     def __getstate__(self) -> dict:
         d: dict = {
-            "num_actions":  self.num_actions,
-            "capacity":     self.capacity,
-            "k":            self.k,
-            "device":       self.device,
-            "_sizes":       list(self._sizes),
-            "_write_ptrs":  list(self._write_ptrs),
+            "num_actions":   self.num_actions,
+            "capacity":      self.capacity,
+            "k":             self.k,
+            "device":        self.device,
+            "key_scale":     self._key_scale,
+            "_sizes":        list(self._sizes),
+            "_write_ptrs":   list(self._write_ptrs),
             "action_states": None,
             "action_values": None,
         }
         if self.states is None:
             return d
 
-        action_states = []
-        action_values = []
+        action_states, action_values = [], []
         for a in range(self.num_actions):
             sz  = self._sizes[a]
             ptr = self._write_ptrs[a]
@@ -613,7 +715,7 @@ class QEC:
                 action_states.append(None)
                 action_values.append(np.array([], dtype=np.float64))
                 continue
-            # Rotate so index 0 = oldest entry (preserves write-order on load).
+            # Rotate so index 0 = oldest entry (write-order on load).
             if sz == self.capacity and ptr != 0:
                 s = torch.roll(self.states[a], -ptr, dims=0)[:sz]
                 v = torch.roll(self.values[a], -ptr, dims=0)[:sz]
@@ -632,19 +734,24 @@ class QEC:
         self.capacity    = d["capacity"]
         self.k           = d["k"]
         self.device      = d["device"]
+        self._key_scale  = d.get("key_scale", 1e5)   # default for old checkpoints
         self._sizes      = list(d["_sizes"])
         self._write_ptrs = list(d["_write_ptrs"])
 
         dev = self.device
         self.values = torch.empty(self.num_actions, self.capacity, dtype=torch.float64, device=dev)
 
+        # Initialise empty dicts — rebuilt from tensors below.
+        self._key_to_slot = [{} for _ in range(self.num_actions)]
+        self._slot_to_key = [{} for _ in range(self.num_actions)]
+
         if d["action_states"] is None:
             self.states = None
             return
 
-        # Determine state_dim from first non-empty action.
         state_dim = next(
-            (s.shape[1] for s in d["action_states"] if s is not None and s.ndim == 2 and s.shape[0] > 0),
+            (s.shape[1] for s in d["action_states"]
+             if s is not None and s.ndim == 2 and s.shape[0] > 0),
             None,
         )
         if state_dim is None:
@@ -659,3 +766,15 @@ class QEC:
             if sz > 0 and s_np is not None:
                 self.states[a, :sz] = torch.from_numpy(s_np).to(dev)
                 self.values[a, :sz] = torch.from_numpy(v_np).to(dev)
+
+        # Rebuild dicts from the restored tensors (no need to pickle the dicts).
+        for a in range(self.num_actions):
+            sz = self._sizes[a]
+            if sz == 0:
+                continue
+            keys_a = self._make_keys(self.states[a, :sz])
+            k_to_s = self._key_to_slot[a]
+            s_to_k = self._slot_to_key[a]
+            for slot, key in enumerate(keys_a):
+                k_to_s[key]  = slot
+                s_to_k[slot] = key
