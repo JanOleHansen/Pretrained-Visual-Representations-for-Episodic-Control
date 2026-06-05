@@ -233,9 +233,7 @@ class MFECAlgorithm(BaseAlgorithm):
             ep_start = ep_end + 1
 
         dev = self._buffer_device
-        G_gpu     = torch.tensor(G_all, dtype=torch.float64, device=dev)
-        frame_times = (self._collected_frames - n) + np.arange(n, dtype=np.int64)
-        times_gpu = torch.tensor(frame_times, dtype=torch.int64, device=dev)
+        G_gpu = torch.tensor(G_all, dtype=torch.float64, device=dev)
 
         if states_gpu.device != dev:
             states_gpu = states_gpu.to(dev)
@@ -248,27 +246,24 @@ class MFECAlgorithm(BaseAlgorithm):
             mask_t     = torch.from_numpy(mask_np).to(dev)
             act_states = states_gpu[mask_t]   # (m, state_dim)
             act_values = G_gpu[mask_t]        # (m,)
-            act_times  = times_gpu[mask_t]    # (m,)
 
             buf = self.qec.buffers[action]
 
             if buf._size > 0:
                 # One batched torch.cdist call for all m states of this action.
                 dists, nn_idx = buf.knn_batch(act_states, 1)   # (m, 1) each
-                nn_dist = dists[:, 0]                           # (m,)
-                exact   = nn_dist < 1e-5                        # (m,) bool
+                exact = dists[:, 0] < 1e-5                      # (m,) bool
 
                 if exact.any():
                     ex_slots = nn_idx[:, 0][exact]
-                    # Max-aggregation in-place; duplicates (rare) overwrite, which is acceptable.
+                    # Max-aggregation in-place; duplicate slots (rare) overwrite, acceptable.
                     buf.values[ex_slots] = torch.maximum(buf.values[ex_slots], act_values[exact])
-                    buf.times[ex_slots]  = torch.maximum(buf.times[ex_slots],  act_times[exact])
 
                 new_mask = ~exact
                 if new_mask.any():
-                    buf.add_batch(act_states[new_mask], act_values[new_mask], act_times[new_mask])
+                    buf.add_batch(act_states[new_mask], act_values[new_mask])
             else:
-                buf.add_batch(act_states, act_values, act_times)
+                buf.add_batch(act_states, act_values)
 
         return {
             "train/epsilon": float(self.greedy_module.eps),
@@ -304,15 +299,7 @@ class MFECAlgorithm(BaseAlgorithm):
             optimizer_state_dict={},
             extra={
                 "projection": self.projection,
-                "qec_state": [
-                    {
-                        "states": b.states[:b._size].cpu().numpy() if b.states is not None and b._size > 0 else None,
-                        "values": b.values[:b._size].cpu().numpy() if b._size > 0 else np.array([], dtype=np.float64),
-                        "times":  b.times[:b._size].cpu().numpy()  if b._size > 0 else np.array([], dtype=np.int64),
-                        "size":   b._size,
-                    }
-                    for b in self.qec.buffers
-                ],
+                "qec_state": [b.__getstate__() for b in self.qec.buffers],
                 "collected_frames": self._collected_frames,
             },
         )
@@ -324,22 +311,8 @@ class MFECAlgorithm(BaseAlgorithm):
         self.qec_policy._proj_tensor = None
         self._collected_frames = int(state.extra["collected_frames"])
 
-        dev = self._buffer_device
         for buf, saved in zip(self.qec.buffers, state.extra["qec_state"]):
-            size = saved["size"]
-            buf._size  = size
-            buf.values = torch.empty(buf.capacity, dtype=torch.float64, device=dev)
-            buf.times  = torch.zeros(buf.capacity, dtype=torch.int64,   device=dev)
-            if size > 0:
-                buf.values[:size] = torch.from_numpy(np.asarray(saved["values"])).to(dev)
-                buf.times[:size]  = torch.from_numpy(np.asarray(saved["times"])).to(dev)
-            saved_states = saved["states"]
-            if saved_states is not None and size > 0:
-                arr = np.asarray(saved_states)
-                buf.states = torch.empty(buf.capacity, arr.shape[1], dtype=torch.float32, device=dev)
-                buf.states[:size] = torch.from_numpy(arr).to(dev)
-            else:
-                buf.states = None
+            buf.__setstate__(saved)
 
 
 # ---------------------------------------------------------------------------
@@ -492,9 +465,10 @@ class QEC:
 class ActionBuffer:
     """Fixed-capacity nearest-neighbour memory for a single action.
 
-    All data lives in three persistent GPU tensors (states, values, times).
+    All data lives in two persistent GPU tensors (states, values).
     kNN queries use batched torch.cdist (exact L2, fully GPU-parallelised).
-    LRU eviction uses vectorised topk on the times tensor — no heap needed.
+    Eviction is FIFO via a ring buffer — a single modular write pointer,
+    no LRU heap or times tensor needed.
 
     Parameters
     ----------
@@ -503,14 +477,14 @@ class ActionBuffer:
     """
 
     def __init__(self, capacity: int, device: torch.device) -> None:
-        self.capacity = capacity
-        self.device   = device
-        self._size: int = 0
+        self.capacity   = capacity
+        self.device     = device
+        self._size:      int = 0   # grows to capacity, then stays there
+        self._write_ptr: int = 0   # next slot to write (ring buffer)
         # states is lazily allocated on the first add_batch() call when
         # state_dim becomes known.
-        self.states: torch.Tensor | None = None               # (capacity, state_dim) float32
+        self.states: torch.Tensor | None = None          # (capacity, state_dim) float32
         self.values: torch.Tensor = torch.empty(capacity, dtype=torch.float64, device=device)
-        self.times:  torch.Tensor = torch.zeros(capacity, dtype=torch.int64,   device=device)
 
     # ------------------------------------------------------------------
     # kNN lookup
@@ -547,9 +521,13 @@ class ActionBuffer:
         self,
         states: torch.Tensor,   # (n, state_dim) float32
         values: torch.Tensor,   # (n,) float64
-        times:  torch.Tensor,   # (n,) int64
     ) -> None:
-        """Insert a batch of (state, value, time) entries, evicting LRU as needed."""
+        """Insert a batch of (state, value) entries via ring-buffer scatter.
+
+        When n ≥ capacity, only the last `capacity` entries are kept (earlier
+        ones would be immediately overwritten anyway).  The write pointer
+        advances modulo capacity so no eviction decision is ever needed.
+        """
         n = len(states)
         if n == 0:
             return
@@ -557,40 +535,25 @@ class ActionBuffer:
         if states.device != self.device:
             states = states.to(self.device)
             values = values.to(self.device)
-            times  = times.to(self.device)
 
         if self.states is None:
             self.states = torch.empty(
                 self.capacity, states.shape[1], dtype=torch.float32, device=self.device
             )
 
-        # Phase 1: fill free slots without eviction.
-        free = self.capacity - self._size
-        if free > 0:
-            n_fill = min(n, free)
-            end = self._size + n_fill
-            self.states[self._size:end] = states[:n_fill]
-            self.values[self._size:end] = values[:n_fill]
-            self.times [self._size:end] = times [:n_fill]
-            self._size = end
-            states = states[n_fill:]
-            values = values[n_fill:]
-            times  = times [n_fill:]
-            n -= n_fill
+        # If the batch itself exceeds capacity, only the newest entries matter.
+        if n > self.capacity:
+            states = states[-self.capacity:]
+            values = values[-self.capacity:]
+            n = self.capacity
 
-        if n == 0:
-            return
+        # Destination slots via modular arithmetic — single GPU op.
+        slots = torch.arange(self._write_ptr, self._write_ptr + n, device=self.device) % self.capacity
+        self.states[slots] = states
+        self.values[slots] = values
 
-        # Phase 2: buffer is full — evict the n LRU entries.
-        # Pair newest incoming ↔ oldest stored: newest new entry replaces the
-        # oldest existing entry, maximising the recency of the buffer overall.
-        lru_times, lru_idx = self.times.topk(n, largest=False)   # n smallest stored times
-        new_t_sorted, order = times.sort(descending=True)         # newest incoming first
-        mask  = new_t_sorted > lru_times                          # only replace if newer
-        slots = lru_idx[mask]
-        self.states[slots] = states[order[mask]]
-        self.values[slots] = values[order[mask]]
-        self.times [slots] = new_t_sorted[mask]
+        self._write_ptr = int((self._write_ptr + n) % self.capacity)
+        self._size      = min(self._size + n, self.capacity)
 
     def __len__(self) -> int:
         return self._size
@@ -601,27 +564,35 @@ class ActionBuffer:
 
     def __getstate__(self) -> dict:
         size = self._size
+        # When the buffer has wrapped (size == capacity), save all slots in
+        # write-order so __setstate__ can restore the ring without gaps.
+        if size == self.capacity and self.states is not None:
+            # Rotate so slot[0] = oldest entry (the one write_ptr points at).
+            ptr = self._write_ptr
+            states_np = torch.roll(self.states, -ptr, dims=0).cpu().numpy()
+            values_np = torch.roll(self.values, -ptr, dims=0).cpu().numpy()
+        else:
+            states_np = self.states[:size].cpu().numpy() if self.states is not None and size > 0 else None
+            values_np = self.values[:size].cpu().numpy() if size > 0 else np.array([], dtype=np.float64)
         return {
-            "capacity": self.capacity,
-            "device":   self.device,
-            "_size":    size,
-            # Compact CPU numpy slices for portability across hardware.
-            "states": self.states[:size].cpu().numpy() if self.states is not None and size > 0 else None,
-            "values": self.values[:size].cpu().numpy() if size > 0 else np.array([], dtype=np.float64),
-            "times":  self.times[:size].cpu().numpy()  if size > 0 else np.array([], dtype=np.int64),
+            "capacity":   self.capacity,
+            "device":     self.device,
+            "_size":      size,
+            "_write_ptr": self._write_ptr,
+            "states":     states_np,
+            "values":     values_np,
         }
 
     def __setstate__(self, d: dict) -> None:
-        self.capacity = d["capacity"]
-        self.device   = d["device"]
-        self._size    = d["_size"]
+        self.capacity   = d["capacity"]
+        self.device     = d["device"]
+        self._size      = d["_size"]
+        self._write_ptr = d["_write_ptr"]
         dev  = self.device
         size = self._size
         self.values = torch.empty(self.capacity, dtype=torch.float64, device=dev)
-        self.times  = torch.zeros(self.capacity, dtype=torch.int64,   device=dev)
         if size > 0:
             self.values[:size] = torch.from_numpy(d["values"]).to(dev)
-            self.times[:size]  = torch.from_numpy(d["times"]).to(dev)
         saved = d["states"]
         if saved is not None and size > 0:
             self.states = torch.empty(self.capacity, saved.shape[1], dtype=torch.float32, device=dev)
