@@ -6,7 +6,7 @@ defaults:
   - _self_
 
 trainer:
-  total_frames: 40_000_000
+  total_frames: 1_000_000
   accelerator: gpu
   devices: [0]
   num_envs: 1
