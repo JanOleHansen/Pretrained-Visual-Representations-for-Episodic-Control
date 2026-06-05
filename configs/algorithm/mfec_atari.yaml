@@ -10,3 +10,5 @@ eps_end: 0.05
 annealing_frames: 70_000
 frames_per_batch: 1_000
 max_frames_per_traj: -1
+hnsw_m: 32
+hnsw_ef_search: 50

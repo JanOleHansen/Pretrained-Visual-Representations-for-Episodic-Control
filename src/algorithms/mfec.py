@@ -133,6 +133,15 @@ class MFECAlgorithm(BaseAlgorithm):
             frames_per_batch: int = 1_000,
             # Hard cap on episode length; -1 means no limit.
             max_frames_per_traj: int = -1,
+
+            #   HNSW approximate-index parameters
+            # Number of bi-directional HNSW links per element.  Higher M → better
+            # recall and faster queries at the cost of more memory and slower inserts.
+            # 32 is a good general-purpose default.
+            hnsw_m: int = 32,
+            # Size of the dynamic candidate list during search.  Must be >= k.
+            # Higher ef_search → better recall, slightly slower queries.
+            hnsw_ef_search: int = 50,
     ) -> None:
         
         super().__init__(device)
@@ -148,6 +157,8 @@ class MFECAlgorithm(BaseAlgorithm):
         self.annealing_frames = annealing_frames
         self.frames_per_batch = frames_per_batch
         self.max_frames_per_traj = max_frames_per_traj
+        self.hnsw_m = hnsw_m
+        self.hnsw_ef_search = hnsw_ef_search
 
         # Running count of all environment frames seen so far.  Used as an LRU timestamp when inserting entries into the QEC buffers.
         self._collected_frames = 0
@@ -168,12 +179,10 @@ class MFECAlgorithm(BaseAlgorithm):
         self.projection = np.random.randn(obs_flat_dim, self.state_dim)
         self.projection /= np.linalg.norm(self.projection, axis=0)
 
-        if self.device is not None and self.device.type == "cuda":
-            gpu_id = self.device.index if self.device.index is not None else 0
-        else:
-            gpu_id = -1
-
-        self.qec = QEC(range(num_actions), self.buffer_size, self.k, gpu_id=gpu_id)
+        self.qec = QEC(
+            range(num_actions), self.buffer_size, self.k,
+            hnsw_m=self.hnsw_m, hnsw_ef_search=self.hnsw_ef_search,
+        )
         self._num_actions = num_actions
 
         self.qec_policy = QECPolicy(self.qec, self.projection, num_actions)
@@ -487,10 +496,13 @@ class QEC:
     k           : number of nearest neighbours for Q-value estimation
     """
 
-    def __init__(self, actions, buffer_size: int, k: int, gpu_id: int = -1) -> None:
+    def __init__(self, actions, buffer_size: int, k: int, hnsw_m: int = 32, hnsw_ef_search: int = 50) -> None:
         # One independent buffer per action.  Using a tuple prevents accidental
         # reassignment of individual buffers.
-        self.buffers = tuple(ActionBuffer(buffer_size, gpu_id=gpu_id) for _ in actions)
+        self.buffers = tuple(
+            ActionBuffer(buffer_size, hnsw_m=hnsw_m, hnsw_ef_search=hnsw_ef_search)
+            for _ in actions
+        )
         self.k = k
         self.executor = ThreadPoolExecutor(max_workers=len(self.buffers))
 
@@ -632,7 +644,7 @@ class ActionBuffer:
     """Fixed-capacity nearest-neighbour memory for a single action.
 
     Internally maintains three parallel lists — states, values, times —
-    alongside a FAISS IndexFlatL2 for fast kNN queries.
+    alongside a FAISS IndexHNSWFlat for approximate O(log n) kNN queries.
 
     The index is kept in sync lazily: sync_index() is called once per
     training batch (by QEC.rebuild_trees()) rather than after every insert.
@@ -648,15 +660,16 @@ class ActionBuffer:
     Parameters
     ----------
     capacity : int — maximum number of (state, return) entries to store
-    gpu_id   : int — CUDA device index for FAISS GPU acceleration; -1 = CPU
+    hnsw_m        : int — HNSW connections per element (default 32)
+    hnsw_ef_search: int — HNSW search-time candidate list size (default 50)
     """
 
-    def __init__(self, capacity: int, gpu_id: int = -1) -> None:
+    def __init__(self, capacity: int, hnsw_m: int = 32, hnsw_ef_search: int = 50) -> None:
         self._index: faiss.Index | None = None
         self._index_size: int = 0        # entries currently reflected in _index
         self._needs_rebuild: bool = False  # True after an in-place eviction
-        self._gpu_id = gpu_id
-        self._gpu_res: object | None = None  # faiss.StandardGpuResources, lazy
+        self._hnsw_m = hnsw_m
+        self._hnsw_ef_search = hnsw_ef_search
         self.capacity = capacity
         self._size: int = 0
         # states is a preallocated (capacity, state_dim) float32 array, lazily
@@ -677,11 +690,12 @@ class ActionBuffer:
     # ------------------------------------------------------------------
 
     def _make_index(self, state_dim: int) -> faiss.Index:
-        index = faiss.IndexFlatL2(state_dim)
-        if self._gpu_id >= 0 and faiss.get_num_gpus() > 0:
-            if self._gpu_res is None:
-                self._gpu_res = faiss.StandardGpuResources()
-            index = faiss.index_cpu_to_gpu(self._gpu_res, self._gpu_id, index)
+        # IndexHNSWFlat: O(log n) approximate kNN, no training step, CPU-only.
+        # efConstruction controls graph quality at build time; 2*M is the FAISS
+        # minimum and 200 is the practical sweet-spot for recall vs. build cost.
+        index = faiss.IndexHNSWFlat(state_dim, self._hnsw_m)
+        index.hnsw.efConstruction = max(200, 2 * self._hnsw_m)
+        index.hnsw.efSearch = self._hnsw_ef_search
         return index
 
     def sync_index(self) -> None:
@@ -776,9 +790,8 @@ class ActionBuffer:
 
     def __getstate__(self):
         d = self.__dict__.copy()
-        # FAISS index and GPU resources are not picklable; drop them.
+        # FAISS index is not picklable; drop it (rebuilt on load via sync_index).
         d["_index"] = None
-        d["_gpu_res"] = None
         d["_index_size"] = 0
         d["_needs_rebuild"] = False
         # Heap is rebuilt cheaply from times on load; don't pickle it.
