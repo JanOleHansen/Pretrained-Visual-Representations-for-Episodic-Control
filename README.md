@@ -34,14 +34,15 @@ Two derived rules:
 
 **Implemented experiments:**
 
-| Algorithm | Environment    | Config                          |
-|-----------|----------------|---------------------------------|
-| DQN       | CartPole-v1    | `experiment=dqn/cartpole`       |
-| DQN       | ALE/Pong-v5    | `experiment=dqn/pong`           |
-| DDPG      | HalfCheetah-v4 | `experiment=ddpg/halfcheetah`   |
-| A2C       | HalfCheetah-v4 | `experiment=a2c/halfcheetah`    |
-
-Other algorithms will follow.
+| Algorithm | Environment      | Config                          |
+|-----------|------------------|---------------------------------|
+| DQN       | CartPole-v1      | `experiment=dqn/cartpole`       |
+| DQN       | ALE/Pong-v5      | `experiment=dqn/pong`           |
+| DDPG      | HalfCheetah-v4   | `experiment=ddpg/halfcheetah`   |
+| A2C       | HalfCheetah-v4   | `experiment=a2c/halfcheetah`    |
+| MFEC      | ALE/Pong-v5      | `experiment=mfec/pong`          |
+| MFEC      | ALE/Breakout-v5  | `experiment=mfec/breakout`      |
+| MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`         |
 
 ## Main technologies
 
@@ -251,11 +252,16 @@ configs/
 │   ├── dqn.yaml            <- DQN HPs (CartPole defaults)
 │   ├── dqn_atari.yaml      <- DQN HPs (Atari/NatureDQN defaults)
 │   ├── ddpg.yaml           <- DDPG HPs (HalfCheetah defaults)
-│   └── a2c.yaml            <- A2C HPs (HalfCheetah/MuJoCo defaults)
+│   ├── a2c.yaml            <- A2C HPs (HalfCheetah/MuJoCo defaults)
+│   └── mfec_atari.yaml     <- MFEC HPs (Atari defaults; random projection, QEC)
 ├── environment/
 │   ├── cartpole.yaml       <- env name + transforms
 │   ├── pong_train.yaml     <- Pong with EndOfLife + Sign + VecNorm (training)
 │   ├── pong_eval.yaml      <- Pong without those transforms (evaluation)
+│   ├── breakout_train.yaml <- Breakout training transforms
+│   ├── breakout_eval.yaml  <- Breakout eval transforms
+│   ├── qbert_train.yaml    <- Q*Bert training transforms
+│   ├── qbert_eval.yaml     <- Q*Bert eval transforms
 │   └── halfcheetah.yaml    <- HalfCheetah-v4 (DoubleToFloat + InitTracker)
 ├── logger/
 │   ├── wandb.yaml
@@ -267,8 +273,12 @@ configs/
     │   └── pong.yaml       <- composed Atari Pong experiment
     ├── ddpg/
     │   └── halfcheetah.yaml <- composed DDPG HalfCheetah experiment
-    └── a2c/
-        └── halfcheetah.yaml <- composed A2C HalfCheetah experiment
+    ├── a2c/
+    │   └── halfcheetah.yaml <- composed A2C HalfCheetah experiment
+    └── mfec/
+        ├── pong.yaml       <- MFEC on Pong (40M frames)
+        ├── breakout.yaml   <- MFEC on Breakout (1M frames)
+        └── qbert.yaml      <- MFEC on Q*Bert (40M frames)
 ```
 
 ### Override hierarchy

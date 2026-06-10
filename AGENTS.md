@@ -9,14 +9,15 @@ A modular reinforcement learning research template built on
 
 Implemented experiments:
 
-| Algorithm | Environment    | Experiment config             |
-|-----------|----------------|-------------------------------|
-| DQN       | CartPole-v1    | `experiment=dqn/cartpole`     |
-| DQN       | ALE/Pong-v5    | `experiment=dqn/pong`         |
-| DDPG      | HalfCheetah-v4 | `experiment=ddpg/halfcheetah` |
-| A2C       | HalfCheetah-v4 | `experiment=a2c/halfcheetah`  |
-
-Other algorithms will follow.
+| Algorithm | Environment      | Experiment config              |
+|-----------|------------------|--------------------------------|
+| DQN       | CartPole-v1      | `experiment=dqn/cartpole`      |
+| DQN       | ALE/Pong-v5      | `experiment=dqn/pong`          |
+| DDPG      | HalfCheetah-v4   | `experiment=ddpg/halfcheetah`  |
+| A2C       | HalfCheetah-v4   | `experiment=a2c/halfcheetah`   |
+| MFEC      | ALE/Pong-v5      | `experiment=mfec/pong`         |
+| MFEC      | ALE/Breakout-v5  | `experiment=mfec/breakout`     |
+| MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`        |
 
 ## Design principles
 
@@ -298,19 +299,27 @@ configs/
   algorithm/dqn_atari.yaml  — DQN HPs (Atari/NatureDQN defaults; pixel obs)
   algorithm/ddpg.yaml       — DDPG HPs (HalfCheetah defaults); _partial_ actor/critic/noise
   algorithm/a2c.yaml        — A2C HPs (HalfCheetah/MuJoCo defaults); _partial_ actor/value
+  algorithm/mfec_atari.yaml — MFEC HPs (Atari defaults: buffer_size=1M, k=11, state_dim=64)
   environment/cartpole.yaml — env kwargs (name, transforms)
   environment/pong_train.yaml — Atari Pong env (training transforms incl. EndOfLife + Sign + VecNorm)
   environment/pong_eval.yaml  — Atari Pong env (eval transforms; drops EndOfLife + Sign + VecNorm)
+  environment/breakout_train.yaml — Atari Breakout (training transforms; same stack as Pong)
+  environment/breakout_eval.yaml  — Atari Breakout (eval transforms)
+  environment/qbert_train.yaml    — ALE/Qbert-v5 (training transforms; same stack as Pong)
+  environment/qbert_eval.yaml     — ALE/Qbert-v5 (eval transforms)
   environment/halfcheetah.yaml — HalfCheetah-v4 (DoubleToFloat + InitTracker)
   experiment/dqn/cartpole.yaml — composed CartPole experiment
   experiment/dqn/pong.yaml     — composed Atari Pong experiment
   experiment/ddpg/halfcheetah.yaml — composed DDPG HalfCheetah experiment
   experiment/a2c/halfcheetah.yaml — composed A2C HalfCheetah experiment
+  experiment/mfec/pong.yaml    — MFEC on Pong (40M frames, num_envs=16)
+  experiment/mfec/breakout.yaml — MFEC on Breakout (1M frames)
+  experiment/mfec/qbert.yaml   — MFEC on Q*Bert (40M frames, num_envs=16)
   logger/{wandb,tensorboard}.yaml
   paths/default.yaml
   train.yaml, eval.yaml
 tests/
-  test_smoke.py             — DQN-on-CartPole, DQN-on-Pong, DDPG-on-HalfCheetah, A2C-on-HalfCheetah smoke tests
+  test_smoke.py             — DQN-on-CartPole, DQN-on-Pong, DDPG-on-HalfCheetah, A2C-on-HalfCheetah, MFEC-on-Pong smoke tests
 ```
 
 ## Adding a new algorithm
@@ -346,5 +355,7 @@ python src/train.py experiment=dqn/cartpole 'logger=[wandb]'  # experiments defa
 python src/train.py experiment=dqn/pong            # Atari Pong (40M frames, GPU)
 python src/train.py experiment=ddpg/halfcheetah    # DDPG continuous control (1M frames)
 python src/train.py experiment=a2c/halfcheetah     # A2C on-policy continuous control (1M frames)
+python src/train.py experiment=mfec/pong           # MFEC on Pong (40M frames, GPU)
+python src/train.py experiment=mfec/qbert          # MFEC on Q*Bert (40M frames, GPU)
 pytest tests/test_smoke.py -v
 ```

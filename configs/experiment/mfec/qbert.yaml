@@ -1,0 +1,17 @@
+# @package _global_
+# MFEC on ALE/Qbert-v5 — same hyperparameters as the Pong run.
+# Q*Bert has 6 actions, so the mfec_atari defaults (buffer_size=1M, k=11,
+# state_dim=64, gamma=0.99) apply without change.
+defaults:
+  - override /algorithm: mfec_atari
+  - override /environment: qbert_train
+  - override /environment@eval_environment: qbert_eval
+  - _self_
+
+trainer:
+  total_frames: 40_000_100
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  num_envs: 16
+  log_every_n_steps: 10_000

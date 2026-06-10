@@ -1,0 +1,35 @@
+name: ALE/Qbert-v5
+gym_backend: gymnasium
+gym_kwargs:
+  frame_skip: 4
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# Standard Atari training transform stack (Mnih et al. 2015).
+# EndOfLifeTransform ends each sub-episode on a life loss so the agent cannot
+# learn to exploit "free" steps between lives.  SignTransform clips rewards to
+# {-1, 0, +1} to stabilise training across games with different score scales.
+# VecNorm whitens the pixel observations online.  All three are train-only; see
+# qbert_eval.yaml for the evaluation variant.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.EndOfLifeTransform
+  - _target_: torchrl.envs.SignTransform
+    in_keys: [reward]
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.GrayScale
+  - _target_: torchrl.envs.Resize
+    w: 84
+    h: 84
+  - _target_: torchrl.envs.CatFrames
+    N: 4
+    dim: -3
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    max_steps: 4500
+  - _target_: torchrl.envs.DoubleToFloat
+  - _target_: torchrl.envs.VecNorm
+    in_keys: [pixels]
