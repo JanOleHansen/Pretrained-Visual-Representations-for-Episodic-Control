@@ -157,6 +157,13 @@ class MFECAlgorithm(BaseAlgorithm):
             self.device if self.device is not None else torch.device("cpu")
         )
 
+        # Detect number of parallel envs from the proof env's batch_size.
+        # ParallelEnv(E, fn).batch_size = torch.Size([E]); single env → Size([]).
+        env_bs = proof_env.batch_size
+        self._num_envs: int = int(env_bs[0]) if len(env_bs) == 1 else 1
+        # Per-env carry buffers for partial episodes that span batch boundaries.
+        self._carry: list[dict | None] = [None] * self._num_envs
+
         self.qec = QEC(
             num_actions, self.buffer_size, self.k, self._buffer_device,
             key_scale=self.key_scale,
@@ -188,14 +195,20 @@ class MFECAlgorithm(BaseAlgorithm):
         """Process one batch of collected transitions and update QEC memory.
 
         MFEC has no neural-network parameters to optimise.  The update is:
-          1. Compute discounted Monte Carlo returns for each episode in the batch.
-          2. Exact-match states (hash lookup, O(1)) → max-aggregate the stored value.
-          3. Novel states → insert into the ring buffer via add_batch().
+          1. Compute discounted Monte Carlo returns per env (Bug 1 fix).
+          2. Buffer partial episodes across batch boundaries (Bug 2 fix).
+          3. Exact-match states (hash lookup, O(1)) → max-aggregate the stored value.
+          4. Novel states → insert into the ring buffer via add_batch().
+
+        The collector batch from SyncDataCollector with ParallelEnv(E, fn) has
+        batch_size = (E, T).  Computing returns on the flat (E*T,) representation
+        mixes trajectories from different envs, corrupting the learning signal.
+        This method always operates on the (E, T) structure before flattening.
 
         Parameters
         ----------
         batch : TensorDict
-            Transitions from SyncDataCollector.  May span multiple episodes.
+            Transitions from SyncDataCollector.  Shape (E, T) or (T,) for E=1.
 
         Returns
         -------
@@ -203,44 +216,123 @@ class MFECAlgorithm(BaseAlgorithm):
             Scalar metrics including train/exact_hit_rate.
         """
 
-        batch = batch.reshape(-1)
-        n = batch.numel()
+        # --- 1. Determine per-env shape -----------------------------------
+        # Collector yields (E, T) with ParallelEnv(E, fn); (T,) with single env.
+        bs = batch.batch_size
+        if len(bs) == 2:
+            E, T = int(bs[0]), int(bs[1])
+        elif len(bs) == 1:
+            E, T = 1, int(bs[0])
+        else:
+            raise ValueError(f"Unexpected batch shape: {bs}")
+        n = E * T
 
         self.greedy_module.step(n)
         self._collected_frames += n
 
         dev = self._buffer_device
-        obs = batch[self.obs_key]
 
-        # actions stay on GPU — no .cpu() needed.
-        actions_gpu = batch["action"].to(dev).flatten().long()   # (n,)
+        # --- 2. Embed all observations in one GPU matmul ------------------
+        # embed() does reshape(-1, flat_dim) internally, so any leading shape works.
+        obs        = batch[self.obs_key]                          # (E, T, *obs)
+        states_all = self.qec_policy.embed(obs)                   # (E*T, d)
+        if states_all.device != dev:
+            states_all = states_all.to(dev)
+        states_2d = states_all.reshape(E, T, -1)                  # (E, T, d)
 
-        # rewards/dones go through scipy on CPU (not the bottleneck).
-        rewards_np = batch["next", "reward"].cpu().numpy().flatten().astype(np.float64)
-        dones_np   = batch["next", "done"].cpu().numpy().flatten().astype(bool)
+        # Flatten to 1D then reshape to (E, T) — handles the (E,T,1) reward shape.
+        rewards_2d = (batch["next", "reward"].cpu().numpy()
+                      .flatten().astype(np.float64).reshape(E, T))
+        dones_2d   = (batch["next", "done"].cpu().numpy()
+                      .flatten().astype(bool).reshape(E, T))
+        actions_2d = batch["action"].to(dev).reshape(n).long().reshape(E, T)
 
-        # Embed all observations in one GPU matmul — result stays on device.
-        states_gpu = self.qec_policy.embed(obs)   # (n, d)
-        if states_gpu.device != dev:
-            states_gpu = states_gpu.to(dev)
+        # --- 3. Per-env discounted return computation with carry-over ------
+        #
+        # Only complete episodes (steps up to and including done=True) contribute
+        # to QEC updates. The trailing partial trajectory of each env is buffered
+        # and prepended to that env's data in the next step() call so returns are
+        # always computed over full episodes (Algorithm 1, Blundell et al. 2016).
+        #
+        # Guard: resize carry if num_envs changed (e.g. checkpoint with different E).
+        if len(self._carry) != E:
+            self._carry = [None] * E
 
-        # Discounted Monte Carlo returns via scipy IIR.
-        G_all = np.empty(n, dtype=np.float64)
-        ends = np.flatnonzero(dones_np)
-        if len(ends) == 0 or ends[-1] != n - 1:
-            ends = np.append(ends, n - 1)
-        ep_start = 0
-        for ep_end in ends:
-            r = rewards_np[ep_start : ep_end + 1]
-            G_all[ep_start : ep_end + 1] = lfilter([1.0], [1.0, -self.gamma], r[::-1])[::-1]
-            ep_start = ep_end + 1
-        G_gpu = torch.tensor(G_all, dtype=torch.float64, device=dev)
+        collect_states:  list[torch.Tensor] = []
+        collect_G:       list[torch.Tensor] = []
+        collect_actions: list[torch.Tensor] = []
 
-        # Sort transitions by action on GPU — one argsort, no per-action CPU mask.
+        for env_idx in range(E):
+            states_e  = states_2d[env_idx]         # (T, d)
+            rewards_e = rewards_2d[env_idx]         # (T,)
+            dones_e   = dones_2d[env_idx]           # (T,) bool
+            actions_e = actions_2d[env_idx]         # (T,) long
+
+            # Prepend buffered partial episode from the previous batch.
+            carry = self._carry[env_idx]
+            if carry is not None:
+                states_e  = torch.cat([carry["states"],  states_e],  dim=0)
+                rewards_e = np.concatenate([carry["rewards"], rewards_e])
+                dones_e   = np.concatenate([carry["dones"],   dones_e])
+                actions_e = torch.cat([carry["actions"], actions_e], dim=0)
+
+            ends = np.flatnonzero(dones_e)
+
+            if len(ends) == 0:
+                # No complete episode in this env — buffer everything.
+                self._carry[env_idx] = {
+                    "states":  states_e,
+                    "rewards": rewards_e,
+                    "dones":   dones_e,
+                    "actions": actions_e,
+                }
+                continue
+
+            last = int(ends[-1])  # index of last done (inclusive end of last episode)
+
+            # Discounted return for the complete portion [0 .. last].
+            G_e      = np.empty(last + 1, dtype=np.float64)
+            ep_start = 0
+            for ep_end in ends:
+                ep_end = int(ep_end)
+                r = rewards_e[ep_start : ep_end + 1]
+                G_e[ep_start : ep_end + 1] = lfilter(
+                    [1.0], [1.0, -self.gamma], r[::-1]
+                )[::-1]
+                ep_start = ep_end + 1
+
+            collect_states.append(states_e[:last + 1])
+            collect_G.append(torch.tensor(G_e, dtype=torch.float64, device=dev))
+            collect_actions.append(actions_e[:last + 1])
+
+            # Buffer the trailing partial trajectory for the next batch.
+            if last < len(states_e) - 1:
+                self._carry[env_idx] = {
+                    "states":  states_e[last + 1:],
+                    "rewards": rewards_e[last + 1:],
+                    "dones":   dones_e[last + 1:],
+                    "actions": actions_e[last + 1:],
+                }
+            else:
+                self._carry[env_idx] = None
+
+        # --- 4. Early-exit if no complete episode this batch ---------------
+        if not collect_states:
+            return {
+                "train/epsilon":        float(self.greedy_module.eps),
+                "train/qec_size":       float(np.mean(self.qec._sizes)),
+                "train/exact_hit_rate": 0.0,
+            }
+
+        states_gpu  = torch.cat(collect_states,  dim=0)    # (N_done, d)
+        G_gpu       = torch.cat(collect_G,       dim=0)    # (N_done,)
+        actions_gpu = torch.cat(collect_actions, dim=0).flatten().long()  # (N_done,)
+
+        # --- 5. GPU-native per-action update (argsort + bincount) ----------
         sorted_idx     = torch.argsort(actions_gpu, stable=True)
-        sorted_states  = states_gpu[sorted_idx]                    # (n, d)
-        sorted_values  = G_gpu[sorted_idx]                         # (n,)
-        sorted_actions = actions_gpu[sorted_idx]                   # (n,) sorted
+        sorted_states  = states_gpu[sorted_idx]
+        sorted_values  = G_gpu[sorted_idx]
+        sorted_actions = actions_gpu[sorted_idx]
 
         counts  = torch.bincount(sorted_actions, minlength=self._num_actions)
         offsets = torch.zeros(self._num_actions + 1, dtype=torch.long, device=dev)
@@ -252,16 +344,16 @@ class MFECAlgorithm(BaseAlgorithm):
         total_hits    = 0
 
         for a in range(self._num_actions):
-            s, e = offsets_cpu[a], offsets_cpu[a + 1]
-            if s == e:
+            seg_s, seg_e = offsets_cpu[a], offsets_cpu[a + 1]
+            if seg_s == seg_e:
                 continue
 
-            act_states = sorted_states[s:e]   # view — zero-copy slice
-            act_values = sorted_values[s:e]
-            m = e - s
+            act_states = sorted_states[seg_s:seg_e]   # zero-copy view
+            act_values = sorted_values[seg_s:seg_e]
+            m = seg_e - seg_s
             total_queries += m
 
-            # --- Exact-match path: O(m) hash lookup, no kNN needed ------
+            # --- Exact-match path: O(m) hash lookup, no kNN needed --------
             keys_a = self.qec._make_keys(act_states)
             k_to_s = self.qec._key_to_slot[a]
             exact_list = [key in k_to_s for key in keys_a]
@@ -329,6 +421,7 @@ class MFECAlgorithm(BaseAlgorithm):
                 "projection":       self.projection,
                 "qec_state":        self.qec.__getstate__(),
                 "collected_frames": self._collected_frames,
+                "carry":            self._serialise_carry(),
             },
         )
 
@@ -338,6 +431,40 @@ class MFECAlgorithm(BaseAlgorithm):
         self.qec_policy._proj_tensor = None
         self._collected_frames = int(state.extra["collected_frames"])
         self.qec.__setstate__(state.extra["qec_state"])
+        if "carry" in state.extra:
+            self._deserialise_carry(state.extra["carry"])
+        else:
+            self._carry = [None] * self._num_envs
+
+    def _serialise_carry(self) -> list:
+        """Convert per-env carry buffers to numpy for torch.save serialisation."""
+        out = []
+        for c in self._carry:
+            if c is None:
+                out.append(None)
+            else:
+                out.append({
+                    "states":  c["states"].cpu().numpy(),
+                    "rewards": c["rewards"],
+                    "dones":   c["dones"],
+                    "actions": c["actions"].cpu().numpy().astype(np.int64),
+                })
+        return out
+
+    def _deserialise_carry(self, data: list) -> None:
+        """Restore per-env carry buffers from serialised numpy arrays."""
+        dev = self._buffer_device
+        self._carry = []
+        for c in data:
+            if c is None:
+                self._carry.append(None)
+            else:
+                self._carry.append({
+                    "states":  torch.from_numpy(c["states"]).to(dev),
+                    "rewards": c["rewards"],
+                    "dones":   c["dones"],
+                    "actions": torch.from_numpy(c["actions"]).long().to(dev),
+                })
 
 
 # ---------------------------------------------------------------------------
