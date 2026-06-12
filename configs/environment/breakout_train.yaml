@@ -6,6 +6,9 @@ gym_kwargs:
   pixels_only: false
   categorical_action_encoding: true
 
+# VecNorm deliberately omitted for MFEC: see qbert_train.yaml for the
+# detailed explanation.  Short version: VecNorm's shifting statistics prevent
+# deterministic key generation and drive exact_hit_rate to 0.
 transforms:
   - _target_: torchrl.envs.NoopResetEnv
     noops: 30
@@ -25,5 +28,3 @@ transforms:
   - _target_: torchrl.envs.StepCounter
     max_steps: 4500
   - _target_: torchrl.envs.DoubleToFloat
-  - _target_: torchrl.envs.VecNorm
-    in_keys: [pixels]

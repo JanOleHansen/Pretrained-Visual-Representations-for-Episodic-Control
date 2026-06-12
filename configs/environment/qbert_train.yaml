@@ -10,8 +10,21 @@ gym_kwargs:
 # EndOfLifeTransform ends each sub-episode on a life loss so the agent cannot
 # learn to exploit "free" steps between lives.  SignTransform clips rewards to
 # {-1, 0, +1} to stabilise training across games with different score scales.
-# VecNorm whitens the pixel observations online.  All three are train-only; see
-# qbert_eval.yaml for the evaluation variant.
+# All three are train-only; see qbert_eval.yaml for the evaluation variant.
+#
+# NOTE — reward scale: train/episode_reward (from RewardSum) reflects
+# *clipped* rewards {-1, 0, +1} due to SignTransform, not the true Atari
+# score.  "57" means ~57 positive reward events, not a game score of 57.
+# Use eval/return_mean (from qbert_eval.yaml, which drops SignTransform) for
+# comparisons against paper figures.
+#
+# NOTE — VecNorm deliberately omitted for MFEC: VecNorm updates its running
+# mean/std with every collected frame, so the same raw pixel observation
+# produces different normalised values at different timesteps.  MFEC's
+# exact-match dict relies on bit-identical embeddings for re-encountered
+# states; VecNorm makes that impossible and drives exact_hit_rate to 0.
+# The fixed random projection already compresses observations adequately
+# without online whitening.
 transforms:
   - _target_: torchrl.envs.NoopResetEnv
     noops: 30
@@ -31,5 +44,3 @@ transforms:
   - _target_: torchrl.envs.StepCounter
     max_steps: 4500
   - _target_: torchrl.envs.DoubleToFloat
-  - _target_: torchrl.envs.VecNorm
-    in_keys: [pixels]

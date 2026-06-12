@@ -301,11 +301,12 @@ configs/
   algorithm/a2c.yaml        — A2C HPs (HalfCheetah/MuJoCo defaults); _partial_ actor/value
   algorithm/mfec_atari.yaml — MFEC HPs (Atari defaults: buffer_size=1M, k=11, state_dim=64)
   environment/cartpole.yaml — env kwargs (name, transforms)
-  environment/pong_train.yaml — Atari Pong env (training transforms incl. EndOfLife + Sign + VecNorm)
-  environment/pong_eval.yaml  — Atari Pong env (eval transforms; drops EndOfLife + Sign + VecNorm)
-  environment/breakout_train.yaml — Atari Breakout (training transforms; same stack as Pong)
+  environment/pong_train.yaml     — Atari Pong (training transforms incl. EndOfLife + Sign + VecNorm; DQN only)
+  environment/pong_mfec_train.yaml — Atari Pong for MFEC (same stack WITHOUT VecNorm; see note below)
+  environment/pong_eval.yaml      — Atari Pong (eval transforms; drops EndOfLife + Sign + VecNorm)
+  environment/breakout_train.yaml — Atari Breakout (training transforms; no VecNorm — MFEC only)
   environment/breakout_eval.yaml  — Atari Breakout (eval transforms)
-  environment/qbert_train.yaml    — ALE/Qbert-v5 (training transforms; same stack as Pong)
+  environment/qbert_train.yaml    — ALE/Qbert-v5 (training transforms; no VecNorm — MFEC only)
   environment/qbert_eval.yaml     — ALE/Qbert-v5 (eval transforms)
   environment/halfcheetah.yaml — HalfCheetah-v4 (DoubleToFloat + InitTracker)
   experiment/dqn/cartpole.yaml — composed CartPole experiment
@@ -338,6 +339,37 @@ tests/
 5. **Update `README.md` and `AGENTS.md`.**
 6. Add a smoke test in `tests/test_smoke.py`.
 
+## VecNorm + MFEC incompatibility
+
+**Never add `VecNorm` to an MFEC environment config.** VecNorm updates its
+running mean/std with every collected frame, so the same raw pixel observation
+produces different normalised float32 values at different timesteps.
+MFEC's exact-match dict (`QEC._key_to_slot`) requires bit-identical
+embeddings for the same game state to produce the same quantised hash key;
+VecNorm breaks this invariant and drives `train/exact_hit_rate` permanently
+to 0 even when 165k+ states are stored.
+
+Concretely:
+
+| env config | VecNorm | intended for |
+|---|---|---|
+| `pong_train.yaml` | ✓ | DQN pong only |
+| `pong_mfec_train.yaml` | ✗ | MFEC pong |
+| `breakout_train.yaml` | ✗ | MFEC breakout |
+| `qbert_train.yaml` | ✗ | MFEC Q*Bert |
+
+The fixed random projection already compresses 28 k-pixel observations
+adequately without online whitening.
+
+## Reward scale for Atari MFEC runs
+
+All MFEC training configs include `SignTransform` (reward clipped to
+`{-1, 0, +1}`), so `train/episode_reward` (from `RewardSum`) counts clipped
+reward events — **not** the true game score. For example, "57" on Q*Bert means
+~57 positive reward events, not a score of 57 points. Always compare against
+the paper using `eval/return_mean`, which is computed from the `*_eval.yaml`
+environment that drops `SignTransform`.
+
 ## What not to do
 
 - Do not place learning-affecting knobs on `trainer:` or `environment:` configs.
@@ -345,6 +377,7 @@ tests/
 - Do not add `cfg: DictConfig` to `BaseAlgorithm` or pass `cfg=cfg` to algorithms.
 - Do not pass `cfg.environment` directly to `Environment()` — unpack as `**kwargs`.
 - Do not add `OmegaConf` imports to `base.py`.
+- Do not add `VecNorm` to any MFEC environment config (see section above).
 
 ## Running
 
