@@ -157,3 +157,41 @@ def test_smoke_mfec_pong():
     assert isinstance(metrics, dict)
     assert "train/epsilon" in metrics
     assert "train/qec_size" in metrics
+
+
+#
+# NEC
+#
+
+def _nec_pong_overrides() -> list[str]:
+    # 500 frames in 100-frame batches; tiny DND so memory stays bounded.
+    # k=2 so kNN lookup works with dnd_capacity=200.
+    # n_step=5 so N-step bootstrap exercises the DND lookup path early.
+    # init_random_frames=100 so we hit the gradient path in this run.
+    return [
+        *BASE_OVERRIDES,
+        "trainer.total_frames=500",
+        "trainer.log_every_n_steps=100",
+        "trainer.num_envs=1",
+        "algorithm.frames_per_batch=100",
+        "algorithm.init_random_frames=100",
+        "algorithm.batch_size=8",
+        "algorithm.num_updates=2",
+        "algorithm.dnd_capacity=200",
+        "algorithm.k=2",
+        "algorithm.n_step=5",
+        "algorithm.annealing_frames=500",
+        "algorithm.replay_buffer.storage.max_size=500",
+    ]
+
+
+def test_smoke_nec_pong():
+    """NEC on ALE/Pong-v5: trainable CNN encoder, DND tables, N-step returns."""
+    pytest.importorskip("ale_py")
+    cfg = load_experiment_cfg("nec/pong", _nec_pong_overrides())
+    from src.train import _train
+
+    metrics = _train(cfg)
+    assert isinstance(metrics, dict)
+    assert "train/epsilon" in metrics
+    assert "train/dnd_size" in metrics

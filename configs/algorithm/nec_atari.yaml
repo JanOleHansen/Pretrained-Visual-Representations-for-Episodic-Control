@@ -1,0 +1,58 @@
+_target_: src.algorithms.nec.NECAlgorithm
+
+# NEC on Atari — hyperparameters from Pritzel et al. (2017), Table S1.
+# Uses the same NatureDQN convolutional trunk (Mnih et al. 2015) with the
+# Q-head replaced by a single dense embedding layer.
+
+# Callable factories
+embedding_network:
+  _partial_: true
+  _target_: src.networks.NatureEmbedding
+  num_cells_cnn: [32, 64, 64]
+  kernel_sizes: [8, 4, 3]
+  strides: [4, 2, 1]
+  activation_class:
+    _target_: hydra.utils.get_class
+    path: torch.nn.ReLU
+
+# 1×10⁵ replay buffer on CPU (pixel obs are ~110 KB each; 10⁵ ≈ 11 GB uint8
+# but ToTensorImage converts to float32 so actual storage is ~44 GB).
+# Keep max_size=100_000 as in the paper; reduce for memory-constrained hosts.
+replay_buffer:
+  _partial_: true
+  _target_: torchrl.data.TensorDictReplayBuffer
+  storage:
+    _target_: torchrl.data.LazyTensorStorage
+    max_size: 100_000
+    device: cpu
+
+obs_key: pixels
+
+# DND parameters (paper Table S1)
+embedding_dim: 64        # h ∈ ℝ^64
+dnd_capacity: 500_000    # 5×10⁵ entries per action
+k: 50                    # p = 50 nearest neighbours
+kernel_delta: 1.0e-3     # δ = 10⁻³
+dnd_lr: 0.1              # α = 0.1 for blending existing entries
+
+# N-step return (paper §2.2)
+n_step: 100
+
+# Optimisation
+lr: 1.0e-4
+gamma: 0.99
+batch_size: 32
+max_grad_norm: 10.0
+
+# Exploration
+eps_start: 1.0
+eps_end: 0.01
+annealing_frames: 4_000_000
+
+# Data collection (same cadence as DQN Atari)
+frames_per_batch: 1_600
+init_random_frames: 50_000
+max_frames_per_traj: -1
+
+# 1 gradient update per 16 frames; 1600 / 16 = 100
+num_updates: 100

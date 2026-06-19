@@ -18,6 +18,7 @@ Implemented experiments:
 | MFEC      | ALE/Pong-v5      | `experiment=mfec/pong`         |
 | MFEC      | ALE/Breakout-v5  | `experiment=mfec/breakout`     |
 | MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`        |
+| NEC       | ALE/Pong-v5      | `experiment=nec/pong`          |
 
 ## Design principles
 
@@ -279,6 +280,7 @@ src/
   train.py                  — entry point; instantiate(cfg.algorithm); environment **kwargs
   eval.py                   — evaluation entry point; same algorithm instantiation
   networks.py               — network factories: make_mlp_q_net, NatureDQN,
+                              NatureEmbedding (NEC CNN trunk, no Q-head),
                               make_mlp_ddpg_actor, make_mlp_ddpg_critic,
                               make_mlp_a2c_actor, make_mlp_a2c_value
   algorithms/
@@ -286,6 +288,7 @@ src/
     dqn.py                  — DQNAlgorithm; replay/network factories (defaults + setup contract)
     ddpg.py                 — DDPGAlgorithm; actor/critic/replay/noise factories
     a2c.py                  — A2CAlgorithm; on-policy actor/critic with GAE + A2CLoss
+    nec.py                  — NECAlgorithm; DND class, DNDPolicy, N-step returns, dual updates
   environments/
     environment.py          — Environment wrapper (holds factory kwargs, exposes make_env)
     factory.py              — make_env: gymnasium + transforms list + gym_kwargs/gym_backend
@@ -300,6 +303,8 @@ configs/
   algorithm/ddpg.yaml       — DDPG HPs (HalfCheetah defaults); _partial_ actor/critic/noise
   algorithm/a2c.yaml        — A2C HPs (HalfCheetah/MuJoCo defaults); _partial_ actor/value
   algorithm/mfec_atari.yaml — MFEC HPs (Atari defaults: buffer_size=1M, k=11, state_dim=64)
+  algorithm/nec.yaml        — NEC HPs (base defaults); _partial_ embedding_network + replay_buffer
+  algorithm/nec_atari.yaml  — NEC HPs (Atari defaults per Pritzel et al. 2017 Table S1)
   environment/cartpole.yaml — env kwargs (name, transforms)
   environment/pong_train.yaml     — Atari Pong (training transforms incl. EndOfLife + Sign + VecNorm; DQN only)
   environment/pong_mfec_train.yaml — Atari Pong for MFEC (same stack WITHOUT VecNorm; see note below)
@@ -316,11 +321,12 @@ configs/
   experiment/mfec/pong.yaml    — MFEC on Pong (40M frames, num_envs=16)
   experiment/mfec/breakout.yaml — MFEC on Breakout (1M frames)
   experiment/mfec/qbert.yaml   — MFEC on Q*Bert (40M frames, num_envs=16)
+  experiment/nec/pong.yaml     — NEC on Pong (40M frames, num_envs=16)
   logger/{wandb,tensorboard}.yaml
   paths/default.yaml
   train.yaml, eval.yaml
 tests/
-  test_smoke.py             — DQN-on-CartPole, DQN-on-Pong, DDPG-on-HalfCheetah, A2C-on-HalfCheetah, MFEC-on-Pong smoke tests
+  test_smoke.py             — DQN-on-CartPole, DQN-on-Pong, DDPG-on-HalfCheetah, A2C-on-HalfCheetah, MFEC-on-Pong, NEC-on-Pong smoke tests
 ```
 
 ## Adding a new algorithm
@@ -369,6 +375,84 @@ reward events — **not** the true game score. For example, "57" on Q*Bert means
 ~57 positive reward events, not a score of 57 points. Always compare against
 the paper using `eval/return_mean`, which is computed from the `*_eval.yaml`
 environment that drops `SignTransform`.
+
+## NEC — DND values with gradients
+
+`NECAlgorithm` (Pritzel et al. 2017) differs from MFEC in two ways that
+require special care:
+
+### 1. DND `values` tensor is a gradient-enabled leaf
+
+`DND.values` is a plain `torch.Tensor` with `requires_grad=True` (not
+`nn.Parameter` — the DND is not an `nn.Module`).  The optimizer is built
+as:
+
+```python
+optimizer = torch.optim.Adam(
+    list(self.embedding_net.parameters()) + [self.dnd.values],
+    lr=self.lr,
+)
+```
+
+All in-place ring-buffer and blend writes use `.data` to avoid breaking the
+autograd graph:
+
+```python
+self.dnd.values.data[action, slots] = new_vals   # ring-buffer insert
+self.dnd.values.data[action, slots] += alpha * delta  # blend update
+```
+
+The gradient path is the training step only: `dnd.values[a, indices]`
+(advanced indexing) returns a differentiable view used in the kernel-weighted
+Q̂ computation.
+
+**Checkpoint restore:** `DND.__setstate__` re-creates `dnd.values` as a
+fresh leaf tensor.  `NECAlgorithm._load_training_state` therefore rebuilds
+the optimizer after calling `__setstate__` so the optimizer holds the new
+tensor reference, then loads the saved optimizer state dict.
+
+### 2. N-step returns (per-env, complete-episodes-only)
+
+NEC uses bootstrapped N-step returns:
+
+    Q^(N)(s_t, a_t) = Σ_{j=0}^{N-1} γ^j r_{t+j} + γ^N max_{a'} Q(s_{t+N}, a')
+
+The per-env carry-over logic is identical to MFEC's (the `(E, T)` shape
+pattern, partial-episode buffering in `_carry`, `lfilter` for MC returns).
+The NEC-specific addition is a DND bootstrap correction applied after the
+full MC pass:
+
+```python
+# mc: full Monte Carlo returns via lfilter
+gamma_n = gamma ** n_step
+correction = gamma_n * (q_max_at_t_plus_n - mc[n_step:])
+n_step_G[:T - n_step] = where(valid, mc[:T - n_step] + correction, mc[:T - n_step])
+```
+
+Bootstrapping uses the CURRENT DND state (written by previous episodes in
+the same batch, or prior batches).  The carry stores RAW observations (not
+pre-computed embeddings) so they are re-embedded with the current network
+at the start of each step() call.
+
+### 3. NatureEmbedding factory
+
+`src/networks.NatureEmbedding(obs_shape, embedding_dim, *, ...)` is a CNN
+trunk + single dense layer — the same convolutional body as NatureDQN but
+with the MLP Q-head replaced.  It is called as
+`embedding_network(obs_shape, embedding_dim)` in `NECAlgorithm.setup()`,
+matching the `network(obs_shape, num_actions)` convention used by DQN.
+
+### 4. Exact-match dict and VecNorm
+
+NEC's DND also uses a quantised-embedding hash dict (`_key_to_slot`) for
+O(1) blend-on-revisit detection.  Unlike MFEC's fixed random projection,
+the CNN embedding changes during training, so the same observation will
+produce different hash keys after network updates.  The exact-match dict
+remains useful for recent re-visits (within the same or adjacent batches)
+and for warm-starting early training.
+
+The same VecNorm restriction that applies to MFEC applies to NEC
+environments — use `pong_mfec_train.yaml` (no VecNorm) for NEC Pong.
 
 ## What not to do
 

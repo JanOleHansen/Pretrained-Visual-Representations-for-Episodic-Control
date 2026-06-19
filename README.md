@@ -43,6 +43,7 @@ Two derived rules:
 | MFEC      | ALE/Pong-v5      | `experiment=mfec/pong`          |
 | MFEC      | ALE/Breakout-v5  | `experiment=mfec/breakout`      |
 | MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`         |
+| NEC       | ALE/Pong-v5      | `experiment=nec/pong`           |
 
 ## Main technologies
 
@@ -253,7 +254,9 @@ configs/
 │   ├── dqn_atari.yaml      <- DQN HPs (Atari/NatureDQN defaults)
 │   ├── ddpg.yaml           <- DDPG HPs (HalfCheetah defaults)
 │   ├── a2c.yaml            <- A2C HPs (HalfCheetah/MuJoCo defaults)
-│   └── mfec_atari.yaml     <- MFEC HPs (Atari defaults; random projection, QEC)
+│   ├── mfec_atari.yaml     <- MFEC HPs (Atari defaults; random projection, QEC)
+│   ├── nec.yaml            <- NEC HPs (base defaults; trainable CNN, DND)
+│   └── nec_atari.yaml      <- NEC HPs (Atari defaults per Pritzel et al. 2017)
 ├── environment/
 │   ├── cartpole.yaml       <- env name + transforms
 │   ├── pong_train.yaml     <- Pong with EndOfLife + Sign + VecNorm (training)
@@ -275,10 +278,12 @@ configs/
     │   └── halfcheetah.yaml <- composed DDPG HalfCheetah experiment
     ├── a2c/
     │   └── halfcheetah.yaml <- composed A2C HalfCheetah experiment
-    └── mfec/
-        ├── pong.yaml       <- MFEC on Pong (40M frames)
-        ├── breakout.yaml   <- MFEC on Breakout (1M frames)
-        └── qbert.yaml      <- MFEC on Q*Bert (40M frames)
+    ├── mfec/
+    │   ├── pong.yaml       <- MFEC on Pong (40M frames)
+    │   ├── breakout.yaml   <- MFEC on Breakout (1M frames)
+    │   └── qbert.yaml      <- MFEC on Q*Bert (40M frames)
+    └── nec/
+        └── pong.yaml       <- NEC on Pong (40M frames)
 ```
 
 ### Override hierarchy

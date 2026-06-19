@@ -144,3 +144,34 @@ def NatureDQN(
         activation_class=activation_class,
     )
     return nn.Sequential(cnn, mlp)
+
+
+def NatureEmbedding(
+    obs_shape: Sequence[int],
+    embedding_dim: int,
+    *,
+    num_cells_cnn: Sequence[int] = (32, 64, 64),
+    kernel_sizes: Sequence[int] = (8, 4, 3),
+    strides: Sequence[int] = (4, 2, 1),
+    activation_class: Type[nn.Module] = nn.ReLU,
+) -> nn.Module:
+    """ConvNet trunk + single dense layer to ``embedding_dim``. No Q-head.
+
+    Used by NEC: maps (B, C, H, W) pixel observations to (B, embedding_dim)
+    state embeddings.  Architecture follows NatureDQN's convolutional trunk
+    (Mnih et al. 2015) with the MLP Q-head replaced by a single linear layer.
+
+    Called as ``embedding_network(obs_shape, embedding_dim)`` inside
+    ``NECAlgorithm.setup()``.  Hydra uses ``_partial_`` to pre-bind the
+    kwarg-only design params; ``setup()`` supplies the two positional args.
+    """
+    cnn = ConvNet(
+        activation_class=activation_class,
+        num_cells=list(num_cells_cnn),
+        kernel_sizes=list(kernel_sizes),
+        strides=list(strides),
+    )
+    with torch.no_grad():
+        cnn_out = cnn(torch.zeros(1, *obs_shape))
+    dense = nn.Linear(cnn_out.shape[-1], embedding_dim)
+    return nn.Sequential(cnn, dense)

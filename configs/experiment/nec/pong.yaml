@@ -1,0 +1,21 @@
+
+# @package _global_
+# NEC on Atari Pong (Pritzel et al. 2017).
+# Uses pong_mfec_train.yaml (no VecNorm) for the same reason as MFEC: the
+# exact-match dict keys the DND on quantised CNN embeddings; VecNorm changes
+# raw pixel values over time which would shift the embedding distribution and
+# impair the exact-match hit rate (though less severely than for MFEC, since
+# NEC's CNN is trainable and embeddings shift anyway as the network learns).
+defaults:
+  - override /algorithm: nec_atari
+  - override /environment: pong_mfec_train
+  - override /environment@eval_environment: pong_eval
+  - _self_
+
+trainer:
+  total_frames: 40_000_100
+  seed: 42
+  accelerator: gpu
+  devices: [3]
+  num_envs: 16
+  log_every_n_steps: 10_000
