@@ -766,7 +766,7 @@ class NECAlgorithm(BaseAlgorithm):
                       .flatten().astype(np.float64).reshape(E, T))
         dones_2d   = (batch["next", "done"].cpu().numpy()
                       .flatten().astype(bool).reshape(E, T))
-        actions_2d = batch["action"].reshape(n).long().reshape(E, T)
+        actions_2d = batch["action"].to(dev).reshape(n).long().reshape(E, T)
 
         if len(self._carry) != E:
             self._carry = [None] * E
@@ -799,10 +799,10 @@ class NECAlgorithm(BaseAlgorithm):
 
             if len(ends) == 0:
                 self._carry[env_idx] = {
-                    "obs":     obs_e,
+                    "obs":     obs_e,                  # intentionally CPU — raw pixels, re-embedded each step
                     "rewards": rewards_e,
                     "dones":   dones_e,
-                    "actions": actions_e,
+                    "actions": actions_e.to(dev),
                 }
                 continue
 
@@ -819,7 +819,6 @@ class NECAlgorithm(BaseAlgorithm):
             ep_start = 0
             for ep_end in ends:
                 ep_end = int(ep_end)
-                ep_len = ep_end - ep_start + 1
 
                 r_ep = rewards_e[ep_start: ep_end + 1]             # (L,) f64
                 h_ep = h_complete[ep_start: ep_end + 1]            # (L, d)
@@ -865,10 +864,10 @@ class NECAlgorithm(BaseAlgorithm):
             # Buffer trailing partial episode
             if last < len(obs_e) - 1:
                 self._carry[env_idx] = {
-                    "obs":     obs_e[last + 1:],
+                    "obs":     obs_e[last + 1:],              # intentionally CPU — raw pixels, re-embedded each step
                     "rewards": rewards_e[last + 1:],
                     "dones":   dones_e[last + 1:],
-                    "actions": actions_e[last + 1:].cpu(),
+                    "actions": actions_e[last + 1:].to(dev),
                 }
             else:
                 self._carry[env_idx] = None
@@ -934,7 +933,7 @@ class NECAlgorithm(BaseAlgorithm):
         actions = sample["action"].long().flatten().to(self.device)
         targets = sample["n_step_return"].float().flatten().to(self.device)
 
-        obs_flat = obs.reshape(-1, *self._obs_shape).float()
+        obs_flat = obs.reshape(-1, *self._obs_shape)
 
         # Forward through embedding network — gradients enabled
         h = self.embedding_net(obs_flat)    # (B, embedding_dim)
@@ -1066,5 +1065,5 @@ class NECAlgorithm(BaseAlgorithm):
                     "obs":     torch.from_numpy(c["obs"]),
                     "rewards": c["rewards"],
                     "dones":   c["dones"],
-                    "actions": torch.from_numpy(c["actions"]).long(),
+                    "actions": torch.from_numpy(c["actions"]).long().to(self._buffer_device),
                 })
