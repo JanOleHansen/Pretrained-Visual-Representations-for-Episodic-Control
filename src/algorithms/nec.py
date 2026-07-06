@@ -54,9 +54,9 @@ At episode end:
         (s, a, target) ← sample D
         h ← φ(s)
         find k nearest keys in DND[a]   # no_grad
-        Q̂(s, a) ← Σ w_i v_i / Σ w_i  # differentiable: grad → φ + DND values
+        Q̂(s, a) ← Σ w_i(h) v_i / Σ w_i(h)  # v_i frozen; grad → φ via ∂w_i/∂h
         ∇ θ = (Q̂ − target)²
-        update θ (embedding network + DND values)
+        update θ (embedding network only — DND values updated by blend rule)
 
 Reference implementation deviations NOT replicated
 --------------------------------------------------
@@ -97,20 +97,22 @@ class DND:
     """Differentiable Neural Dictionary — fused GPU tensors, grad-enabled values.
 
     Extends the QEC ring-buffer / exact-match-dict / chunked-kNN pattern from
-    mfec.py with two NEC-specific changes:
+    mfec.py with one NEC-specific change:
 
-    1. ``values`` is a leaf tensor with ``requires_grad=True`` so gradient
-       descent can optimise Q-value estimates stored in the DND.  All in-place
-       ring-buffer and blend writes go through ``.data`` to avoid breaking the
-       autograd graph.
+    ``estimate_all()`` uses the inverse-distance kernel instead of a plain
+    average: w_i = 1 / (‖h − h_i‖² + δ).
 
-    2. ``estimate_all()`` uses the inverse-distance kernel instead of a plain
-       average: w_i = 1 / (‖h − h_i‖² + δ).
+    ``values`` is a plain (no grad) tensor updated only by the in-place blend
+    rule Q_i ← Q_i + α(G − Q_i).  The regression loss gradient reaches the
+    CNN via ∂w_i/∂h (distance term); stored Q-values are frozen constants in
+    that computation.  Including ``values`` in Adam conflicted with the blend
+    writes and caused values to drift negative (stale momentum applied to
+    post-blend values).
 
     Storage layout mirrors QEC:
 
         keys   : (num_actions, capacity, embedding_dim)  float32   — no grad
-        values : (num_actions, capacity)                 float32   — requires_grad
+        values : (num_actions, capacity)                 float32   — no grad (blend-only updates)
 
     Parameters
     ----------
@@ -142,11 +144,12 @@ class DND:
 
         self.keys: torch.Tensor | None = None  # (A, C, d) — lazy init, no grad
 
-        # Leaf tensor with requires_grad so gradient descent can update stored
-        # Q-values.  In-place writes (blend + ring-buffer) use .data to keep
-        # the autograd graph clean.
+        # Plain (no grad) tensor.  Values are updated only via the in-place
+        # blend rule Q_i ← Q_i + α(G - Q_i) and ring-buffer inserts.
+        # The gradient of the regression loss flows into the CNN embedding
+        # network through the distance term ‖h − h_i‖²; the stored Q-values
+        # act as frozen scalars in that computation.
         self.values = torch.zeros(num_actions, capacity, device=device)
-        self.values.requires_grad_(True)
 
         self._sizes      = [0] * num_actions
         self._write_ptrs = [0] * num_actions
@@ -447,10 +450,7 @@ class DND:
         self._write_ptrs  = list(d["_write_ptrs"])
 
         dev = self.device
-        # Re-create as a fresh leaf tensor; the caller (NECAlgorithm) rebuilds
-        # the optimizer with this new tensor reference after calling __setstate__.
         self.values = torch.zeros(self.num_actions, self.capacity, device=dev)
-        self.values.requires_grad_(True)
 
         self._key_to_slot = [{} for _ in range(self.num_actions)]
         self._slot_to_key = [{} for _ in range(self.num_actions)]
@@ -602,8 +602,8 @@ class NECAlgorithm(BaseAlgorithm):
     * ``embedding_network`` factory is called as
       ``embedding_network(obs_shape, embedding_dim)`` in ``setup()``.
     * ``replay_buffer`` is a no-arg factory returning a ``ReplayBuffer``.
-    * The DND ``values`` tensor is a leaf with ``requires_grad=True``;
-      the optimizer covers both it and the embedding network.
+    * The optimizer covers the CNN embedding network only.  DND values are
+      updated by the in-place blend rule, not by gradient descent.
     * Per-env carry-over logic (the ``_carry`` list) is taken directly from
       ``MFECAlgorithm.step()`` and extended to also buffer raw observations so
       they can be re-embedded with the *current* network on each step call.
@@ -720,9 +720,12 @@ class NECAlgorithm(BaseAlgorithm):
         # 4. Replay buffer — stores (obs, action, n_step_return)
         self.replay_buffer = self._make_replay_buffer()
 
-        # 5. Optimizer — covers CNN params + DND values (both are leaf tensors)
+        # 5. Optimizer — CNN embedding network only.
+        # DND values are updated exclusively by the in-place blend rule;
+        # including them in Adam causes the momentum state to conflict with
+        # the blend writes and drives stored Q-values negative.
         self.optimizer = torch.optim.Adam(
-            list(self.embedding_net.parameters()) + [self.dnd.values],
+            self.embedding_net.parameters(),
             lr=self.lr,
         )
 
@@ -905,31 +908,38 @@ class NECAlgorithm(BaseAlgorithm):
             return base_metrics
 
         # --- Gradient steps ------------------------------------------------
-        losses = torch.zeros(self.num_updates, device=self.device)
+        losses  = torch.zeros(self.num_updates, device=self.device)
+        q_vals  = torch.zeros(self.num_updates, device=self.device)
         for j in range(self.num_updates):
-            loss_val = self._gradient_step()
+            loss_val, mean_q = self._gradient_step()
             losses[j] = loss_val
+            q_vals[j]  = mean_q
 
         return {
             **base_metrics,
-            "train/q_loss": losses.mean().item(),
+            "train/q_loss":   losses.mean().item(),
+            "train/q_values": q_vals.mean().item(),
         }
 
-    def _gradient_step(self) -> float:
-        """One minibatch gradient update on the embedding network and DND values.
+    def _gradient_step(self) -> tuple[float, float]:
+        """One minibatch gradient update on the embedding network.
 
         Samples (obs, action, n_step_return) from the replay buffer, re-embeds
         observations with the *current* embedding network, computes the
         kernel-weighted Q̂ via differentiable indexing into DND.values, and
         minimises MSE(Q̂, n_step_return_target).
 
-        Gradients flow through:
-          a) the embedding network (CNN parameters), via the distance term
-             ‖h − h_i‖² where h = embedding_net(obs)
-          b) DND.values, via the w_i * v_i weighted sum
+        Gradients flow through the embedding network (CNN parameters) via the
+        distance term ‖h − h_i‖² where h = embedding_net(obs).  The stored
+        DND values Q_i are frozen constants here; they are updated separately
+        by the in-place blend rule in step().
+
+        Returns
+        -------
+        (loss, mean_q) — scalar MSE loss and mean kernel-weighted Q-estimate
         """
         if len(self.replay_buffer) < self.batch_size:
-            return 0.0
+            return 0.0, 0.0
 
         sample  = self.replay_buffer.sample(self.batch_size)
         obs     = sample[self.obs_key].to(self.device).float()
@@ -969,7 +979,7 @@ class NECAlgorithm(BaseAlgorithm):
             weights       = 1.0 / (dists_sq + self.kernel_delta)   # (n_a, k_use)
             weights       = weights / weights.sum(dim=-1, keepdim=True)
 
-            # dnd.values[a, indices]: (n_a, k_use) — requires_grad leaf tensor
+            # dnd.values[a, indices]: (n_a, k_use) — frozen; no grad into values
             neighbor_vals = self.dnd.values[a, indices]            # (n_a, k_use)
             q_hat_a       = (weights * neighbor_vals).sum(dim=-1)  # (n_a,)
 
@@ -977,7 +987,7 @@ class NECAlgorithm(BaseAlgorithm):
             target_parts.append(t_a)
 
         if not q_hat_parts:
-            return 0.0
+            return 0.0, 0.0
 
         q_hat  = torch.cat(q_hat_parts)
         tgt    = torch.cat(target_parts)
@@ -986,12 +996,13 @@ class NECAlgorithm(BaseAlgorithm):
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(
-            list(self.embedding_net.parameters()) + [self.dnd.values],
+            self.embedding_net.parameters(),
             self.max_grad_norm,
         )
         self.optimizer.step()
 
-        return float(loss.detach())
+        mean_q = float(q_hat.detach().mean())
+        return float(loss.detach()), mean_q
 
     def _sizes_summary(self) -> list[int]:
         return list(self.dnd._sizes)
@@ -1032,9 +1043,8 @@ class NECAlgorithm(BaseAlgorithm):
     def _load_training_state(self, state: TrainingState) -> None:
         self.embedding_net.load_state_dict(state.policy_state_dict)
         self.dnd.__setstate__(state.extra["dnd_state"])
-        # Rebuild optimizer with the new dnd.values tensor created by __setstate__
         self.optimizer = torch.optim.Adam(
-            list(self.embedding_net.parameters()) + [self.dnd.values],
+            self.embedding_net.parameters(),
             lr=self.lr,
         )
         self.optimizer.load_state_dict(state.optimizer_state_dict)
