@@ -674,7 +674,11 @@ class NECAlgorithm(BaseAlgorithm):
 
     def setup(self, make_env: Callable[[], EnvBase]) -> None:
         proof_env   = make_env()
-        obs_shape   = tuple(proof_env.observation_spec[self.obs_key].shape)
+        # Strip leading parallel-env batch dims so _obs_shape is the per-sample
+        # frame shape (e.g. (4, 84, 84)), not (num_envs, 4, 84, 84).
+        # Same pattern as MFECAlgorithm.setup().
+        env_bs      = proof_env.batch_size
+        obs_shape   = tuple(proof_env.observation_spec[self.obs_key].shape)[len(env_bs):]
         action_spec = proof_env.action_spec
         num_actions = int(action_spec.space.n)
         self._num_actions = num_actions
@@ -723,7 +727,6 @@ class NECAlgorithm(BaseAlgorithm):
         )
 
         # 6. Per-env carry buffers for partial episodes across batch boundaries
-        env_bs = proof_env.batch_size
         self._num_envs: int = int(env_bs[0]) if len(env_bs) == 1 else 1
         self._carry: list[dict | None] = [None] * self._num_envs
 
