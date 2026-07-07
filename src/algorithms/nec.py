@@ -524,6 +524,7 @@ class DNDPolicy(nn.Module):
         leading   = obs.shape[:-3]                             # dims before (C,H,W)
         obs_flat  = obs.reshape(-1, *obs.shape[-3:]).float()   # (B, C, H, W)
         h         = self.embedding_net(obs_flat)               # (B, d)
+        h         = nn.functional.normalize(h, dim=-1)        # unit-norm per paper §2
         q_values  = self.dnd.estimate_all(h)                   # (B, A)
         q_values  = torch.where(
             torch.isinf(q_values),
@@ -819,7 +820,8 @@ class NECAlgorithm(BaseAlgorithm):
             with torch.no_grad():
                 h_complete = self.embedding_net(
                     obs_complete.reshape(last + 1, *obs_shape)
-                ).to(dev)  # (T_c, d)
+                ).to(dev)                                          # (T_c, d)
+                h_complete = nn.functional.normalize(h_complete, dim=-1)  # unit-norm per paper §2
 
             # Process each complete episode individually
             ep_start = 0
@@ -949,7 +951,8 @@ class NECAlgorithm(BaseAlgorithm):
         obs_flat = obs.reshape(-1, *self._obs_shape)
 
         # Forward through embedding network — gradients enabled
-        h = self.embedding_net(obs_flat)    # (B, embedding_dim)
+        h = self.embedding_net(obs_flat)                      # (B, embedding_dim)
+        h = nn.functional.normalize(h, dim=-1)               # unit-norm per paper §2
 
         q_hat_parts:  list[torch.Tensor] = []
         target_parts: list[torch.Tensor] = []
