@@ -1,0 +1,28 @@
+name: ALE/Hero-v5
+gym_backend: gymnasium
+gym_kwargs:
+  frame_skip: 4
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# Eval variant: drops EndOfLifeTransform so episodes end on game-over rather
+# than life loss, drops SignTransform so episode rewards reflect the true game
+# score, and drops VecNorm because its running stats are not checkpointed and a
+# fresh eval env would distort the observations the policy was trained on.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.GrayScale
+  - _target_: torchrl.envs.Resize
+    w: 84
+    h: 84
+  - _target_: torchrl.envs.CatFrames
+    N: 4
+    dim: -3
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    max_steps: 4500
+  - _target_: torchrl.envs.DoubleToFloat

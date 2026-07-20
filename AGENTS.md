@@ -376,40 +376,51 @@ reward events — **not** the true game score. For example, "57" on Q*Bert means
 the paper using `eval/return_mean`, which is computed from the `*_eval.yaml`
 environment that drops `SignTransform`.
 
-## NEC — DND values with gradients
+## NEC — DND values, blend-only (deviates from the paper here)
 
 `NECAlgorithm` (Pritzel et al. 2017) differs from MFEC in two ways that
 require special care:
 
-### 1. DND `values` tensor is a gradient-enabled leaf
+### 1. DND `values` tensor is a plain (non-grad) tensor, NOT gradient-enabled
 
-`DND.values` is a plain `torch.Tensor` with `requires_grad=True` (not
-`nn.Parameter` — the DND is not an `nn.Module`).  The optimizer is built
-as:
-
-```python
-optimizer = torch.optim.Adam(
-    list(self.embedding_net.parameters()) + [self.dnd.values],
-    lr=self.lr,
-)
-```
-
-All in-place ring-buffer and blend writes use `.data` to avoid breaking the
-autograd graph:
+The paper's §3.4 backpropagates into both the embedding network *and* the
+DND keys/values (values at a lower LR than the blend rate α). This
+implementation does **not** do that: `DND.values` is a plain `torch.Tensor`
+with no `requires_grad`, updated only by the in-place blend rule
 
 ```python
-self.dnd.values.data[action, slots] = new_vals   # ring-buffer insert
-self.dnd.values.data[action, slots] += alpha * delta  # blend update
+self.values.data[action, slots] += dnd_lr * (target - old)   # blend update
+self.values.data[action, slots]  = new_vals                  # ring-buffer insert
 ```
 
-The gradient path is the training step only: `dnd.values[a, indices]`
-(advanced indexing) returns a differentiable view used in the kernel-weighted
-Q̂ computation.
+and the optimizer covers the embedding network only:
 
-**Checkpoint restore:** `DND.__setstate__` re-creates `dnd.values` as a
-fresh leaf tensor.  `NECAlgorithm._load_training_state` therefore rebuilds
-the optimizer after calling `__setstate__` so the optimizer holds the new
-tensor reference, then loads the saved optimizer state dict.
+```python
+optimizer = torch.optim.Adam(self.embedding_net.parameters(), lr=self.lr)
+```
+
+`_gradient_step` reads `dnd.values[a, indices]` as a frozen constant — the
+regression-loss gradient reaches the CNN only through the distance term
+(`∂w_i/∂h`), never into `values` itself.
+
+**Why:** an earlier version matched the paper (`values` as a gradient-enabled
+leaf, included in Adam). This broke because `values` is a *ring buffer*:
+Adam's per-slot momentum/variance state is tied to slot *position*, not
+entry *identity*. When a slot is evicted and a new, unrelated (key, value)
+pair is written into it, the optimizer's stale momentum for the *previous*
+occupant gets applied to the *new* one on the next step, and combined with
+the separate blend-rule writes touching the same slot out-of-band from
+autograd, this drove values negative over time. Freezing `values` (blend
+rule only) avoids that interaction. This matches the deviation the
+reference GitHub repo (github.com/EndingCredits/Neural-Episodic-Control)
+makes from the paper, for a related reason.
+
+If you want to restore paper-faithful gradient updates on `values`, you'd
+need to solve the stale-momentum-on-eviction problem first (e.g. reset
+Adam's per-slot state on eviction, or use a plain low-LR SGD step for
+`values` instead of Adam) — don't just re-add `self.dnd.values` to the
+optimizer's parameter list, that's the change that caused the original
+regression.
 
 ### 2. N-step returns (per-env, complete-episodes-only)
 

@@ -65,7 +65,15 @@ class StepTrainer(BaseTrainer):
             step_time = time.perf_counter() - step_start
 
             if self._should_log(log_every, batch_frames):
-                metrics.update(_batch_metrics(batch))
+                # Fill in only metrics the algorithm didn't already report.
+                # Some algorithms (e.g. NEC/MFEC) use +inf-valued optimistic
+                # Q-estimates for under-explored state-actions in their
+                # exploration policy; `_batch_metrics`'s "train/q_values" reads
+                # that raw (sentinel-substituted) action_value straight from
+                # the collected batch, so it must never clobber an algorithm's
+                # own, correctly-bounded "train/q_values" from step().
+                for key, value in _batch_metrics(batch).items():
+                    metrics.setdefault(key, value)
                 total_time = collect_time + step_time
                 metrics["time/collect"] = collect_time
                 metrics["time/step"] = step_time

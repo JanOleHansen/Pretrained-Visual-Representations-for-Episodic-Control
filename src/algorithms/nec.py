@@ -58,8 +58,8 @@ At episode end:
         ∇ θ = (Q̂ − target)²
         update θ (embedding network only — DND values updated by blend rule)
 
-Reference implementation deviations NOT replicated
---------------------------------------------------
+Reference implementation deviations
+------------------------------------
 The GitHub repo at github.com/EndingCredits/Neural-Episodic-Control explicitly
 documents these deviations from the paper (README + source comments):
 
@@ -68,7 +68,15 @@ documents these deviations from the paper (README + source comments):
    is trained.
 3. Slightly different episode-reset handling.
 
-This implementation follows the paper exactly on all three points.
+This implementation follows the paper on (1) and (3). It does **not** follow
+the paper on (2): the paper's §3.4 has gradients update both the embedding
+network *and* the DND keys/values (values at a lower LR than the blend rate
+α). Here, ``DND.values`` is a plain (non-grad) tensor updated only by the
+blend rule — see the ``DND`` class docstring for why: making ``values`` a
+gradient-enabled Adam parameter conflicted with the ring-buffer's in-place
+overwrites (a newly-inserted entry inherits Adam's stale per-slot momentum
+from whatever it evicted) and drove values negative. This is the same
+deviation the reference repo makes, for a related reason.
 """
 
 from __future__ import annotations
