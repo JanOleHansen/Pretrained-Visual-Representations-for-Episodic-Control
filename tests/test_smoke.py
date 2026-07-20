@@ -159,6 +159,31 @@ def test_smoke_mfec_pong():
     assert "train/qec_size" in metrics
 
 
+def test_smoke_mfec_pong_with_periodic_eval():
+    """EvalCallback: eval/return_mean (unclipped, full-episode) lands in the
+    same metrics dict as train/* when trainer.eval_every_n_steps is set --
+    no separate ``src/eval.py`` run required.
+
+    eval_every_n_steps=500 is chosen to land exactly on the final (and only)
+    logging boundary of this run (500 frames, 100-frame batches, log every
+    100), so the eval fires once and its keys survive into the dict
+    ``_train()`` returns.
+    """
+    pytest.importorskip("ale_py")
+    cfg = load_experiment_cfg(
+        "mfec/pong",
+        [
+            *_mfec_pong_overrides(),
+            "trainer.eval_every_n_steps=500",
+            "trainer.num_eval_episodes=1",
+        ],
+    )
+    from src.train import _train
+
+    metrics = _train(cfg)
+    assert "eval/return_mean" in metrics
+
+
 #
 # NEC
 #

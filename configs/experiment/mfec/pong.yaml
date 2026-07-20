@@ -17,3 +17,5 @@ trainer:
   devices: [3]
   num_envs: 16
   log_every_n_steps: 10_000
+  eval_every_n_steps: 200_000   # paper §4: "evaluate MFEC and NEC every 200,000 frames"
+  num_eval_episodes: 5

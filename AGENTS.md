@@ -261,6 +261,37 @@ Use this when training-time and evaluation-time observations should differ
 (e.g. Atari, where `EndOfLifeTransform` and `SignTransform` are train-only and
 `VecNorm` is dropped at eval because its running stats are not checkpointed).
 
+### Periodic in-training evaluation (`EvalCallback`)
+
+`BaseTrainer.evaluate(num_episodes)` runs greedy episodes against
+`eval_environment` and returns `eval/return_mean` etc. By default this only
+runs when you invoke `src/eval.py` manually against a checkpoint — `train/*`
+metrics (from `RewardSum` on the *training* env) are clipped/life-based for
+Atari (see "Reward scale for Atari MFEC runs" below — the same clipping
+applies to any Atari algorithm whose train env includes `SignTransform`,
+not just MFEC) and are **not** comparable to paper-reported scores.
+
+Set `trainer.eval_every_n_steps` (opt-in; `null` by default in
+`configs/train.yaml`) to also run evaluation periodically during training and
+have `eval/return_mean` land in the normal training logs (TensorBoard/W&B)
+next to `train/*`, with no separate `src/eval.py` invocation needed:
+
+```yaml
+# configs/experiment/nec/pong.yaml
+trainer:
+  eval_every_n_steps: 200_000   # paper §4 cadence for MFEC/NEC; baselines use 1_000_000
+  num_eval_episodes: 5
+```
+
+`build_callbacks` (`src/utils/instantiate.py`) only adds `EvalCallback` when
+`eval_every_n_steps` is truthy, and places it **before** the logger callbacks
+in the callback list — `EvalCallback.on_step_end` mutates the shared
+`metrics` dict in place, and callbacks fire in list order, so the loggers see
+the merged `eval/*` keys on the same `on_step_end` call. This only makes
+sense when a dedicated `eval_environment` is configured (see above); without
+one, `evaluate()` falls back to the (clipped/life-based) training env and
+periodic eval buys you nothing beyond more episodes.
+
 ## Trainer
 
 `StepTrainer` is the only trainer.  It:
@@ -295,7 +326,8 @@ src/
   trainers/
     BaseTrainer.py          — BaseTrainer ABC, TrainerEvent, Callback protocol, fire_callbacks
     StepTrainer.py          — StepTrainer (Collector-driven loop)
-  callbacks/                — ProgressCallback, CheckpointCallback, WandBLogger, TensorBoardLogger
+  callbacks/                — ProgressCallback, CheckpointCallback, EvalCallback,
+                              WandBLogger, TensorBoardLogger
   utils/                    — device resolution, seeding, callback builders
 configs/
   algorithm/dqn.yaml        — DQN HPs (CartPole defaults); _partial_ replay_buffer + network
@@ -374,7 +406,10 @@ All MFEC training configs include `SignTransform` (reward clipped to
 reward events — **not** the true game score. For example, "57" on Q*Bert means
 ~57 positive reward events, not a score of 57 points. Always compare against
 the paper using `eval/return_mean`, which is computed from the `*_eval.yaml`
-environment that drops `SignTransform`.
+environment that drops `SignTransform`. Set `trainer.eval_every_n_steps` to
+get `eval/return_mean` logged periodically during training instead of
+running `src/eval.py` separately after the fact — see "Periodic in-training
+evaluation" above.
 
 ## NEC — DND values, blend-only (deviates from the paper here)
 

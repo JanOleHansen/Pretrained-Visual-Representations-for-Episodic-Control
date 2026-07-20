@@ -30,19 +30,26 @@ def build_callbacks(
 ) -> list:
     """Assemble the full callback list for a training run.
 
-    Always includes ProgressCallback and CheckpointCallback.
-    Logger callbacks are appended after.
+    Always includes ProgressCallback and CheckpointCallback. EvalCallback is
+    included when ``trainer_cfg.eval_every_n_steps`` is set (opt-in, since it
+    requires a dedicated ``eval_environment`` to be worth the extra rollout
+    cost -- see ``configs/experiment/*/*.yaml`` for examples). Logger
+    callbacks are appended last, so EvalCallback's ``eval/*`` metrics are
+    already in the ``metrics`` dict by the time loggers see it on the same
+    ``on_step_end`` call.
 
     Args:
-        trainer_cfg: trainer sub-config (contains total_frames, log_every_n_steps)
+        trainer_cfg: trainer sub-config (contains total_frames, log_every_n_steps,
+            optionally eval_every_n_steps / num_eval_episodes)
         checkpoint_cfg: checkpoint sub-config (save_dir, save_every_n_steps, save_last)
-        trainer: the trainer instance (injected into CheckpointCallback)
+        trainer: the trainer instance (injected into CheckpointCallback / EvalCallback)
         loggers: pre-instantiated logger callback objects
 
     Returns:
         ordered list of callbacks
     """
     from src.callbacks.checkpoint import CheckpointCallback
+    from src.callbacks.eval import EvalCallback
     from src.callbacks.progress import ProgressCallback
 
     checkpoint_cb = CheckpointCallback(
@@ -52,8 +59,19 @@ def build_callbacks(
     )
     checkpoint_cb.set_trainer(trainer)
 
-    return [
+    callbacks = [
         ProgressCallback(total_steps=trainer_cfg.total_frames),
         checkpoint_cb,
-        *loggers,
     ]
+
+    eval_every_n_steps = trainer_cfg.get("eval_every_n_steps")
+    if eval_every_n_steps:
+        eval_cb = EvalCallback(
+            eval_every_n_steps=int(eval_every_n_steps),
+            num_episodes=int(trainer_cfg.get("num_eval_episodes", 5)),
+        )
+        eval_cb.set_trainer(trainer)
+        callbacks.append(eval_cb)
+
+    callbacks.extend(loggers)
+    return callbacks

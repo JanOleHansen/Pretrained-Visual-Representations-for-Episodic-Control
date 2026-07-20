@@ -219,6 +219,11 @@ defaults:
 When `eval_environment` is set, `BaseTrainer.evaluate()` uses it; otherwise it
 falls back to `environment`.
 
+By default `evaluate()` only runs when you invoke `src/eval.py` against a
+checkpoint. Set `trainer.eval_every_n_steps` (see "Trainer" below) to also
+run it periodically *during* training and get `eval/return_mean` logged
+alongside `train/*` in the same run — no separate eval pass needed.
+
 ### Trainer
 
 `StepTrainer` creates a `torchrl.collectors.Collector` from the algorithm's
@@ -240,8 +245,10 @@ for batch in self.collector:
 - **Checkpoints** — orchestrates save/load of algorithm state.
 
 Trainer config knobs (`total_frames`, `seed`, `accelerator`, `devices`,
-`num_envs`, `log_every_n_steps`) only control how training runs, never what is
-learned.
+`num_envs`, `log_every_n_steps`, `eval_every_n_steps`, `num_eval_episodes`)
+only control how training runs, never what is learned. `eval_every_n_steps`
+is `null` (disabled) by default; set it to a frame count to enable periodic
+evaluation (see `EvalCallback` below).
 
 ## Configuration
 
@@ -319,7 +326,9 @@ The trainer fires events at key points:
 | `ON_TRAIN_END`    | After the loop        | `state: {"cfg": cfg}`               |
 
 Built-in callbacks: `ProgressCallback` (tqdm bar), `CheckpointCallback`,
-`WandBLogger`, `TensorBoardLogger`.
+`EvalCallback` (periodic greedy-policy eval via `eval_environment`, opt-in
+with `trainer.eval_every_n_steps`; merges `eval/*` into the same `metrics`
+dict the loggers see), `WandBLogger`, `TensorBoardLogger`.
 
 ## Adding a new algorithm
 
