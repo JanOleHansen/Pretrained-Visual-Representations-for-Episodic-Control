@@ -199,6 +199,10 @@ class DND:
           2. kNN + kernel weighting for queries not in the dict.
           3. +∞ for actions with too few stored entries (optimistic init).
 
+        The kNN step is batched across all actions in a single
+        :meth:`knn_all_actions` call rather than looping over actions in
+        Python — see that method's docstring for why.
+
         Parameters
         ----------
         queries : (B, d) float32
@@ -218,55 +222,144 @@ class DND:
         if queries.device != self.device:
             queries = queries.to(self.device)
 
-        keys = self._make_keys(queries)
-        result = torch.full((A, B), float("inf"), dtype=torch.float32, device=self.device)
+        keys_b = self._make_keys(queries)
 
+        # --- Exact-match lookups (cheap CPU dict ops; unchanged) -----------
+        hit_mask = torch.zeros(A, B, dtype=torch.bool, device=self.device)
+        hit_vals = torch.zeros(A, B, dtype=torch.float32, device=self.device)
         for a in range(A):
-            size_a = self._sizes[a]
             k_to_s = self._key_to_slot[a]
-
             hit_b:    list[int] = []
             hit_slots: list[int] = []
-            miss_b:   list[int] = []
-            for b, key in enumerate(keys):
+            for b, key in enumerate(keys_b):
                 slot = k_to_s.get(key)
                 if slot is not None:
                     hit_b.append(b)
                     hit_slots.append(slot)
-                else:
-                    miss_b.append(b)
-
             if hit_b:
                 hit_b_t = torch.tensor(hit_b,     dtype=torch.long, device=self.device)
                 hit_s_t = torch.tensor(hit_slots, dtype=torch.long, device=self.device)
-                result[a, hit_b_t] = self.values.data[a, hit_s_t].float()
+                hit_mask[a, hit_b_t] = True
+                hit_vals[a, hit_b_t] = self.values.data[a, hit_s_t].float()
 
-            if not miss_b:
-                continue
+        # --- kNN, batched across ALL actions in one pass -------------------
+        # k+1: column 0 is the nearest neighbour (used for the near-exact
+        # check), columns 0..k-1 feed the kernel-weighted average.
+        dists, idx = self.knn_all_actions(queries, self.k + 1)  # (A, B, <=k+1)
+        cols  = dists.shape[-1]
+        k_use = min(self.k, cols)
 
-            if size_a <= self.k:
-                continue  # too sparse → stays +inf (optimistic init)
+        a_idx    = torch.arange(A, device=self.device).view(A, 1, 1).expand_as(idx)
+        knn_vals = self.values.data[a_idx, idx].float()          # (A, B, cols)
 
-            miss_b_t = torch.tensor(miss_b, dtype=torch.long, device=self.device)
-            miss_q   = queries[miss_b_t]
-            k_fetch  = min(self.k + 1, size_a)
-            dists, idx = self.knn_action(miss_q, a, k_fetch)  # (miss, k_fetch)
+        near_exact = dists[..., 0] < 1e-5                        # (A, B)
+        dists_sq   = dists[..., :k_use] ** 2                     # (A, B, k_use)
+        weights    = 1.0 / (dists_sq + self.kernel_delta)
+        knn_q      = (weights * knn_vals[..., :k_use]).sum(-1) / weights.sum(-1)
+        exact_val  = knn_vals[..., 0]
 
-            near_exact = dists[:, 0] < 1e-5
-            k_use      = min(self.k, k_fetch)
-            knn_vals   = self.values.data[a, idx[:, :k_use]].float()  # (miss, k_use)
+        knn_result = torch.where(near_exact, exact_val, knn_q)   # (A, B)
 
-            dists_sq = dists[:, :k_use] ** 2                          # (miss, k_use)
-            weights  = 1.0 / (dists_sq + self.kernel_delta)           # (miss, k_use)
-            knn_q    = (weights * knn_vals).sum(-1) / weights.sum(-1)
-
-            exact_val = self.values.data[a, idx[:, 0]].float()
-            result[a, miss_b_t] = torch.where(near_exact, exact_val, knn_q)
+        sizes_t     = torch.tensor(self._sizes, device=self.device)
+        sparse_mask = (sizes_t <= self.k).view(A, 1)              # too sparse → +inf
+        result = torch.where(
+            sparse_mask, torch.full_like(knn_result, float("inf")), knn_result
+        )
+        result = torch.where(hit_mask, hit_vals, result)          # exact hits always win
 
         return result.T.to(dev_q)  # (B, A)
 
     # ------------------------------------------------------------------
-    # kNN for a single action (identical to QEC.knn_action)
+    # kNN across ALL actions for a shared query set (batched)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def knn_all_actions(
+        self,
+        queries: torch.Tensor,  # (B, d)
+        k:       int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Chunked kNN (exact L2) over stored keys, batched across actions.
+
+        Used by ``estimate_all`` (ε-greedy action selection, called once per
+        collector step): every query there is checked against every
+        action's table regardless — that's what "Q(s, a) for all actions"
+        means — so batching the ``num_actions`` sequential ``knn_action``
+        calls into one batched ``cdist`` per capacity-chunk removes GPU
+        kernel-launch/sync overhead for free, without computing anything
+        extra. NOT used by ``NECAlgorithm._gradient_step``: there, each row
+        only ever needs its own action's table, so broadcasting against all
+        tables would mean doing up to ``num_actions``x more distance
+        computations for no benefit — that call site keeps the per-action
+        ``knn_action`` loop instead.
+
+        Slots beyond an action's current size are masked to +inf distance so
+        they never surface in the top-k; callers must still gate "too
+        sparse" actions (``size_a <= k``) themselves, exactly as with the
+        per-action ``knn_action``.
+
+        Parameters
+        ----------
+        queries : (B, d) float32 — same query set evaluated against every
+            action's table.
+        k : requested number of neighbours (may be reduced if no action
+            holds at least that many entries).
+
+        Returns
+        -------
+        dists   : (A, B, k_eff) L2 distances
+        indices : (A, B, k_eff) slot indices into self.keys[action]
+        """
+        A = self.num_actions
+        B = queries.shape[0]
+        d = queries.shape[1]
+
+        if queries.device != self.device:
+            queries = queries.to(self.device)
+
+        sizes_t  = torch.tensor(self._sizes, device=self.device)
+        max_size = int(sizes_t.max().item()) if self._sizes else 0
+        k_eff    = min(k, max_size)
+
+        if k_eff <= 0:
+            return (
+                torch.full((A, B, 0), float("inf"), device=self.device),
+                torch.zeros((A, B, 0), dtype=torch.long, device=self.device),
+            )
+
+        chunk_size = max(1, self._CHUNK_BYTES // (A * B * 4))
+        chunk_size = min(chunk_size, max_size)
+
+        best_dists = torch.full((A, B, k_eff), float("inf"), device=self.device)
+        best_idx   = torch.zeros((A, B, k_eff), dtype=torch.long,  device=self.device)
+
+        q_exp = queries.unsqueeze(0).expand(A, B, d)
+
+        for cs in range(0, max_size, chunk_size):
+            ce = min(cs + chunk_size, max_size)
+            cd = torch.cdist(q_exp, self.keys[:, cs:ce, :])       # (A, B, ce-cs)
+
+            slot_idx = torch.arange(cs, ce, device=self.device).view(1, 1, -1)
+            valid    = slot_idx < sizes_t.view(A, 1, 1)
+            cd       = cd.masked_fill(~valid, float("inf"))
+
+            ck = min(k_eff, ce - cs)
+            chd, chi = cd.topk(ck, dim=-1, largest=False)
+            chi = chi + cs
+
+            merged_d = torch.cat([best_dists, chd], dim=-1)
+            merged_i = torch.cat([best_idx,   chi], dim=-1)
+            _, keep  = merged_d.topk(k_eff, dim=-1, largest=False)
+            best_dists = merged_d.gather(-1, keep)
+            best_idx   = merged_i.gather(-1, keep)
+
+        return best_dists, best_idx
+
+    # ------------------------------------------------------------------
+    # kNN for a single action (identical to QEC.knn_action) — used by
+    # NECAlgorithm._gradient_step, where each row only needs its own
+    # action's table (see knn_all_actions' docstring for why that call
+    # site does NOT use the batched-across-actions helper).
     # ------------------------------------------------------------------
 
     @torch.no_grad()
@@ -962,6 +1055,16 @@ class NECAlgorithm(BaseAlgorithm):
         h = self.embedding_net(obs_flat)                      # (B, embedding_dim)
         h = nn.functional.normalize(h, dim=-1)               # unit-norm per paper §2
 
+        # NOTE: this stays a per-action Python loop (unlike estimate_all,
+        # which batches across actions via dnd.knn_all_actions). Batching it
+        # the same way would mean broadcasting every row's query against
+        # EVERY action's table instead of just the table for its own action
+        # — an up-to-num_actions-fold increase in raw distance computations
+        # against tables that can hold up to dnd_capacity entries each. That
+        # FLOP blow-up is not just a constant-overhead cost (unlike the
+        # kernel-launch overhead estimate_all's batching removes), so it can
+        # easily cost more than the saved launches recover. Measured ~3.8x
+        # slower on CPU when tried; left as the per-action loop here.
         q_hat_parts:  list[torch.Tensor] = []
         target_parts: list[torch.Tensor] = []
 
