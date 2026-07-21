@@ -25,6 +25,7 @@ dependencies = [
     # Testing
     "pytest>=8.0.0",
     "pytest-timeout>=2.3.0",
+    "scipy>=1.15.3",
 ]
 
 [build-system]
