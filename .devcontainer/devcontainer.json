@@ -9,15 +9,17 @@
             "VARIANT": "ubuntu22.04",
             "CUDA_VERSION": "12.4.1",
             "USERNAME": "vscode",
-            "USER_UID": "${localEnv:UID:1000}",
-            "USER_GID": "${localEnv:GID:1000}"
+            "USER_UID": "5055",
+            "USER_GID": "5002"
         }
     },
     "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/${localWorkspaceFolderBasename},type=bind",
     "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
     "runArgs": [
-        "--gpus",
-        "all",
+        "--gpus", "device=2",
+        "--cpus=8",
+        "--memory=32g",
+        "--memory-reservation=16g",
         "--shm-size=32gb"
     ],
     "mounts": [

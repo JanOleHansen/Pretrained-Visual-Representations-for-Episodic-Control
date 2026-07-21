@@ -25,13 +25,13 @@ RUN UV_INSTALL_DIR=/usr/local/bin sh /uv-installer.sh && rm /uv-installer.sh
 
 # Create a non-root user matching the host UID/GID and name
 ARG USERNAME=vscode
-ARG USER_UID=1000
-ARG USER_GID=1000
+ARG USER_UID=5055
+ARG USER_GID=5002
 
 RUN set -eux; \
     USERNAME="${USERNAME:-vscode}"; \
-    USER_UID="${USER_UID:-1000}"; \
-    USER_GID="${USER_GID:-${USER_UID}}"; \
+    USER_UID="${USER_UID:-5055}"; \
+    USER_GID="${USER_GID:-5002}"; \
     if ! getent group "${USER_GID}" > /dev/null; then \
         groupadd --gid "${USER_GID}" "${USERNAME}"; \
     fi; \
@@ -39,7 +39,7 @@ RUN set -eux; \
         useradd --uid "${USER_UID}" --gid "${USER_GID}" -m --shell /bin/bash "${USERNAME}"; \
     fi; \
     usermod --shell /bin/bash "${USERNAME}"; \
-    apt-get install -y --no-install-recommends sudo; \
+    apt-get update && apt-get install -y --no-install-recommends sudo; \
     echo "${USERNAME} ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME}; \
     chmod 0440 /etc/sudoers.d/${USERNAME}
 
