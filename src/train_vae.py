@@ -65,7 +65,6 @@ def _train_vae(cfg: DictConfig) -> str:
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     torch.set_num_threads(1)
 
-    # Stays on CPU: 1M 84x84 frames is ~26GB of float32, which alone can
     # exceed a single GPU's VRAM even though any one training minibatch is
     # tiny. _fit() moves only each minibatch to `device`.
     frames = _collect_frames(
@@ -118,7 +117,7 @@ def _collect_frames(
     t0 = time.time()
     for batch in collector:
         pixels = batch["pixels"].reshape(-1, *batch["pixels"].shape[-3:])
-        chunks.append(pixels.clone())
+        chunks.append((pixels * 255.0).round().to(torch.uint8))   # cast to uint8 per minibatch to save RAM
         collected += pixels.shape[0]
         elapsed = time.time() - t0
         print(
@@ -130,7 +129,7 @@ def _collect_frames(
             break
     collector.shutdown()
 
-    return torch.cat(chunks, dim=0)[:num_frames].float()
+    return torch.cat(chunks, dim=0)[:num_frames]    #keep uint8 cast per minibatch in _fit() to save RAM
 
 
 def _fit(vae, optimizer, frames: torch.Tensor, device: torch.device, cfg: DictConfig) -> None:
@@ -148,7 +147,7 @@ def _fit(vae, optimizer, frames: torch.Tensor, device: torch.device, cfg: DictCo
         for start in range(0, n - batch_size + 1, batch_size):
             if step >= total_steps:
                 break
-            x = frames[perm[start : start + batch_size]].to(device, non_blocking=True)
+            x = frames[perm[start : start + batch_size]].to(device, non_blocking=True).float().div_(255.0)   # cast to float per minibatch to save RAM
 
             recon_mu, recon_logstd, mu, logstd = vae(x)
             loss, recon_loss, kl_loss = vae_loss(recon_mu, recon_logstd, x, mu, logstd, beta)
