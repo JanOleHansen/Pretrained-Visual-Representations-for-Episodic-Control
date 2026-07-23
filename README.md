@@ -43,6 +43,7 @@ Two derived rules:
 | MFEC      | ALE/Pong-v5      | `experiment=mfec/pong`          |
 | MFEC      | ALE/Breakout-v5  | `experiment=mfec/breakout`      |
 | MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`         |
+| MFEC      | ALE/MsPacman-v5  | `experiment=mfec/mspacman`      |
 | NEC       | ALE/Pong-v5      | `experiment=nec/pong`           |
 
 ## Main technologies
@@ -256,6 +257,7 @@ evaluation (see `EvalCallback` below).
 configs/
 ├── train.yaml              <- top-level defaults (trainer, checkpoint)
 ├── eval.yaml               <- evaluation defaults
+├── train_vae.yaml          <- VAE pretraining defaults (MFEC "vae" encoder)
 ├── algorithm/
 │   ├── dqn.yaml            <- DQN HPs (CartPole defaults)
 │   ├── dqn_atari.yaml      <- DQN HPs (Atari/NatureDQN defaults)
@@ -272,6 +274,10 @@ configs/
 │   ├── breakout_eval.yaml  <- Breakout eval transforms
 │   ├── qbert_train.yaml    <- Q*Bert training transforms
 │   ├── qbert_eval.yaml     <- Q*Bert eval transforms
+│   ├── mspacman_train.yaml <- Ms. Pac-Man training transforms
+│   ├── mspacman_eval.yaml  <- Ms. Pac-Man eval transforms
+│   ├── mspacman_train_singleframe.yaml <- same, no CatFrames (paper-exact VAE encoder)
+│   ├── mspacman_eval_singleframe.yaml  <- eval counterpart, no CatFrames
 │   └── halfcheetah.yaml    <- HalfCheetah-v4 (DoubleToFloat + InitTracker)
 ├── logger/
 │   ├── wandb.yaml
@@ -288,7 +294,9 @@ configs/
     ├── mfec/
     │   ├── pong.yaml       <- MFEC on Pong (40M frames)
     │   ├── breakout.yaml   <- MFEC on Breakout (1M frames)
-    │   └── qbert.yaml      <- MFEC on Q*Bert (40M frames)
+    │   ├── qbert.yaml      <- MFEC on Q*Bert (40M frames)
+    │   ├── mspacman.yaml   <- MFEC on Ms. Pac-Man (40M frames)
+    │   └── mspacman_vae.yaml <- same, with the paper-exact VAE encoder
     └── nec/
         └── pong.yaml       <- NEC on Pong (40M frames)
 ```
@@ -329,6 +337,26 @@ Built-in callbacks: `ProgressCallback` (tqdm bar), `CheckpointCallback`,
 `EvalCallback` (periodic greedy-policy eval via `eval_environment`, opt-in
 with `trainer.eval_every_n_steps`; merges `eval/*` into the same `metrics`
 dict the loggers see), `WandBLogger`, `TensorBoardLogger`.
+
+## MFEC encoders
+
+MFEC's state embedding is pluggable (`algorithm.encoder_name`):
+
+- `random_projection` (default) — fixed random projection, no pretraining needed.
+- `vae` — a frozen convolutional VAE (`src/models/conv_vae.py`), matching
+  Blundell et al. 2016 ("Model-Free Episodic Control"), Appendix D exactly:
+  a single 84×84 grayscale frame in, embedding = `mean ⊕ log-std` of a
+  32-dim latent (64 values total). Because the input is a single frame (not
+  this repo's usual 4-frame stack), it needs a "singleframe" environment
+  variant — see `experiment/mfec/mspacman_vae.yaml`. Pretrain a checkpoint
+  with `src/train_vae.py` (defaults: 1M random-policy frames, RMSProp,
+  lr=1e-5, batch=100, 400,000 steps — also matching the paper), then run:
+
+  ```shell
+  python src/train_vae.py
+  python src/train.py experiment=mfec/mspacman_vae \
+      algorithm.vae_checkpoint=<checkpoint.save_path printed above>
+  ```
 
 ## Adding a new algorithm
 

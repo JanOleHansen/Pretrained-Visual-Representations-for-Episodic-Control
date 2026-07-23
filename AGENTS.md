@@ -18,6 +18,7 @@ Implemented experiments:
 | MFEC      | ALE/Pong-v5      | `experiment=mfec/pong`         |
 | MFEC      | ALE/Breakout-v5  | `experiment=mfec/breakout`     |
 | MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`        |
+| MFEC      | ALE/MsPacman-v5  | `experiment=mfec/mspacman`     |
 | NEC       | ALE/Pong-v5      | `experiment=nec/pong`          |
 
 ## Design principles
@@ -310,6 +311,8 @@ checkpoint orchestration.
 src/
   train.py                  — entry point; instantiate(cfg.algorithm); environment **kwargs
   eval.py                   — evaluation entry point; same algorithm instantiation
+  train_vae.py              — offline VAE pretraining entry point for the MFEC "vae" encoder
+                              (not an Algorithm/Trainer — standalone Hydra script)
   networks.py               — network factories: make_mlp_q_net, NatureDQN,
                               NatureEmbedding (NEC CNN trunk, no Q-head),
                               make_mlp_ddpg_actor, make_mlp_ddpg_critic,
@@ -319,7 +322,16 @@ src/
     dqn.py                  — DQNAlgorithm; replay/network factories (defaults + setup contract)
     ddpg.py                 — DDPGAlgorithm; actor/critic/replay/noise factories
     a2c.py                  — A2CAlgorithm; on-policy actor/critic with GAE + A2CLoss
+    mfec.py                 — MFECAlgorithm; QEC memory, QECPolicy (pluggable encoder), MC returns
     nec.py                  — NECAlgorithm; DND class, DNDPolicy, N-step returns, dual updates
+  encoders/                 — pluggable MFEC state embeddings (see "Encoders (MFEC)" below)
+    base.py                 — Encoder contract: embed() / state() / load_state()
+    factory.py               — make_encoder(name, ...)
+    random_projectins.py    — RandomProjectionEncoder (default; filename has a typo, kept as-is)
+    vae_encoder.py           — VAEEncoder (frozen ConvVAE, embeds mean ++ log-std)
+  models/
+    conv_vae.py              — ConvVAE (Blundell et al. 2016 App. D architecture);
+                              vae_loss/gaussian_nll/kl_diag_gaussian used by train_vae.py
   environments/
     environment.py          — Environment wrapper (holds factory kwargs, exposes make_env)
     factory.py              — make_env: gymnasium + transforms list + gym_kwargs/gym_backend
@@ -334,7 +346,8 @@ configs/
   algorithm/dqn_atari.yaml  — DQN HPs (Atari/NatureDQN defaults; pixel obs)
   algorithm/ddpg.yaml       — DDPG HPs (HalfCheetah defaults); _partial_ actor/critic/noise
   algorithm/a2c.yaml        — A2C HPs (HalfCheetah/MuJoCo defaults); _partial_ actor/value
-  algorithm/mfec_atari.yaml — MFEC HPs (Atari defaults: buffer_size=1M, k=11, state_dim=64)
+  algorithm/mfec_atari.yaml — MFEC HPs (Atari defaults: buffer_size=1M, k=11, state_dim=64;
+                              encoder_name=random_projection, vae_checkpoint=null, seed=null)
   algorithm/nec.yaml        — NEC HPs (base defaults); _partial_ embedding_network + replay_buffer
   algorithm/nec_atari.yaml  — NEC HPs (Atari defaults per Pritzel et al. 2017 Table S1)
   environment/cartpole.yaml — env kwargs (name, transforms)
@@ -345,6 +358,10 @@ configs/
   environment/breakout_eval.yaml  — Atari Breakout (eval transforms)
   environment/qbert_train.yaml    — ALE/Qbert-v5 (training transforms; no VecNorm — MFEC only)
   environment/qbert_eval.yaml     — ALE/Qbert-v5 (eval transforms)
+  environment/mspacman_train.yaml — ALE/MsPacman-v5 (training transforms; no VecNorm — MFEC only)
+  environment/mspacman_eval.yaml  — ALE/MsPacman-v5 (eval transforms)
+  environment/mspacman_train_singleframe.yaml — same, minus CatFrames (paper-exact VAE encoder input)
+  environment/mspacman_eval_singleframe.yaml  — eval counterpart, no CatFrames
   environment/halfcheetah.yaml — HalfCheetah-v4 (DoubleToFloat + InitTracker)
   experiment/dqn/cartpole.yaml — composed CartPole experiment
   experiment/dqn/pong.yaml     — composed Atari Pong experiment
@@ -353,12 +370,17 @@ configs/
   experiment/mfec/pong.yaml    — MFEC on Pong (40M frames, num_envs=16)
   experiment/mfec/breakout.yaml — MFEC on Breakout (1M frames)
   experiment/mfec/qbert.yaml   — MFEC on Q*Bert (40M frames, num_envs=16)
+  experiment/mfec/mspacman.yaml — MFEC on Ms. Pac-Man (40M frames, num_envs=16)
+  experiment/mfec/mspacman_vae.yaml — same, with encoder_name=vae + singleframe env
+                              (vae_checkpoint is required, no default — see "Encoders" above)
   experiment/nec/pong.yaml     — NEC on Pong (40M frames, num_envs=16)
   logger/{wandb,tensorboard}.yaml
   paths/default.yaml
-  train.yaml, eval.yaml
+  train.yaml, eval.yaml, train_vae.yaml
 tests/
   test_smoke.py             — DQN-on-CartPole, DQN-on-Pong, DDPG-on-HalfCheetah, A2C-on-HalfCheetah, MFEC-on-Pong, NEC-on-Pong smoke tests
+  test_mfec_encoder_refactor.py — encoder-abstraction transparency: setup() wiring, embed()
+                              shape/determinism, forward(), deepcopy sharing, checkpoint round-trip
 ```
 
 ## Adding a new algorithm
@@ -395,6 +417,8 @@ Concretely:
 | `pong_mfec_train.yaml` | ✗ | MFEC pong |
 | `breakout_train.yaml` | ✗ | MFEC breakout |
 | `qbert_train.yaml` | ✗ | MFEC Q*Bert |
+| `mspacman_train.yaml` | ✗ | MFEC Ms. Pac-Man |
+| `mspacman_train_singleframe.yaml` | ✗ | MFEC Ms. Pac-Man + VAE encoder (paper-exact) |
 
 The fixed random projection already compresses 28 k-pixel observations
 adequately without online whitening.
@@ -410,6 +434,80 @@ environment that drops `SignTransform`. Set `trainer.eval_every_n_steps` to
 get `eval/return_mean` logged periodically during training instead of
 running `src/eval.py` separately after the fact — see "Periodic in-training
 evaluation" above.
+
+## Encoders (MFEC)
+
+MFEC's `φ` (state embedding) is a pluggable `Encoder` (`src/encoders/base.py`),
+not hardcoded into `QECPolicy`. `MFECAlgorithm.setup()` builds it via
+`make_encoder(encoder_name, ...)` (`src/encoders/factory.py`) and hands the
+instance to `QECPolicy(qec, encoder, num_actions)`, which calls
+`encoder.embed(obs)`. `QECPolicy.__deepcopy__` shares the encoder by
+reference (same object the collector's policy uses), same as `qec`.
+
+Contract (`Encoder`):
+- `embed(obs) -> (B, d) float32` on `obs.device`; **must be deterministic**
+  (identical pixels -> identical embedding), or the QEC exact-hit hash path
+  (`QEC._make_keys`) never fires.
+- `state() -> dict` / `load_state(dict) -> None` for checkpointing — plugged
+  into `MFECAlgorithm._get_training_state()` / `_load_training_state()` as
+  `extra["encoder_state"]`.
+
+Two implementations:
+- `random_projection` (default) — `RandomProjectionEncoder`
+  (`src/encoders/random_projectins.py` — note the filename typo, kept as-is
+  to avoid churning existing imports). Fixed `np.random.default_rng(seed)`
+  projection matrix, no training needed.
+- `vae` — `VAEEncoder` (`src/encoders/vae_encoder.py`), wraps a frozen
+  `src/models/conv_vae.py::ConvVAE`. Architecture and training regime match
+  Blundell et al. 2016 ("Model-Free Episodic Control"), Appendix D exactly:
+  encoder = 4 conv layers ({32,32,64,64} kernels {4,5,5,4}, stride
+  {2,2,2,2}, no padding, ReLU) -> 512-unit FC ReLU -> linear (mean, log-std)
+  heads, `latent_dim=32`; decoder mirrors this and also outputs (mean,
+  log-std) for `p(x|z)` (a full Gaussian NLL reconstruction loss, not MSE).
+  `embed(obs)` returns `concat(mean, log-std)` — **64 values, both
+  deterministic** (no sampling; only `reparameterize()` samples, and only
+  during training) — per the paper: "both the mean and log-standard-deviation
+  parameters ... were used as dimensions for computing Euclidean distances
+  in the episodic controller." `VAEEncoder`'s `state_dim` is the *exposed*
+  width (64); the underlying `ConvVAE.latent_dim` is `state_dim // 2`.
+
+  The paper's VAE input is a **single 84×84 grayscale frame** (`x ∈ R^7056`,
+  `in_channels=1`), not the 4-frame stack the rest of this repo's Atari
+  configs use (`CatFrames N=4`). MFEC-with-VAE therefore needs a
+  single-frame environment variant — see `mspacman_train_singleframe.yaml`
+  / `mspacman_eval_singleframe.yaml` (drop `CatFrames` from
+  `mspacman_train.yaml` / `mspacman_eval.yaml`) and
+  `experiment/mfec/mspacman_vae.yaml`, which composes them with
+  `encoder_name=vae`. This is a deliberate, paper-faithful trade-off: MFEC
+  loses temporal (velocity) information when using this encoder, vs. the
+  `random_projection` variant which keeps `CatFrames`. Only replicate the
+  singleframe/`*_vae.yaml` pattern for another game if you actually want
+  paper-exact VAE behaviour there.
+
+  Requires a checkpoint: `algorithm.vae_checkpoint=<path>` pointing at a
+  `torch.save(vae.state_dict())` file. Produce one with `src/train_vae.py`
+  (defaults also match the paper — 1,000,000 random-policy frames, RMSProp,
+  lr=1e-5, batch=100, 400,000 SGD steps):
+
+  ```shell
+  python src/train_vae.py
+  python src/train.py experiment=mfec/mspacman_vae \
+      algorithm.vae_checkpoint=<checkpoint.save_path printed above>
+  ```
+
+  `train_vae.py` rolls out `collect.frames` pixel frames with a random
+  policy (`torchrl.collectors.Collector` + `RandomPolicy`) from
+  `environment` (defaults to `mspacman_train_singleframe`), trains `ConvVAE`
+  with the Gaussian-NLL + KL loss (`src.models.conv_vae.vae_loss`) for
+  `train.steps` SGD steps, and saves the state_dict to
+  `checkpoint.save_path`. `in_channels` is inferred from the collected
+  frames' shape (not a config knob), so it automatically matches whichever
+  `environment` you point it at. It is a standalone Hydra entry point
+  (`configs/train_vae.yaml`), not an `Algorithm`/`Trainer` — VAE pretraining
+  is offline data prep, not part of the RL loop.
+  `vae.latent_dim` (32 by default) must be half of the downstream
+  `algorithm.state_dim` (64 by default): the exposed embedding is
+  `mean ⊕ log-std`.
 
 ## NEC — DND values, blend-only (deviates from the paper here)
 
@@ -520,5 +618,8 @@ python src/train.py experiment=ddpg/halfcheetah    # DDPG continuous control (1M
 python src/train.py experiment=a2c/halfcheetah     # A2C on-policy continuous control (1M frames)
 python src/train.py experiment=mfec/pong           # MFEC on Pong (40M frames, GPU)
 python src/train.py experiment=mfec/qbert          # MFEC on Q*Bert (40M frames, GPU)
+python src/train.py experiment=mfec/mspacman       # MFEC on Ms. Pac-Man (40M frames, GPU)
+python src/train.py experiment=mfec/mspacman_vae algorithm.vae_checkpoint=<path>  # + paper-exact VAE encoder
+python src/train_vae.py                            # pretrain the MFEC "vae" encoder (see above)
 pytest tests/test_smoke.py -v
 ```

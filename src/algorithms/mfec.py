@@ -85,6 +85,7 @@ from torchrl.envs import EnvBase
 from torchrl.modules import EGreedyModule, QValueActor
 
 from src.algorithms.base import BaseAlgorithm, CollectorConfig, TrainingState
+from src.encoders.factory import make_encoder
 
 
 #
@@ -104,6 +105,9 @@ class MFECAlgorithm(BaseAlgorithm):
             self,
             device: torch.device | None = None,
             *,
+            encoder_name: str = "random_projection",
+            vae_checkpoint: str | None = None,
+            seed: int | None = None,
             obs_key: str = "pixels",
             buffer_size: int = 1_000_000,
             k: int = 11,
@@ -123,7 +127,9 @@ class MFECAlgorithm(BaseAlgorithm):
     ) -> None:
 
         super().__init__(device)
-
+        self.encoder_name = encoder_name
+        self.vae_checkpoint = vae_checkpoint
+        self.seed = seed
         self.obs_key = obs_key
         self.buffer_size = buffer_size
         self.k = k
@@ -148,13 +154,22 @@ class MFECAlgorithm(BaseAlgorithm):
         action_spec = proof_env.action_spec
         num_actions = int(action_spec.space.n)
 
-        sample_shape = obs_shape[-3:]
-        obs_flat_dim = int(np.prod(sample_shape))
-        self.projection = np.random.randn(obs_flat_dim, self.state_dim)
-        self.projection /= np.linalg.norm(self.projection, axis=0)
-
         self._buffer_device = (
             self.device if self.device is not None else torch.device("cpu")
+        )
+
+        sample_shape = obs_shape[-3:]
+        obs_flat_dim = int(np.prod(sample_shape))
+        in_channels = sample_shape[0]
+
+        self.encoder = make_encoder(
+            self.encoder_name,
+            obs_flat_dim=obs_flat_dim,
+            in_channels=in_channels,
+            state_dim=self.state_dim,
+            vae_checkpoint_path=self.vae_checkpoint,
+            device=self._buffer_device,
+            seed=self.seed,
         )
 
         # Detect number of parallel envs from the proof env's batch_size.
@@ -168,9 +183,10 @@ class MFECAlgorithm(BaseAlgorithm):
             num_actions, self.buffer_size, self.k, self._buffer_device,
             key_scale=self.key_scale,
         )
+
         self._num_actions = num_actions
 
-        self.qec_policy = QECPolicy(self.qec, self.projection, num_actions)
+        self.qec_policy = QECPolicy(self.qec, self.encoder, num_actions)
 
         self.q_actor = QValueActor(
             module=self.qec_policy,
@@ -418,7 +434,7 @@ class MFECAlgorithm(BaseAlgorithm):
             policy_state_dict={},
             optimizer_state_dict={},
             extra={
-                "projection":       self.projection,
+                "encoder_state":    self.encoder.state(),
                 "qec_state":        self.qec.__getstate__(),
                 "collected_frames": self._collected_frames,
                 "carry":            self._serialise_carry(),
@@ -426,9 +442,7 @@ class MFECAlgorithm(BaseAlgorithm):
         )
 
     def _load_training_state(self, state: TrainingState) -> None:
-        self.projection = state.extra["projection"]
-        self.qec_policy.projection = self.projection
-        self.qec_policy._proj_tensor = None
+        self.encoder.load_state(state.extra["encoder_state"])
         self._collected_frames = int(state.extra["collected_frames"])
         self.qec.__setstate__(state.extra["qec_state"])
         if "carry" in state.extra:
@@ -472,44 +486,28 @@ class MFECAlgorithm(BaseAlgorithm):
 # ---------------------------------------------------------------------------
 
 class QECPolicy(nn.Module):
-    """Non-parametric nn.Module that estimates Q-values via kNN memory lookup.
-
-    embed() and forward() are split so that MFECAlgorithm.step() can embed
-    the whole batch in one GPU matmul without going through the full forward pass.
-    """
-
-    def __init__(self, qec: "QEC", projection: np.ndarray, num_actions: int) -> None:
+    def __init__(self, qec, encoder, num_actions):
         super().__init__()
         self.qec = qec
-        self.projection = projection
+        self.encoder = encoder
         self.num_actions = num_actions
-        self._proj_tensor: torch.Tensor | None = None
 
     def __deepcopy__(self, memo):
-        # TorchRL deepcopies the policy when setting up the collector.  Share
-        # self.qec by reference so the collector reads the memory that step() writes.
         cls = self.__class__
         copy = cls.__new__(cls)
         memo[id(self)] = copy
         super(QECPolicy, copy).__init__()
-        copy.qec = self.qec
-        copy.projection = self.projection
+        copy.qec = self.qec            # share memory by reference
+        copy.encoder = self.encoder    # share encoder by reference
         copy.num_actions = self.num_actions
-        copy._proj_tensor = None
         return copy
 
-    def embed(self, obs: torch.Tensor) -> torch.Tensor:
-        """Project observation to (batch, state_dim) — result stays on obs.device."""
-        if self._proj_tensor is None or self._proj_tensor.device != obs.device:
-            self._proj_tensor = torch.tensor(
-                self.projection, dtype=torch.float32, device=obs.device
-            )
-        flat = obs.float().reshape(-1, self._proj_tensor.shape[0])
-        return flat @ self._proj_tensor
+    def embed(self, obs):
+        return self.encoder.embed(obs)
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        states = self.embed(obs)                    # (B, d) on obs.device
-        q_values = self.qec.estimate_all(states)    # (B, A) — dict-first, kNN for misses
+    def forward(self, obs):
+        states = self.embed(obs)
+        q_values = self.qec.estimate_all(states)
         q_values = torch.where(
             torch.isinf(q_values),
             torch.full_like(q_values, 1e9),
@@ -522,7 +520,7 @@ class QECPolicy(nn.Module):
 
 
 class _SharedPolicy(TensorDictSequential):
-    """Returns self on deepcopy so a single EGreedyModule is shared with the collector."""
+    #Returns self on deepcopy so a single EGreedyModule is shared with the collector.
 
     def __deepcopy__(self, memo):
         memo[id(self)] = self

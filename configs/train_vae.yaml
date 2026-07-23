@@ -1,0 +1,50 @@
+# VAE pretraining config for the MFEC "vae" encoder (src/encoders/vae_encoder.py).
+# Defaults reproduce Blundell et al. 2016 ("Model-Free Episodic Control"),
+# Appendix D exactly: 1M random-policy frames, latent_dim=32 (-> 64-dim
+# mean+log-std embedding), RMSProp lr=1e-5, batch=100, 400,000 SGD steps.
+# environment defaults to the single-frame variant (no CatFrames) to match
+# the paper's 84x84-single-frame VAE input -- see mspacman_train_singleframe.yaml.
+# Produces a state_dict checkpoint consumable via:
+#   python src/train.py experiment=mfec/mspacman_vae \
+#       algorithm.vae_checkpoint=<checkpoint.save_path>
+defaults:
+  - _self_
+  - paths: default
+  - environment: mspacman_train_singleframe
+  - override hydra/job_logging: colorlog
+  - override hydra/hydra_logging: colorlog
+
+seed: 42
+device: cuda:0   # falls back to cpu if cuda is unavailable
+
+vae:
+  # latent_dim is the ConvVAE's internal mean/log-std width; the exposed MFEC
+  # embedding is 2*latent_dim (mean ++ log-std), so this must be
+  # algorithm.state_dim // 2 for the downstream MFEC run (32 -> state_dim=64).
+  latent_dim: 32
+  beta: 1.0        # KL weight
+
+collect:
+  frames: 1_000_000     # raw pixel frames gathered via a random policy
+  frames_per_batch: 1_000
+  # Parallel ALE workers (ParallelEnv) for frame collection. ALE stepping is
+  # CPU-bound and single-threaded per env, so this is what actually uses
+  # more than one core. Tune to the machine's real CPU budget -- check
+  # /sys/fs/cgroup/cpu.max (quota/period), not just nproc, on containers:
+  # torch/OMP default their thread pool to nproc's visible count, and
+  # num_envs workers each spinning up their own pool on top of that will
+  # badly oversubscribe a quota-limited box (looks like a hang, isn't one).
+  num_envs: 8
+
+train:
+  steps: 400_000         # total SGD steps (paper), not epochs
+  batch_size: 100
+  lr: 1.0e-5
+  log_every_n_steps: 5_000
+
+checkpoint:
+  save_path: ${paths.output_dir}/vae_checkpoint.pt
+
+hydra:
+  run:
+    dir: ${paths.log_dir}/train_vae/runs/${now:%Y-%m-%d_%H-%M-%S}

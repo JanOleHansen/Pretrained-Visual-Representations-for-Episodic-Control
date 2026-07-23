@@ -15,6 +15,7 @@ from scipy.signal import lfilter
 from tensordict import TensorDict
 
 from src.algorithms.mfec import MFECAlgorithm, QEC, QECPolicy
+from src.encoders.random_projectins import RandomProjectionEncoder
 
 
 # ---------------------------------------------------------------------------
@@ -60,10 +61,12 @@ def _make_algorithm(
     proj = np.zeros((obs_flat_dim, state_dim), dtype=np.float32)
     for i in range(min(obs_flat_dim, state_dim)):
         proj[i, i] = 1.0
-    alg.projection = proj
+    encoder = RandomProjectionEncoder(obs_flat_dim, state_dim, seed=0)
+    encoder.projection = proj
+    alg.encoder = encoder
 
     alg.qec        = QEC(num_actions, buffer_size, k, dev, key_scale=1e5)
-    alg.qec_policy = QECPolicy(alg.qec, alg.projection, num_actions)
+    alg.qec_policy = QECPolicy(alg.qec, alg.encoder, num_actions)
     alg.greedy_module = _MockGreedy()
     return alg
 

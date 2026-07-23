@@ -23,7 +23,8 @@
         "--shm-size=32gb"
     ],
     "mounts": [
-        "source=${env:HOME}/.ssh,target=/home/vscode/.ssh,readonly,type=bind"
+        "source=${env:HOME}/.ssh,target=/home/vscode/.ssh,readonly,type=bind",
+        "source=/datahome,target=/datahome,type=bind"
     ],
     "extensions": [
         "ms-python.python",

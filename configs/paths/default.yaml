@@ -1,6 +1,6 @@
 # path configuration (following lightning-hydra-template convention)
 # all paths are relative to the project root
 
-root_dir: /datahome/${oc.env:USER}/pvrec-runs
+root_dir: /datahome/rschwinger/episodicrl
 log_dir: ${paths.root_dir}/logs/
 output_dir: ${hydra:runtime.output_dir}/

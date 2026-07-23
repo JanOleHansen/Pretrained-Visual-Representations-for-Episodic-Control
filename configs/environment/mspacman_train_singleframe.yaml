@@ -1,0 +1,31 @@
+name: ALE/MsPacman-v5
+gym_backend: gymnasium
+gym_kwargs:
+  frame_skip: 4
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# Single-frame variant of mspacman_train.yaml: no CatFrames, so "pixels" is a
+# single 84x84 grayscale frame (1, 84, 84) instead of a 4-frame stack.
+# Exists specifically for the paper-exact VAE encoder (Blundell et al. 2016,
+# Appendix D), whose input is explicitly "an 84x84 grayscale image" — a
+# single frame, not a stack. MFEC runs using this environment lose the
+# temporal (velocity) information frame-stacking would otherwise provide;
+# the random_projection MFEC variant should keep using mspacman_train.yaml.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.EndOfLifeTransform
+  - _target_: torchrl.envs.SignTransform
+    in_keys: [reward]
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.GrayScale
+  - _target_: torchrl.envs.Resize
+    w: 84
+    h: 84
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    max_steps: 4500
+  - _target_: torchrl.envs.DoubleToFloat

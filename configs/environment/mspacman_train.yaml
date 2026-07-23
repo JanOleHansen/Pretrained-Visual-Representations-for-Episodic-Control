@@ -1,0 +1,45 @@
+name: ALE/MsPacman-v5
+gym_backend: gymnasium
+gym_kwargs:
+  frame_skip: 4
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# Standard Atari training transform stack (Mnih et al. 2015).
+# EndOfLifeTransform ends each sub-episode on a life loss so the agent cannot
+# learn to exploit "free" steps between lives.  SignTransform clips rewards to
+# {-1, 0, +1} to stabilise training across games with different score scales.
+# All three are train-only; see mspacman_eval.yaml for the evaluation variant.
+#
+# NOTE — reward scale: train/episode_reward (from RewardSum) reflects
+# *clipped* rewards {-1, 0, +1} due to SignTransform, not the true Atari
+# score.  Use eval/return_mean (from mspacman_eval.yaml, which drops
+# SignTransform) for comparisons against paper figures.
+#
+# NOTE — VecNorm deliberately omitted for MFEC: VecNorm updates its running
+# mean/std with every collected frame, so the same raw pixel observation
+# produces different normalised values at different timesteps.  MFEC's
+# exact-match dict relies on bit-identical embeddings for re-encountered
+# states; VecNorm makes that impossible and drives exact_hit_rate to 0.
+# The fixed random projection already compresses observations adequately
+# without online whitening.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.EndOfLifeTransform
+  - _target_: torchrl.envs.SignTransform
+    in_keys: [reward]
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.GrayScale
+  - _target_: torchrl.envs.Resize
+    w: 84
+    h: 84
+  - _target_: torchrl.envs.CatFrames
+    N: 4
+    dim: -3
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    max_steps: 4500
+  - _target_: torchrl.envs.DoubleToFloat

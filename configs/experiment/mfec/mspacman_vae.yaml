@@ -1,0 +1,24 @@
+# @package _global_
+# MFEC + paper-exact VAE encoder (Blundell et al. 2016, Appendix D) on
+# ALE/MsPacman-v5. Uses single 84x84 grayscale frames (no CatFrames) to match
+# the paper's VAE input exactly — see mspacman_train_singleframe.yaml.
+# Pretrain the VAE first with src/train_vae.py, then pass its checkpoint here.
+defaults:
+  - override /algorithm: mfec_atari
+  - override /environment: mspacman_train_singleframe
+  - override /environment@eval_environment: mspacman_eval_singleframe
+  - _self_
+
+algorithm:
+  encoder_name: vae
+  vae_checkpoint: ???   # required: algorithm.vae_checkpoint=<path from src/train_vae.py>
+
+trainer:
+  total_frames: 40_000_100
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  num_envs: 16
+  log_every_n_steps: 10_000
+  eval_every_n_steps: 200_000   # paper §4: "evaluate MFEC and NEC every 200,000 frames"
+  num_eval_episodes: 5
