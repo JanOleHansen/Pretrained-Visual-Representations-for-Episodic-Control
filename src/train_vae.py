@@ -137,7 +137,8 @@ def _fit(vae, optimizer, frames: torch.Tensor, device: torch.device, cfg: DictCo
 
     n = frames.shape[0]
     batch_size = int(cfg.train.batch_size)
-    beta = float(cfg.vae.beta)
+    beta_target = float(cfg.vae.beta)
+    beta_warmup = int(cfg.vae.get("beta_warmup_steps", 0))
     log_every = int(cfg.train.log_every_n_steps)
     total_steps = int(cfg.train.steps)
 
@@ -149,6 +150,7 @@ def _fit(vae, optimizer, frames: torch.Tensor, device: torch.device, cfg: DictCo
                 break
             x = frames[perm[start : start + batch_size]].to(device, non_blocking=True).float().div_(255.0)   # cast to float per minibatch to save RAM
 
+            beta = beta_target if beta_warmup <= 0 else beta_target * min(1.0, step / beta_warmup)
             recon_mu, recon_logstd, mu, logstd = vae(x)
             loss, recon_loss, kl_loss = vae_loss(recon_mu, recon_logstd, x, mu, logstd, beta)
 

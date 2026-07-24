@@ -23,6 +23,7 @@ vae:
   # algorithm.state_dim // 2 for the downstream MFEC run (32 -> state_dim=64).
   latent_dim: 32
   beta: 1.0        # KL weight
+  beta_warmup_steps: 50_000
 
 collect:
   frames: 1_000_000     # raw pixel frames gathered via a random policy

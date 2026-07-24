@@ -27,6 +27,9 @@ class ConvVAE(nn.Module):
 
     _SPATIAL_AFTER_CONV = 3  # 84 -> 41 -> 19 -> 8 -> 3 through the 4 conv layers
 
+    _DEC_LOGSTD_MIN = -4    
+    _DEC_LOGSTD_MAX = 2.0
+
     def __init__(self, in_channels: int = 1, latent_dim: int = 32) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -72,6 +75,7 @@ class ConvVAE(nn.Module):
         )
         h = self.dec(h)
         recon_mu, recon_logstd = self.dec_out(h).chunk(2, dim=1)
+        recon_logstd = recon_logstd.clamp(self._DEC_LOGSTD_MIN, self._DEC_LOGSTD_MAX)
         return recon_mu, recon_logstd
 
     def forward(self, x: torch.Tensor):
