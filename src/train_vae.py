@@ -161,7 +161,7 @@ def _fit(vae, optimizer, frames: torch.Tensor, device: torch.device, cfg: DictCo
             step += 1
             if step % log_every == 0:
                 print(
-                    f"step {step}/{total_steps}  "
+                    f"step {step}/{total_steps}  beta={beta:.3f}"
                     f"recon={recon_loss.item():.4f}  kl={kl_loss.item():.4f}"
                 )
 
