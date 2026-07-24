@@ -1,0 +1,22 @@
+name: ALE/MsPacman-v5
+gym_backend: gymnasium
+gym_kwargs:
+  frame_skip: 4
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# DINOv2 PVM eval variant, paired with mspacman_train_dinov2.yaml.
+# Single RGB frame: no GrayScale (DINOv2 needs 3 channels), no CatFrames.
+# Resize + ImageNet-normalise happen inside DINOv2Encoder.embed().
+# Like mspacman_eval.yaml, drops EndOfLifeTransform + SignTransform so
+# eval/return_mean reflects the true (unclipped) Atari score.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    max_steps: 4500
+  - _target_: torchrl.envs.DoubleToFloat

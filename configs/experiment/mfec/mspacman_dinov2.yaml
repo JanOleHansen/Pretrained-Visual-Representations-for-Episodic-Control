@@ -1,24 +1,24 @@
-# @package _global
+# @package _global_
 defaults:
   - override /algorithm: mfec_atari
   - override /environment: mspacman_train_dinov2
   - override /environment@eval_environment: mspacman_eval_dinov2
   - _self_
 
-  algorithm:
-    encoder_name: dino_v2
-    dinov2_weigts: /datahome/rschwinger/models/dinov2_vits14_pretrain.pth
-    dinov2_model_name: dino_v2_vitb14
-    dinov2_repo_dir: null
-    dinov2_image_size: 224
-    state_dim:384
+algorithm:
+  encoder_name: dinov2
+  dinov2_weights: /datahome/rschwinger/models/dinov2_vits14_pretrain.pth
+  dinov2_model_name: dinov2_vits14
+  dinov2_repo_dir: null
+  dinov2_image_size: 224
+  state_dim: 384
 
-  trainer:
-    total_frames: 40_000_000
-    seed: 42
-    accelerator: gpu
-    devices: [0]
-    num_envs: 16
-    log_every_n_steps: 10_000
-    eval_every_n_steps: 200_000
-    num_eval_episodes: 5
+trainer:
+  total_frames: 40_000_100
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  num_envs: 16
+  log_every_n_steps: 10_000
+  eval_every_n_steps: 200_000
+  num_eval_episodes: 5

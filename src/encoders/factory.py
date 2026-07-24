@@ -12,23 +12,23 @@ def make_encoder(
         vae_checkpoint_path: str | None = None,
         device: torch.device | None = None,
         seed: int | None = None,
-        #dino v2
-        dinov2_weigts_path: str | None = None,
-        dinov2_model_name: str = "dino_v2_vitb14",
+        # dinov2
+        dinov2_weights_path: str | None = None,
+        dinov2_model_name: str = "dinov2_vits14",
         dinov2_repo_dir: str | None = None,
         dinov2_image_size: int = 224,
-): 
+):
     if name == "random_projection":
         return RandomProjectionEncoder(obs_flat_dim, state_dim, seed)
     if name == "vae":
         if vae_checkpoint_path is None:
             raise ValueError("vae_checkpoint_path must be provided for VAE encoder")
         return VAEEncoder(vae_checkpoint_path, in_channels, state_dim, device)
-    if name == "dino_v2":
-        if dinov2_weigts_path is None:
+    if name == "dinov2":
+        if dinov2_weights_path is None:
             raise ValueError("dinov2_weights_path must be provided for DINOv2 encoder")
         return DINOv2Encoder(
-            weights_path=dinov2_weigts_path,
+            weights_path=dinov2_weights_path,
             model_name=dinov2_model_name,
             repo_dir=dinov2_repo_dir,
             image_size=dinov2_image_size,
