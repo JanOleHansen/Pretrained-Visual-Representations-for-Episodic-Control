@@ -124,6 +124,12 @@ class MFECAlgorithm(BaseAlgorithm):
             # values preserve more precision (fewer false-negatives) but make
             # keys longer.  1e5 gives five decimal places of float32 stability.
             key_scale: float = 1e5,
+            # dino v2
+            dino_v2_weights: str | None = None,
+            dino_v2_model_name: str = "dino_v2_vitb14",
+            dino_v2_repo_dir: str | None = None,
+            dino_v2_image_size: int = 224,
+
     ) -> None:
 
         super().__init__(device)
@@ -141,6 +147,11 @@ class MFECAlgorithm(BaseAlgorithm):
         self.frames_per_batch = frames_per_batch
         self.max_frames_per_traj = max_frames_per_traj
         self.key_scale = key_scale
+        #dinov2
+        self.dino_v2_weights = dino_v2_weights
+        self.dino_v2_model_name = dino_v2_model_name
+        self.dino_v2_repo_dir = dino_v2_repo_dir
+        self.dino_v2_image_size = dino_v2_image_size
 
         self._collected_frames = 0
 
@@ -170,6 +181,11 @@ class MFECAlgorithm(BaseAlgorithm):
             vae_checkpoint_path=self.vae_checkpoint,
             device=self._buffer_device,
             seed=self.seed,
+            #dinov2
+            dinov2_weigts_path=self.dino_v2_weights,
+            dinov2_model_name=self.dino_v2_model_name,
+            dinov2_repo_dir=self.dino_v2_repo_dir,
+            dinov2_image_size=self.dino_v2_image_size,
         )
 
         # Detect number of parallel envs from the proof env's batch_size.
