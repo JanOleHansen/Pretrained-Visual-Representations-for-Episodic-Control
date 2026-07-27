@@ -20,12 +20,16 @@ Key ideas
 
       Q^(N)(s_t, a_t) = Σ_{j=0}^{N-1} γ^j r_{t+j} + γ^N max_{a'} Q(s_{t+N}, a')
 
-  Bootstrap from the DND for t + N < T; full Monte Carlo otherwise.
+  Bootstrap from the DND for t + N < T; full Monte Carlo otherwise.  If the
+  episode ended by truncation (e.g. a StepCounter cutoff) rather than a true
+  terminal, the last N steps additionally bootstrap γ^(T−t) max_a Q(s_T, ·)
+  from the DND instead of assuming zero future reward.
 
 * **Dual DND updates**:
   (a) Online write after each episode: blend existing entries
       Q_i ← Q_i + α(Q^(N) − Q_i),  α = dnd_lr;
-      insert novel embeddings via a ring buffer (LRU eviction).
+      insert novel embeddings via a ring buffer (FIFO eviction of the
+      oldest entry; the paper specifies LRU — see deviations below).
   (b) Gradient descent on a regression loss (predicted Q̂ vs. N-step target)
       backpropagates through both the kernel-weighted combination and the CNN.
 
@@ -43,11 +47,13 @@ For each step:
 
 At episode end:
     Compute N-step returns Q^(N)_t for each t
+        (truncated episodes bootstrap the tail from Q(s_T, ·); true
+        terminals use the plain Monte Carlo tail)
     For each t:
         if h_t exact-matches a slot in DND[a_t]:
             DND[a_t][h_t] ← DND[a_t][h_t] + α(Q^(N)_t − DND[a_t][h_t])
         else:
-            insert (h_t, Q^(N)_t) into DND[a_t]  # ring-buffer with LRU eviction
+            insert (h_t, Q^(N)_t) into DND[a_t]  # ring-buffer, FIFO eviction
         append (s_t, a_t, Q^(N)_t) to D
 
     For each gradient step:
@@ -77,6 +83,12 @@ gradient-enabled Adam parameter conflicted with the ring-buffer's in-place
 overwrites (a newly-inserted entry inherits Adam's stale per-slot momentum
 from whatever it evicted) and drove values negative. This is the same
 deviation the reference repo makes, for a related reason.
+
+One further deviation from the paper: DND eviction is FIFO (ring-buffer
+insertion order), not LRU as §3.1 specifies — nothing updates recency on
+lookup. Since stored keys go stale as the CNN trains (they are never
+gradient-refreshed, see above), FIFO evicts the stalest keys first, which
+is a reasonable heuristic for this implementation.
 """
 
 from __future__ import annotations
@@ -421,12 +433,22 @@ class DND:
         Existing entries (exact hash match): blend with DND learning rate α.
         Novel entries: insert via ring buffer (evict oldest on overflow).
 
+        Rows are processed with sequential semantics, so duplicate keys
+        within one call behave like repeated writes in the paper: the first
+        occurrence of a novel key inserts; every later occurrence of the
+        same key — whether it is already stored or still pending in this
+        batch — blends with α.  (Without this, two identical embeddings in
+        one episode would consume two ring-buffer slots and register
+        conflicting entries in the exact-match dicts; a later ring-buffer
+        eviction of either slot would then delist the survivor's key,
+        breaking the slot↔key invariant.)
+
         Uses ``.data`` for all in-place tensor writes so the autograd graph
         for the gradient-step path remains intact.
 
         Returns
         -------
-        (n_hits, n_novel)
+        (n_hits, n_novel) — blended occurrences vs. distinct new entries
         """
         n = len(states)
         if n == 0:
@@ -438,35 +460,48 @@ class DND:
 
         self._init_keys(states.shape[1])
 
-        keys_b  = self._make_keys(states)
-        k_to_s  = self._key_to_slot[action]
+        keys_b = self._make_keys(states)
+        k_to_s = self._key_to_slot[action]
 
-        hit_indices:  list[int] = []
-        hit_slots:    list[int] = []
-        novel_indices: list[int] = []
+        vals   = values.tolist()
+        n_hits = 0
+        # Sequential semantics: first occurrence of a novel key inserts;
+        # every later occurrence of the same key (stored or pending) blends.
+        slot_updates: dict[int, float] = {}   # existing slot -> blended value
+        pending_pos:  dict[bytes, int] = {}   # pending novel key -> novel_rows index
+        novel_rows:   list[int]   = []
+        novel_vals:   list[float] = []
 
         for i, key in enumerate(keys_b):
             slot = k_to_s.get(key)
             if slot is not None:
-                hit_indices.append(i)
-                hit_slots.append(slot)
+                old = slot_updates.get(slot, float(self.values.data[action, slot]))
+                slot_updates[slot] = old + dnd_lr * (vals[i] - old)
+                n_hits += 1
+            elif key in pending_pos:
+                j = pending_pos[key]
+                novel_vals[j] = novel_vals[j] + dnd_lr * (vals[i] - novel_vals[j])
+                n_hits += 1
             else:
-                novel_indices.append(i)
+                pending_pos[key] = len(novel_rows)
+                novel_rows.append(i)
+                novel_vals.append(vals[i])
 
         # --- Blend existing entries (paper §2.3 tabular Q-learning update) --
-        if hit_indices:
-            hit_idx_t   = torch.tensor(hit_indices, dtype=torch.long, device=self.device)
-            hit_slots_t = torch.tensor(hit_slots,   dtype=torch.long, device=self.device)
-            old = self.values.data[action, hit_slots_t]
-            new = values[hit_idx_t].to(old.dtype)
-            self.values.data[action, hit_slots_t] = old + dnd_lr * (new - old)
+        if slot_updates:
+            slots_t = torch.tensor(list(slot_updates.keys()),
+                                   dtype=torch.long, device=self.device)
+            vals_t  = torch.tensor(list(slot_updates.values()),
+                                   dtype=self.values.dtype, device=self.device)
+            self.values.data[action, slots_t] = vals_t
 
         # --- Insert novel entries via ring buffer ---------------------------
-        if novel_indices:
-            nov_idx_t = torch.tensor(novel_indices, dtype=torch.long, device=self.device)
-            self._insert_novel(action, states[nov_idx_t], values[nov_idx_t])
+        if novel_rows:
+            nov_idx_t = torch.tensor(novel_rows, dtype=torch.long, device=self.device)
+            nov_val_t = torch.tensor(novel_vals, dtype=torch.float32, device=self.device)
+            self._insert_novel(action, states[nov_idx_t], nov_val_t)
 
-        return len(hit_indices), len(novel_indices)
+        return n_hits, len(novel_rows)
 
     def _insert_novel(
         self,
@@ -548,7 +583,15 @@ class DND:
         self.device       = d["device"]
         self._key_scale   = d.get("key_scale", 1e5)
         self._sizes       = list(d["_sizes"])
-        self._write_ptrs  = list(d["_write_ptrs"])
+        # __getstate__ rotates full ring buffers so that slot 0 holds the
+        # OLDEST entry; after restore the write pointer must therefore point
+        # at slot 0 (full buffer) or at the append position == size (buffer
+        # never wrapped; ptr == size is an invariant of _insert_novel).
+        # Restoring the raw saved pointer would evict entries in a rotated
+        # (wrong) order for a full capacity cycle.
+        self._write_ptrs  = [
+            0 if sz == self.capacity else sz for sz in self._sizes
+        ]
 
         dev = self.device
         self.values = torch.zeros(self.num_actions, self.capacity, device=dev)
@@ -655,6 +698,8 @@ def _compute_n_step_returns(
     gamma:   float,
     n_step:  int,
     dnd:     DND,
+    final_state: torch.Tensor | None = None,  # (1, d) embedding of s_T when the
+                                              # episode was TRUNCATED (not terminal)
 ) -> np.ndarray:
     """N-step discounted returns for a complete episode.
 
@@ -664,6 +709,13 @@ def _compute_n_step_returns(
     For steps T − n_step ≤ t < T (near end of episode) or when the DND is
     too sparse (Q = +inf): fall back to the full Monte Carlo return MC_t.
 
+    If ``final_state`` is given (the episode ended by TRUNCATION — e.g. a
+    StepCounter cutoff — rather than a true terminal), every step whose
+    N-step window crosses the cutoff additionally bootstraps
+    γ^(T−t) max_a Q(s_T, a) from the DND instead of assuming zero future
+    reward.  True terminals must pass ``final_state=None`` so no value is
+    bootstrapped past a real done.
+
     This reuses lfilter from MFEC so the computation pattern is the same.
     The DND query uses ``@torch.no_grad()`` — gradients are computed later
     from the replay buffer.
@@ -671,8 +723,19 @@ def _compute_n_step_returns(
     T  = len(rewards)
     mc = lfilter([1.0], [1.0, -gamma], rewards[::-1])[::-1].copy()
 
+    # Truncation bootstrap for the last min(T, n_step) steps.  Applied to the
+    # OUTPUT only — `mc` must stay a pure reward sum for the correction
+    # identity below to hold.
+    tail_boot = np.zeros(T, dtype=np.float64)
+    if final_state is not None:
+        with torch.no_grad():
+            q_T = dnd.estimate_all(final_state.to(dnd.device)).max().item()
+        if np.isfinite(q_T):
+            t_idx = np.arange(max(0, T - n_step), T)
+            tail_boot[t_idx] = (gamma ** (T - t_idx)) * q_T
+
     if T <= n_step:
-        return mc
+        return mc + tail_boot
 
     boot_states = states[n_step:].to(dnd.device)      # (T-n_step, d)
     with torch.no_grad():
@@ -686,7 +749,7 @@ def _compute_n_step_returns(
     n_step_G[:T - n_step] = np.where(
         valid, mc[:T - n_step] + correction, mc[:T - n_step]
     )
-    return n_step_G
+    return n_step_G + tail_boot
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +913,9 @@ class NECAlgorithm(BaseAlgorithm):
         - Raw observations are stored (not embeddings) so the carry can be
           re-embedded with the CURRENT network on each step() call.
         - N-step returns are computed per-episode via lfilter + DND bootstrap.
+        - Episodes ended by TRUNCATION (``done`` without ``terminated``, e.g.
+          a StepCounter cutoff) bootstrap their return tail from the DND at
+          the post-cutoff state; true terminals keep the Monte Carlo tail.
         """
         bs = batch.batch_size
         if len(bs) == 2:
@@ -869,10 +935,15 @@ class NECAlgorithm(BaseAlgorithm):
         obs_batch = batch[self.obs_key]
         obs_shape = tuple(obs_batch.shape[len(bs):])
         obs_2d    = obs_batch.reshape(E, T, *obs_shape)
+        # Next-state observations — only needed at episode-end positions, to
+        # bootstrap the return tail of TRUNCATED episodes.
+        next_obs_2d = batch["next", self.obs_key].reshape(E, T, *obs_shape)
 
         rewards_2d = (batch["next", "reward"].cpu().numpy()
                       .flatten().astype(np.float64).reshape(E, T))
         dones_2d   = (batch["next", "done"].cpu().numpy()
+                      .flatten().astype(bool).reshape(E, T))
+        term_2d    = (batch["next", "terminated"].cpu().numpy()
                       .flatten().astype(bool).reshape(E, T))
         actions_2d = batch["action"].to(dev).reshape(n).long().reshape(E, T)
 
@@ -897,6 +968,10 @@ class NECAlgorithm(BaseAlgorithm):
             actions_e = actions_2d[env_idx]                     # (T,) long
 
             carry = self._carry[env_idx]
+            # The carry never contains a done, so episode ends always lie in
+            # the CURRENT batch at index (end - carry_len) — used below to
+            # look up terminated/next-obs for the truncation bootstrap.
+            carry_len = 0 if carry is None else len(carry["dones"])
             if carry is not None:
                 obs_e     = torch.cat([carry["obs"], obs_e], dim=0)
                 rewards_e = np.concatenate([carry["rewards"], rewards_e])
@@ -927,7 +1002,21 @@ class NECAlgorithm(BaseAlgorithm):
             # Process each complete episode individually
             ep_start = 0
             for ep_end in ends:
-                ep_end = int(ep_end)
+                ep_end  = int(ep_end)
+                raw_end = ep_end - carry_len   # position within the current batch
+
+                h_final = None
+                if not term_2d[env_idx, raw_end]:
+                    # Truncated (StepCounter / collector cutoff), not a real
+                    # terminal: bootstrap the return tail from the state
+                    # after the cutoff instead of assuming zero future
+                    # reward.  True terminals keep h_final=None.
+                    nxt = (next_obs_2d[env_idx, raw_end]
+                           .reshape(1, *obs_shape).to(self.device).float())
+                    with torch.no_grad():
+                        h_final = nn.functional.normalize(
+                            self.embedding_net(nxt), dim=-1
+                        ).to(dev)
 
                 r_ep = rewards_e[ep_start: ep_end + 1]             # (L,) f64
                 h_ep = h_complete[ep_start: ep_end + 1]            # (L, d)
@@ -935,7 +1024,8 @@ class NECAlgorithm(BaseAlgorithm):
 
                 # N-step returns for this episode
                 nsr = _compute_n_step_returns(
-                    r_ep, h_ep, self.gamma, self.n_step, self.dnd
+                    r_ep, h_ep, self.gamma, self.n_step, self.dnd,
+                    final_state=h_final,
                 )  # (L,) f64
 
                 # Write N-step returns into the DND (blend/insert per action)
