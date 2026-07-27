@@ -1,0 +1,72 @@
+name: ALE/MsPacman-v5
+gym_backend: gymnasium
+
+# Paper-faithful Atari setup for MFEC (Blundell et al. 2016, §4.1).
+# See mspacman_train.yaml for the DQN-style stack; the three differences below
+# (sticky actions, reward clipping, frame stacking) are all load-bearing for
+# episodic control and are why that config plateaus around 1.5 k on Ms. Pac-Man.
+# frame_skip is deliberately unchanged at 4 — it was already correct.
+gym_kwargs:
+  # frame_skip MUST stay at 4 — §4.1: "actions are repeated 4 times", i.e. the
+  # agent interacts 15 times per second.  TorchRL does NOT apply this itself:
+  # GymEnv._build_env unconditionally does `kwargs["frameskip"] = self.frame_skip`
+  # and sets `wrapper_frame_skip = 1`, so the value is forwarded to ALE and
+  # *overrides* the ALE/*-v5 registry default.  Dropping this line therefore
+  # does not fall back to v5's frameskip=4 — it silently sets ALE frameskip to
+  # GymEnv's default of 1.  Verified: 4 emulator frames per decision.
+  frame_skip: 4
+  # Sticky actions OFF.  ALE/*-v5 defaults to repeat_action_probability=0.25
+  # and TorchRL does not touch it.  MFEC's Eq. (1) update is max-over-returns
+  # and never decreases, which the paper's own footnote 1 calls out as "not
+  # suited to rational action selection in stochastic environments" — it
+  # latches onto lucky returns.  Sticky actions also destroy the exact-match
+  # rate the method leans on (§4.1 measures ~50% exact state-action matches on
+  # Ms. Pac-Man).
+  repeat_action_probability: 0.0
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# NO SignTransform.  MFEC stores raw Monte-Carlo returns and acts by argmax
+#     over them, so clipping rewards to {-1, 0, +1} makes one dot (10 pts)
+#     worth the same as a ghost (200-1600) or fruit (100-5000): the entire
+#     scoring upside of Ms. Pac-Man becomes invisible to the policy.  The paper
+#     clips observations, never rewards.
+#
+# NO CatFrames.  §3 embeds a single 84x84 grayscale frame (their "28 KBytes
+#     per frame" is exactly 84*84*4 bytes, D = 7056).  A 4-stack quadruples D
+#     and folds three frames of history into the state, making exact
+#     re-encounters strictly rarer.
+#
+# EndOfLifeTransform is also dropped: MFEC's backward replay (Algorithm 1,
+# lines 9-11) is defined over whole episodes.  Note it was already inert in
+# mspacman_train.yaml: `_step` *reads* done_key (default "done") but writes the
+# life-loss signal only to `eol_key` ("end-of-life"), never back to "done" —
+# consuming it requires pointing a loss/return computation at "end-of-life",
+# which this pipeline does not do (MFEC reads batch["next", "done"]).
+# Measured on mspacman_train over 3,000 random steps: end-of-life fired 18x,
+# done fired 6x, i.e. episodes still ended only at game over.
+#
+# VecNorm is omitted for the usual MFEC reason: its running statistics make the
+# same raw frame embed differently at different timesteps, which drives
+# train/exact_hit_rate to 0.  See "VecNorm + MFEC incompatibility" in AGENTS.md.
+#
+# NOTE — reward scale: with SignTransform gone, train/episode_reward is the
+# true game score and is directly comparable to eval/return_mean and to the
+# paper's Figure 1.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.GrayScale
+  - _target_: torchrl.envs.Resize
+    w: 84
+    h: 84
+  - _target_: torchrl.envs.RewardSum
+  # 27,000 decisions x 4 emulator frames = the standard 108,000-frame (30 min)
+  # ALE episode cap.  The 4,500 used elsewhere would cut a competent agent off
+  # after 5 minutes of game time.
+  - _target_: torchrl.envs.StepCounter
+    max_steps: 27_000
+  - _target_: torchrl.envs.DoubleToFloat

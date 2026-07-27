@@ -66,13 +66,24 @@ function EstimateQ(s, a):
 function UpdateMemory(s, a, G):
     if s is in Q_EC[a]:
         Q_EC[a][s] ← max(Q_EC[a][s], G)       # keep best return seen
+        touch s                                # refresh recency (see below)
     else:
         if |Q_EC[a]| ≥ capacity:
-            evict oldest entry (ring buffer)
+            evict least-recently-updated entry
         insert (s, G) into Q_EC[a]
+
+Eviction policy
+---------------
+Blundell et al. (2016) §2: "we limit the size of the table by removing the
+least recently *updated* entry once a maximum size has been reached."  Note
+"updated", not "inserted" and not "read": an Eq. (1) max-update refreshes an
+entry's recency, a kNN read does not.  This matters a lot on Atari — a plain
+FIFO ring buffer evicts the oldest *insertions*, which are exactly the
+early-level states the agent re-visits on every single episode.
 """
 
 from __future__ import annotations
+from collections import OrderedDict
 from typing import Callable
 
 import numpy as np
@@ -408,6 +419,7 @@ class MFECAlgorithm(BaseAlgorithm):
 
             hit_rows: list[int] = []
             hit_slots: list[int] = []
+            hit_keys: list[bytes] = []
             novel_rows: list[int] = []
 
             for key, i in best_row.items():
@@ -415,6 +427,7 @@ class MFECAlgorithm(BaseAlgorithm):
                 if slot is not None:
                     hit_rows.append(i)
                     hit_slots.append(slot)
+                    hit_keys.append(key)
                 else:
                     novel_rows.append(i)
 
@@ -425,8 +438,12 @@ class MFECAlgorithm(BaseAlgorithm):
 
                 self.qec.values[a, slots_t] = torch.maximum(self.qec.values[a, slots_t], act_values[rows_t])
 
-            # --- Novel states → ring-buffer insertion ---------------------
-           
+                # Eq. (1) max-update counts as an update, so refresh recency —
+                # the paper evicts the least recently *updated* entry (§2).
+                self.qec.touch(a, hit_keys)
+
+            # --- Novel states → insert, evicting the LRU entry if full ----
+
             if novel_rows:
                 rows_t = torch.tensor(novel_rows, dtype=torch.long, device=dev)
                 self.qec.add_batch(a, act_states[rows_t], act_values[rows_t])
@@ -572,15 +589,19 @@ class QEC:
         states : (num_actions, capacity, state_dim)  float32
         values : (num_actions, capacity)             float64
 
-    A pair of Python dicts per action provides O(1) exact-match lookup,
+    One ``OrderedDict`` per action provides O(1) exact-match lookup,
     implementing the paper's Eq. (2) "case 1" without any distance computation:
 
         _key_to_slot[a] : bytes → int   (quantised embedding → slot index)
-        _slot_to_key[a] : int   → bytes (slot index → key, for O(1) eviction)
 
-    estimate_all() checks the dicts first and only falls back to kNN (cdist)
-    for novel queries.  add_batch() keeps the dicts consistent with the ring
-    buffer, evicting the stale key whenever a slot is overwritten.
+    The dict is kept in **least-recently-updated-first** order, so it doubles
+    as the LRU queue the paper's eviction rule needs (§2): ``popitem(last=False)``
+    yields the entry to discard, and ``move_to_end(key)`` refreshes an entry
+    whose value was just max-updated via Eq. (1).  Both are O(1).
+
+    estimate_all() checks the dict first and only falls back to kNN (cdist)
+    for novel queries; a *read* deliberately does not refresh recency, since
+    the paper evicts the least recently **updated** entry.
 
     Parameters
     ----------
@@ -614,15 +635,14 @@ class QEC:
         self.states: torch.Tensor | None = None   # (A, C, d) — lazy init
         self.values = torch.empty(num_actions, capacity, dtype=torch.float64, device=device)
 
-        # Per-action ring-buffer state.
-        self._sizes      = [0] * num_actions
-        self._write_ptrs = [0] * num_actions
+        # Per-action fill level.  Slots [0, _sizes[a]) are live.
+        self._sizes = [0] * num_actions
 
-        # Per-action exact-match hash maps.
-        # _key_to_slot: used for O(1) lookup in estimate_all() and step().
-        # _slot_to_key: used for O(1) eviction when a ring-buffer slot wraps.
-        self._key_to_slot: list[dict[bytes, int]] = [{} for _ in range(num_actions)]
-        self._slot_to_key: list[dict[int, bytes]] = [{} for _ in range(num_actions)]
+        # Per-action exact-match hash map, doubling as the LRU queue:
+        # iteration order is least-recently-updated first.
+        self._key_to_slot: list[OrderedDict[bytes, int]] = [
+            OrderedDict() for _ in range(num_actions)
+        ]
 
     # ------------------------------------------------------------------
     # Key generation
@@ -803,11 +823,16 @@ class QEC:
         states: torch.Tensor,   # (n, d) float32
         values: torch.Tensor,   # (n,) float64
     ) -> None:
-        """Insert novel (state, value) pairs via ring-buffer scatter.
+        """Insert (state, value) pairs, evicting the least-recently-updated
+        entry once the per-action buffer is full (Blundell et al. 2016 §2).
 
-        Also registers each new key in _key_to_slot / _slot_to_key and
-        evicts the stale key of any overwritten slot so the dicts stay
-        consistent with the GPU tensors.
+        While the buffer is still filling, slots are handed out sequentially.
+        Once ``_sizes[action] == capacity``, each insertion reclaims the slot
+        of the LRU entry via ``popitem(last=False)``.  Newly written keys go
+        to the most-recent end of ``_key_to_slot[action]``.
+
+        Duplicate keys are collapsed up front (keeping the larger value, per
+        Eq. 1) so one slot is never claimed twice in a single call.
         """
         n = len(states)
         if n == 0:
@@ -824,27 +849,70 @@ class QEC:
             values = values[-self.capacity:]
             n = self.capacity
 
-        ptr   = self._write_ptrs[action]
-        slots = torch.arange(ptr, ptr + n, device=self.device) % self.capacity
+        new_keys = self._make_keys(states)   # one GPU→CPU sync (n rows)
+
+        # --- Collapse duplicate keys within this batch, keeping max value ---
+        # step() already de-duplicates, so this is normally a no-op; it keeps
+        # add_batch() correct as a standalone API.
+        values_list = values.tolist()
+        best_row: dict[bytes, int] = {}
+        for i, key in enumerate(new_keys):
+            j = best_row.get(key)
+            if j is None or values_list[i] > values_list[j]:
+                best_row[key] = i
+        if len(best_row) != n:
+            keep = sorted(best_row.values())
+            keep_t = torch.tensor(keep, dtype=torch.long, device=self.device)
+            states   = states[keep_t]
+            values   = values[keep_t]
+            new_keys = [new_keys[i] for i in keep]
+            n = len(new_keys)
+
+        # --- Resolve a slot for every key (LRU eviction when full) ----------
+        k_to_s = self._key_to_slot[action]
+        slots_list:    list[int] = []
+        existing_rows: list[int] = []
+        for i, key in enumerate(new_keys):
+            slot = k_to_s.get(key)
+            if slot is not None:
+                # Already stored (step() filters these out; defensive path).
+                # Refresh recency and preserve Eq. (1)'s "never decrease".
+                k_to_s.move_to_end(key)
+                existing_rows.append(i)
+            elif self._sizes[action] < self.capacity:
+                slot = self._sizes[action]
+                self._sizes[action] += 1
+                k_to_s[key] = slot
+            else:
+                _, slot = k_to_s.popitem(last=False)   # least recently updated
+                k_to_s[key] = slot
+            slots_list.append(slot)
+
+        slots = torch.tensor(slots_list, dtype=torch.long, device=self.device)
+
+        if existing_rows:
+            rows = torch.tensor(existing_rows, dtype=torch.long, device=self.device)
+            values = values.clone()
+            values[rows] = torch.maximum(values[rows], self.values[action, slots[rows]])
+
         self.states[action, slots] = states
         self.values[action, slots] = values
 
-        # Dict maintenance: O(n) Python operations.
-        new_keys   = self._make_keys(states)   # one GPU→CPU sync (n rows)
-        slots_list = slots.tolist()
-        k_to_s     = self._key_to_slot[action]
-        s_to_k     = self._slot_to_key[action]
-        for slot, key in zip(slots_list, new_keys):
-            # Evict the previous occupant of this slot (ring-buffer overwrite).
-            old_key = s_to_k.get(slot)
-            if old_key is not None:
-                k_to_s.pop(old_key, None)
-            # Register the new entry.
-            k_to_s[key]  = slot
-            s_to_k[slot] = key
+    # ------------------------------------------------------------------
+    # LRU bookkeeping
+    # ------------------------------------------------------------------
 
-        self._write_ptrs[action] = int((ptr + n) % self.capacity)
-        self._sizes[action]      = min(self._sizes[action] + n, self.capacity)
+    def touch(self, action: int, keys: list[bytes]) -> None:
+        """Mark ``keys`` as most-recently-updated for ``action``.
+
+        Called by ``MFECAlgorithm.step()`` after an Eq. (1) max-update on an
+        exact match, so those entries move to the back of the eviction queue.
+        Keys that are no longer present are ignored.
+        """
+        k_to_s = self._key_to_slot[action]
+        for key in keys:
+            if key in k_to_s:
+                k_to_s.move_to_end(key)
 
     # ------------------------------------------------------------------
     # Serialisation
@@ -858,31 +926,30 @@ class QEC:
             "device":        self.device,
             "key_scale":     self._key_scale,
             "_sizes":        list(self._sizes),
-            "_write_ptrs":   list(self._write_ptrs),
             "action_states": None,
             "action_values": None,
         }
         if self.states is None:
             return d
 
-        action_states, action_values = [], []
+        action_states, action_values, sizes = [], [], []
         for a in range(self.num_actions):
-            sz  = self._sizes[a]
-            ptr = self._write_ptrs[a]
-            if sz == 0:
+            slots = list(self._key_to_slot[a].values())
+            if not slots:
                 action_states.append(None)
                 action_values.append(np.array([], dtype=np.float64))
+                sizes.append(0)
                 continue
-            # Rotate so index 0 = oldest entry (write-order on load).
-            if sz == self.capacity and ptr != 0:
-                s = torch.roll(self.states[a], -ptr, dims=0)[:sz]
-                v = torch.roll(self.values[a], -ptr, dims=0)[:sz]
-            else:
-                s = self.states[a, :sz]
-                v = self.values[a, :sz]
-            action_states.append(s.cpu().numpy())
-            action_values.append(v.cpu().numpy())
+            # Emit in LRU order (least-recently-updated first) so __setstate__
+            # can rebuild the OrderedDict with the same eviction priority.
+            order = torch.tensor(slots, dtype=torch.long, device=self.device)
+            action_states.append(self.states[a, order].cpu().numpy())
+            action_values.append(self.values[a, order].cpu().numpy())
+            sizes.append(len(slots))
 
+        # Sizes are re-derived from the dicts: the saved arrays are compacted
+        # to LRU order, so slot i on reload is the i-th least-recent entry.
+        d["_sizes"]        = sizes
         d["action_states"] = action_states
         d["action_values"] = action_values
         return d
@@ -894,14 +961,15 @@ class QEC:
         self.device      = d["device"]
         self._key_scale  = d.get("key_scale", 1e5)   # default for old checkpoints
         self._sizes      = list(d["_sizes"])
-        self._write_ptrs = [sz % self.capacity for sz in self._sizes]
+        # Pre-LRU checkpoints carry a "_write_ptrs" key; it is ignored — those
+        # arrays were saved rotated into write order, which seeds the LRU queue
+        # with the old FIFO ordering.  Nothing else about them changes.
 
         dev = self.device
         self.values = torch.empty(self.num_actions, self.capacity, dtype=torch.float64, device=dev)
 
-        # Initialise empty dicts — rebuilt from tensors below.
-        self._key_to_slot = [{} for _ in range(self.num_actions)]
-        self._slot_to_key = [{} for _ in range(self.num_actions)]
+        # Rebuilt from the restored tensors below, in saved (LRU) order.
+        self._key_to_slot = [OrderedDict() for _ in range(self.num_actions)]
 
         if d["action_states"] is None:
             self.states = None
@@ -925,14 +993,14 @@ class QEC:
                 self.states[a, :sz] = torch.from_numpy(s_np).to(dev)
                 self.values[a, :sz] = torch.from_numpy(v_np).to(dev)
 
-        # Rebuild dicts from the restored tensors (no need to pickle the dicts).
+        # Rebuild the dicts from the restored tensors (no need to pickle them).
+        # Slots were written in saved order, which is LRU order, so inserting
+        # by ascending slot index restores the eviction queue exactly.
         for a in range(self.num_actions):
             sz = self._sizes[a]
             if sz == 0:
                 continue
             keys_a = self._make_keys(self.states[a, :sz])
             k_to_s = self._key_to_slot[a]
-            s_to_k = self._slot_to_key[a]
             for slot, key in enumerate(keys_a):
-                k_to_s[key]  = slot
-                s_to_k[slot] = key
+                k_to_s[key] = slot

@@ -1,19 +1,33 @@
 # @package _global_
-# MFEC on ALE/MsPacman-v5 — same hyperparameters as the Pong run.
-# Ms. Pac-Man has 9 actions, so the mfec_atari defaults (buffer_size=1M,
-# k=11, state_dim=64, gamma=0.99) apply without change.
+# MFEC on ALE/MsPacman-v5, set up to be directly comparable to Blundell et al.
+# (2016) Figure 1.  Uses the paper-faithful env pair (single frame, no reward
+# clipping, no sticky actions) rather than the DQN-style mspacman_train/eval
+# configs.
 defaults:
   - override /algorithm: mfec_atari
-  - override /environment: mspacman_train
-  - override /environment@eval_environment: mspacman_eval
+  - override /environment: mspacman_mfec_train
+  - override /environment@eval_environment: mspacman_mfec_eval
   - _self_
 
 trainer:
-  total_frames: 40_000_100
+  # UNITS: total_frames counts agent *decisions* (StepTrainer does
+  # `self._step += batch.numel()`), while the paper's x-axis counts ALE
+  # emulator frames at 4 per decision ("An hour of game play corresponds to
+  # approximately 200,000 frames", §4.1).  So:
+  #
+  #     paper frames = 4 x (this axis)
+  #
+  # 12.5M decisions = 50M emulator frames = the full x-range of Figure 1.
+  total_frames: 12_500_000
   seed: 42
   accelerator: gpu
   devices: [0]
-  num_envs: 16
+  # The paper runs a single sequential stream (Algorithm 1).  Every env in a
+  # ParallelEnv acts on a QEC that is only updated at episode end, so a large
+  # num_envs buys throughput at the cost of the one-shot latching that is the
+  # whole point of episodic control.  4 is the compromise; raise it if
+  # wall-clock hurts more than sample efficiency.
+  num_envs: 4
   log_every_n_steps: 10_000
-  eval_every_n_steps: 200_000   # paper §4: "evaluate MFEC and NEC every 200,000 frames"
+  eval_every_n_steps: 200_000   # 200k decisions = 800k emulator frames
   num_eval_episodes: 5

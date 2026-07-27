@@ -295,7 +295,7 @@ configs/
     │   ├── pong.yaml       <- MFEC on Pong (40M frames)
     │   ├── breakout.yaml   <- MFEC on Breakout (1M frames)
     │   ├── qbert.yaml      <- MFEC on Q*Bert (40M frames)
-    │   ├── mspacman.yaml   <- MFEC on Ms. Pac-Man (40M frames)
+    │   ├── mspacman.yaml   <- MFEC on Ms. Pac-Man (paper-faithful; 12.5M decisions = 50M frames)
     │   └── mspacman_vae.yaml <- same, with the paper-exact VAE encoder
     └── nec/
         └── pong.yaml       <- NEC on Pong (40M frames)
@@ -337,6 +337,38 @@ Built-in callbacks: `ProgressCallback` (tqdm bar), `CheckpointCallback`,
 `EvalCallback` (periodic greedy-policy eval via `eval_environment`, opt-in
 with `trainer.eval_every_n_steps`; merges `eval/*` into the same `metrics`
 dict the loggers see), `WandBLogger`, `TensorBoardLogger`.
+
+## Reproducing MFEC on Atari
+
+`experiment=mfec/mspacman` is set up to be read directly against Figure 1 of
+Blundell et al. (2016). Getting a comparable curve depends on four things that
+a DQN-style Atari config gets wrong for episodic control:
+
+| Setting | DQN-style default | MFEC needs | Why |
+|---|---|---|---|
+| `repeat_action_probability` | `0.25` (the `ALE/*-v5` default) | `0.0` | Eq. (1) is max-over-returns and never decreases; footnote 1 calls it "not suited to rational action selection in stochastic environments". Sticky actions also collapse `train/exact_hit_rate`, which §4.1 measures at ~50% on Ms. Pac-Man. |
+| `SignTransform` | present | **absent** | MFEC stores raw Monte-Carlo returns. Clipping to `{-1,0,+1}` makes a dot (10 pts) worth as much as a ghost (200–1600) or fruit (100–5000), so the policy has no reason to ever use a power pill. |
+| `gamma` | `0.99` | `1.0` | §4.1: "The discount rate was set to γ = 1." The 0.99 in §4.2 is the *Labyrinth* setting. |
+| `eps_end` | `0.05` | `0.005` | §4.1: "We found that higher exploration rates were not as beneficial, as more exploration makes exploiting what is known harder." |
+
+Plus: the observation is a **single** 84×84 frame (§3, D = 7056), not a
+4-frame stack, and eviction is **LRU** (least recently *updated*), not FIFO.
+
+**Units.** `trainer.total_frames` counts agent *decisions*, but the paper's
+x-axis counts ALE emulator frames at 4 per decision (§4.1: "An hour of game
+play corresponds to approximately 200,000 frames"). So **paper frames = 4 ×
+the logged step count**, and `total_frames: 12_500_000` covers Figure 1's full
+50M-frame range.
+
+`frame_skip` is a trap worth knowing about: `GymEnv._build_env` forwards it to
+ALE as `frameskip` and *overrides* the `ALE/*-v5` registry default, so omitting
+it yields 1 emulator frame per decision rather than falling back to v5's 4.
+Keep `frame_skip: 4` in every Atari config.
+
+The remaining Atari MFEC experiments (`pong`, `breakout`, `qbert`) still use
+the DQN-style env configs and have **not** been given the same treatment; they
+pick up the corrected `gamma`/`eps` defaults from `mfec_atari.yaml` but still
+clip rewards, stack 4 frames and run with sticky actions.
 
 ## MFEC encoders
 

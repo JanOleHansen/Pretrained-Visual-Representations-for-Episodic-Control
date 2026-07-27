@@ -203,21 +203,102 @@ def test_qec_add_batch_dict_consistency():
     # Insert the state for action 0.
     qec.add_batch(0, state, value)
 
-    # The key must now be registered.
+    # The key must now be registered, pointing at a live slot.
     keys = qec._make_keys(state)
     assert keys[0] in qec._key_to_slot[0], (
         "Key not registered in _key_to_slot after add_batch"
     )
     slot = qec._key_to_slot[0][keys[0]]
-    assert slot in qec._slot_to_key[0], (
-        "Slot not registered in _slot_to_key after add_batch"
+    assert 0 <= slot < qec._sizes[0], (
+        f"Slot {slot} is outside the live range [0, {qec._sizes[0]}) after add_batch"
     )
-    assert qec._slot_to_key[0][slot] == keys[0], (
-        "_slot_to_key does not round-trip to the same key"
+    assert qec.values[0, slot].item() == pytest.approx(5.0), (
+        "Value tensor does not hold the inserted value at the registered slot"
     )
 
     # Present the same state again — must be an exact match (not novel).
     same_key = qec._make_keys(state)[0]
     assert same_key in qec._key_to_slot[0], (
         "Same state not found in dict on second lookup — dict is not consistent"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 4 — eviction is LRU (least recently *updated*), not FIFO
+# ---------------------------------------------------------------------------
+
+def test_qec_eviction_is_least_recently_updated():
+    """Blundell et al. (2016) §2: eviction removes the least recently *updated*
+    entry, not the least recently inserted one.
+
+    A plain FIFO ring buffer would discard the oldest insertion, which on Atari
+    is exactly the early-level state the agent re-visits on every episode.
+    Here: fill the buffer, re-update the oldest entry, then overflow — the
+    touched entry must survive and the next-oldest must be the one dropped.
+    """
+    dev = torch.device("cpu")
+    qec = QEC(num_actions=1, capacity=3, k=1, device=dev, key_scale=1e5)
+
+    states = torch.tensor(
+        [[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]], dtype=torch.float32
+    )
+    qec.add_batch(0, states, torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64))
+    assert qec._sizes[0] == 3
+
+    keys = qec._make_keys(states)
+
+    # Touch the oldest entry (states[0]) — simulates an Eq. (1) max-update.
+    qec.touch(0, [keys[0]])
+
+    # Insert a fourth state: the buffer is full, so one entry must be evicted.
+    new_state = torch.tensor([[4.0, 0.0]], dtype=torch.float32)
+    qec.add_batch(0, new_state, torch.tensor([4.0], dtype=torch.float64))
+
+    k_to_s = qec._key_to_slot[0]
+    assert keys[0] in k_to_s, (
+        "The touched (most recently updated) entry was evicted — eviction is "
+        "still FIFO rather than LRU."
+    )
+    assert keys[1] not in k_to_s, (
+        "Expected the least recently updated entry (states[1]) to be evicted, "
+        f"but it is still present. Dict holds {len(k_to_s)} entries."
+    )
+    assert qec._make_keys(new_state)[0] in k_to_s, "New entry was not registered"
+    assert len(k_to_s) == 3, f"Buffer overflowed capacity: {len(k_to_s)} entries"
+
+    # The evicted entry's slot must have been reused, not leaked.
+    assert qec._sizes[0] == 3
+
+
+# ---------------------------------------------------------------------------
+# Test 5 — keys are invariant to batch shape
+# ---------------------------------------------------------------------------
+
+def test_embed_key_invariant_to_batch_shape():
+    """The same observation must hash to the same key whether it is embedded
+    alone or as part of a larger batch.
+
+    Training embeds ``num_envs`` rows at a time; ``BaseTrainer.evaluate`` builds
+    a single env and therefore embeds 1 row.  A float32 matmul picks a different
+    reduction order for those two shapes, and at key_scale=1e5 the resulting
+    ~1e-6 error is the same order as the quantisation step — which would make
+    evaluation silently miss every exact match.  RandomProjectionEncoder
+    accumulates in float64 to keep the key shape-invariant.
+    """
+    obs_dim, state_dim = 7056, 64        # paper's single 84x84 frame
+    encoder = RandomProjectionEncoder(obs_dim, state_dim, seed=0)
+    qec     = QEC(1, 100, 1, torch.device("cpu"), key_scale=1e5)
+    policy  = QECPolicy(qec, encoder, 1)
+
+    torch.manual_seed(0)
+    batch = torch.rand(16, obs_dim)      # pixel-like values in [0, 1]
+
+    keys_batched = qec._make_keys(policy.embed(batch))
+    keys_single  = [qec._make_keys(policy.embed(batch[i : i + 1]))[0] for i in range(16)]
+
+    mismatches = [i for i in range(16) if keys_batched[i] != keys_single[i]]
+    assert not mismatches, (
+        f"{len(mismatches)}/16 observations hashed differently at batch size 1 "
+        f"vs batch size 16 (rows {mismatches[:5]}). Exact-match lookups would "
+        "fail during evaluation."
     )

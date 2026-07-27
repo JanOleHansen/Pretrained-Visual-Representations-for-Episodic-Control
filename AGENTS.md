@@ -322,7 +322,8 @@ src/
     dqn.py                  — DQNAlgorithm; replay/network factories (defaults + setup contract)
     ddpg.py                 — DDPGAlgorithm; actor/critic/replay/noise factories
     a2c.py                  — A2CAlgorithm; on-policy actor/critic with GAE + A2CLoss
-    mfec.py                 — MFECAlgorithm; QEC memory, QECPolicy (pluggable encoder), MC returns
+    mfec.py                 — MFECAlgorithm; QEC memory (LRU eviction), QECPolicy (pluggable
+                              encoder), MC returns
     nec.py                  — NECAlgorithm; DND class, DNDPolicy, N-step returns, dual updates
   encoders/                 — pluggable MFEC state embeddings (see "Encoders (MFEC)" below)
     base.py                 — Encoder contract: embed() / state() / load_state()
@@ -346,8 +347,10 @@ configs/
   algorithm/dqn_atari.yaml  — DQN HPs (Atari/NatureDQN defaults; pixel obs)
   algorithm/ddpg.yaml       — DDPG HPs (HalfCheetah defaults); _partial_ actor/critic/noise
   algorithm/a2c.yaml        — A2C HPs (HalfCheetah/MuJoCo defaults); _partial_ actor/value
-  algorithm/mfec_atari.yaml — MFEC HPs (Atari defaults: buffer_size=1M, k=11, state_dim=64;
-                              encoder_name=random_projection, vae_checkpoint=null, seed=null)
+  algorithm/mfec_atari.yaml — MFEC HPs (Blundell et al. 2016 §4.1 Atari defaults: buffer_size=1M,
+                              k=11, state_dim=64, gamma=1.0, constant eps=0.005;
+                              encoder_name=random_projection, vae_checkpoint=null, seed=null).
+                              NOTE §4.2's Labyrinth settings differ (k=50, gamma=0.99)
   algorithm/nec.yaml        — NEC HPs (base defaults); _partial_ embedding_network + replay_buffer
   algorithm/nec_atari.yaml  — NEC HPs (Atari defaults per Pritzel et al. 2017 Table S1)
   environment/cartpole.yaml — env kwargs (name, transforms)
@@ -362,6 +365,9 @@ configs/
   environment/mspacman_eval.yaml  — ALE/MsPacman-v5 (eval transforms)
   environment/mspacman_train_singleframe.yaml — same, minus CatFrames (paper-exact VAE encoder input)
   environment/mspacman_eval_singleframe.yaml  — eval counterpart, no CatFrames
+  environment/mspacman_mfec_train.yaml — ALE/MsPacman-v5, paper-faithful MFEC stack: single frame,
+                              no SignTransform, repeat_action_probability=0.0 (see "MFEC on Atari" below)
+  environment/mspacman_mfec_eval.yaml  — eval counterpart (identical by design; nothing to strip)
   environment/halfcheetah.yaml — HalfCheetah-v4 (DoubleToFloat + InitTracker)
   experiment/dqn/cartpole.yaml — composed CartPole experiment
   experiment/dqn/pong.yaml     — composed Atari Pong experiment
@@ -370,7 +376,8 @@ configs/
   experiment/mfec/pong.yaml    — MFEC on Pong (40M frames, num_envs=16)
   experiment/mfec/breakout.yaml — MFEC on Breakout (1M frames)
   experiment/mfec/qbert.yaml   — MFEC on Q*Bert (40M frames, num_envs=16)
-  experiment/mfec/mspacman.yaml — MFEC on Ms. Pac-Man (40M frames, num_envs=16)
+  experiment/mfec/mspacman.yaml — MFEC on Ms. Pac-Man, paper-comparable (12.5M decisions =
+                              50M emulator frames = Figure 1's full x-range; num_envs=4)
   experiment/mfec/mspacman_vae.yaml — same, with encoder_name=vae + singleframe env
                               (vae_checkpoint is required, no default — see "Encoders" above)
   experiment/nec/pong.yaml     — NEC on Pong (40M frames, num_envs=16)
@@ -419,21 +426,91 @@ Concretely:
 | `qbert_train.yaml` | ✗ | MFEC Q*Bert |
 | `mspacman_train.yaml` | ✗ | MFEC Ms. Pac-Man |
 | `mspacman_train_singleframe.yaml` | ✗ | MFEC Ms. Pac-Man + VAE encoder (paper-exact) |
+| `mspacman_mfec_train.yaml` | ✗ | MFEC Ms. Pac-Man (paper-faithful; see "MFEC on Atari" below) |
 
 The fixed random projection already compresses 28 k-pixel observations
 adequately without online whitening.
 
 ## Reward scale for Atari MFEC runs
 
-All MFEC training configs include `SignTransform` (reward clipped to
+Most MFEC training configs include `SignTransform` (reward clipped to
 `{-1, 0, +1}`), so `train/episode_reward` (from `RewardSum`) counts clipped
 reward events — **not** the true game score. For example, "57" on Q*Bert means
-~57 positive reward events, not a score of 57 points. Always compare against
-the paper using `eval/return_mean`, which is computed from the `*_eval.yaml`
-environment that drops `SignTransform`. Set `trainer.eval_every_n_steps` to
-get `eval/return_mean` logged periodically during training instead of
-running `src/eval.py` separately after the fact — see "Periodic in-training
+~57 positive reward events, not a score of 57 points. Compare against the paper
+using `eval/return_mean`, which is computed from the `*_eval.yaml` environment
+that drops `SignTransform`. Set `trainer.eval_every_n_steps` to get
+`eval/return_mean` logged periodically during training instead of running
+`src/eval.py` separately after the fact — see "Periodic in-training
 evaluation" above.
+
+The exception is the `mspacman_mfec_*` pair, which has no `SignTransform` at
+all (see below): there `train/episode_reward` and `eval/return_mean` measure
+the same thing, so a gap between them is a real train/eval discrepancy rather
+than a units mismatch.
+
+## MFEC on Atari — what a DQN-style env config gets wrong
+
+Reusing a DQN Atari transform stack for MFEC quietly breaks the algorithm.
+`mspacman_mfec_train.yaml` / `mspacman_mfec_eval.yaml` are the corrected
+reference pair; `pong`, `breakout` and `qbert` have **not** been migrated yet.
+
+| Setting | DQN-style default | MFEC needs | Why |
+|---|---|---|---|
+| `repeat_action_probability` | `0.25` (`ALE/*-v5` default; TorchRL does not touch it) | `0.0` | Eq. (1) is max-over-returns and never decreases — footnote 1: "not suited to rational action selection in stochastic environments". Sticky actions also collapse `train/exact_hit_rate`, which §4.1 measures at ~50% on Ms. Pac-Man. |
+| `SignTransform` | present | **absent** | MFEC stores raw Monte-Carlo returns, so clipping makes a dot (10 pts) worth as much as a ghost (200–1600) or fruit (100–5000). |
+| `CatFrames` | `N=4` | **absent** | §3 embeds a single 84×84 frame (D = 7056; their "28 KBytes per frame" is exactly 84·84·4 bytes). A stack folds history into the state and makes exact re-encounters rarer. |
+| `gamma` | `0.99` | `1.0` | §4.1: "The discount rate was set to γ = 1." The 0.99 in §4.2 is the *Labyrinth* setting. |
+| `eps_end` | `0.05` | `0.005` | §4.1: "higher exploration rates were not as beneficial". |
+
+`EndOfLifeTransform` is dropped too — MFEC's backward replay (Algorithm 1,
+lines 9–11) is defined over whole episodes. Note it was already **inert** in
+the DQN-style configs: `_step` *reads* `done_key` (which defaults to `"done"`)
+but writes the life-loss signal only to `eol_key` (`"end-of-life"`), never back
+to `"done"`. Consuming it means pointing a loss or return computation at
+`"end-of-life"`, which nothing here does — MFEC reads `batch["next", "done"]`.
+Measured on `mspacman_train` over 3,000 random steps: `end-of-life` fired 18×
+while `done` fired 6×, i.e. episodes still ended only at game over. So adding
+the transform without also rewiring the consumer buys nothing.
+
+### `frame_skip` is not what it looks like
+
+`GymEnv._build_env` unconditionally does `kwargs["frameskip"] = self.frame_skip`
+and sets `wrapper_frame_skip = 1`, so `frame_skip` is **forwarded to ALE** and
+*overrides* the `ALE/*-v5` registry default rather than stacking a second
+action repeat on top of it. Consequences:
+
+- `frame_skip: 4` gives 4 emulator frames per decision — correct, per §4.1.
+- **Omitting** `frame_skip` does not fall back to v5's `frameskip=4`; it sets
+  ALE's frameskip to `GymEnv`'s default of `1`. Always set it explicitly.
+
+### Frame units when comparing to the paper
+
+`trainer.total_frames` and the logged step count are agent **decisions**
+(`StepTrainer` does `self._step += batch.numel()`). The paper's x-axis is ALE
+emulator frames at 4 per decision (§4.1: "An hour of game play corresponds to
+approximately 200,000 frames"). So **paper frames = 4 × logged step**, and
+`total_frames: 12_500_000` covers Figure 1's full 50M-frame range.
+
+### QEC eviction is LRU, not FIFO
+
+§2: "we limit the size of the table by removing the least recently *updated*
+entry". `QEC._key_to_slot[a]` is an `OrderedDict` kept in
+least-recently-updated-first order, so it doubles as the LRU queue:
+`popitem(last=False)` picks the victim and `QEC.touch()` refreshes an entry
+after an Eq. (1) max-update. A kNN **read** deliberately does not refresh
+recency. A FIFO ring buffer would evict the oldest *insertions*, which on
+Atari are exactly the early-level states re-visited every episode.
+
+### Exact-match keys must be invariant to batch shape
+
+`RandomProjectionEncoder.embed` accumulates the projection in **float64**.
+Training embeds `num_envs` rows per call while `BaseTrainer.evaluate` builds a
+single env and embeds 1 row; BLAS picks a different reduction order for those
+shapes, and in float32 the resulting ~1e-6 error is the same order as the
+1e-5 quantisation step at the default `key_scale`. Measured on CPU: 15 of 16
+observations hashed differently at batch 1 vs batch 16 in float32, and 0 of 16
+in float64. Without this, evaluation silently never takes the exact-match
+path. Guarded by `tests/test_mfec_qec_dict.py::test_embed_key_invariant_to_batch_shape`.
 
 ## Encoders (MFEC)
 

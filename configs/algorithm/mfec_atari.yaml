@@ -1,16 +1,30 @@
 _target_: src.algorithms.mfec.MFECAlgorithm
 
+# Atari defaults from Blundell et al. (2016) §4.1.  The Labyrinth settings in
+# §4.2 differ (k=50, gamma=0.99) — do not mix them up.
 encoder_name: random_projection   # "random_projection" | "vae"
 vae_checkpoint: null              # required when encoder_name=vae
 seed: null                        # encoder init seed; null = nondeterministic
 obs_key: pixels
-buffer_size: 1_000_000
-k: 11
-state_dim: 64
-gamma: 0.99
-eps_start: 1.0
-eps_end: 0.05
-annealing_frames: 20_000
-frames_per_batch: 1_000
+buffer_size: 1_000_000            # §4.1: "limited to one million entries" per action
+k: 11                             # §4.1: "The k-nearest-neighbour lookups used k = 11"
+state_dim: 64                     # §4: "64 random-projections of the pixel observations"
+
+# §4.1: "The discount rate was set to gamma = 1."  Atari rewards are sparse and
+# episodes are long; with frame-skip 4 a gamma of 0.99 gives a ~100-decision
+# (~27 s) horizon, which hides every long-range strategy from the QEC values.
+gamma: 1.0
+
+# §4.1: "Exploration is achieved by using an eps-greedy policy with eps = 0.005.
+# We found that higher exploration rates were not as beneficial, as more
+# exploration makes exploiting what is known harder."  Constant, not annealed —
+# eps_start == eps_end makes the anneal a no-op.
+eps_start: 0.005
+eps_end: 0.005
+annealing_frames: 1
+
+# Divisible by every num_envs we use (1/2/4/8/16) so the collector does not
+# silently round frames_per_batch up to a multiple of the env count.
+frames_per_batch: 1_024
 max_frames_per_traj: -1
 key_scale: 100000
