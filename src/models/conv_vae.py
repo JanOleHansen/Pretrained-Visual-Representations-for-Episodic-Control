@@ -92,9 +92,8 @@ class ConvVAE(nn.Module):
         parameters ... were used as dimensions for computing Euclidean
         distances in the episodic controller." Deterministic — no sampling.
         """
-        x = obs.float()
-        if x.max() > 1.0:            # normalize uint8 [0,255] -> [0,1]
-            x = x / 255.0
+        x = obs.float() / 255.0 if obs.dtype == torch.uint8 else obs.float()
+        
         mu, logstd = self.encode(x)
         return torch.cat([mu, logstd], dim=-1)
 
@@ -120,9 +119,8 @@ def vae_loss(
     logstd: torch.Tensor,
     beta: float = 1.0,
 ):
-    x = x.float()
-    if x.max() > 1.0:
-        x = x / 255.0
+    x = x.float() / 255.0 if x.dtype == torch.uint8 else x.float()
+    
     recon_loss = gaussian_nll(x, recon_mu, recon_logstd)
     kl = kl_diag_gaussian(mu, logstd)
     return recon_loss + beta * kl, recon_loss, kl

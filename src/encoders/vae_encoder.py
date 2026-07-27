@@ -25,10 +25,9 @@ class VAEEncoder(Encoder):
 
     @torch.no_grad()
     def embed(self, obs: torch.Tensor) -> torch.Tensor:
-        if next(self.vae.parameters()).device != obs.device:
-            self.vae.to(obs.device)
-        x = obs.reshape(-1, *obs.shape[-3:])
-        return self.vae.embed(x)
+        dev = next(self.vae.parameters()).device
+        x = obs.reshape(-1, *obs.shape[-3:]).to(dev)
+        return self.vae.embed(x).to(obs.device)
 
     def state(self) -> dict:
         return {"vae_state_dict": self.vae.state_dict()}

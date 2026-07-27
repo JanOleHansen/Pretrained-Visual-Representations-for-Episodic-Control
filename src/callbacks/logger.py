@@ -64,7 +64,16 @@ class WandBLogger:
 
 
 class TensorBoardLogger:
-    """Logs training metrics to TensorBoard.
+    """Logs training metrics, the full config, and hyperparameters to TensorBoard.
+
+    Three surfaces:
+      * SCALARS  -- per-step metrics from ``on_step_end``.
+      * TEXT     -- the complete resolved config as YAML, written once at start
+                    under the ``config`` tag. Nothing is filtered out here.
+      * HPARAMS  -- a flattened, scalar-only view of the config plus the final
+                    metric values, written once at the end so the table can be
+                    sorted by result. Point TensorBoard at the parent directory
+                    (``logs/train/runs``) to compare runs in one table.
 
     Args:
         log_dir: directory where TensorBoard event files are written
@@ -73,6 +82,9 @@ class TensorBoardLogger:
     def __init__(self, log_dir: str) -> None:
         self.log_dir = log_dir
         self._writer = None
+        self._config_dict: dict | None = None
+        self._last_metrics: dict[str, float] = {}
+        self._last_step: int = 0
 
     def on_train_start(self, state: dict[str, Any]) -> None:
         from torch.utils.tensorboard import SummaryWriter
@@ -87,17 +99,20 @@ class TensorBoardLogger:
             log_dir=self.log_dir,
             purge_step=resume_step or None,
         )
+        self._last_step = resume_step
 
         cfg = state.get("cfg")
         if cfg is None:
             return
-        config_dict = OmegaConf.to_container(cfg, resolve=True)
 
-        hparams = _flatten(config_dict)          # -> {"trainer.total_frames": 500000, ...}
-        # run_name="." keeps torch's internal hparams SummaryWriter in *this* log_dir.
-        # The default (str(time.time())) opens a second writer in a nested subdir with
-        # its own event file, which TensorBoard lists as a duplicate run.
-        self._writer.add_hparams(hparams, {}, run_name=".")
+        # TEXT tab: the entire config, verbatim. Written at start so it survives
+        # a crashed run. resolve=True expands ${...} interpolations to real values.
+        self._config_dict = OmegaConf.to_container(cfg, resolve=True)
+        self._writer.add_text(
+            "config",
+            _as_markdown_code(OmegaConf.to_yaml(cfg, resolve=True)),
+            global_step=resume_step,
+        )
 
     def on_step_end(self, metrics: dict[str, float], step: int) -> None:
         if self._writer is None:
@@ -105,12 +120,58 @@ class TensorBoardLogger:
         for key, value in metrics.items():
             if isinstance(value, (int, float)):
                 self._writer.add_scalar(key, value, global_step=step)
+                self._last_metrics[key] = float(value)
+        self._last_step = step
 
     def on_train_end(self, state: dict[str, Any]) -> None:
-        if self._writer is not None:
-            self._writer.flush()
-            self._writer.close()
-            self._writer = None
+        if self._writer is None:
+            return
+
+        # HPARAMS tab: written last so the table carries the run's final metrics
+        # and can be sorted by them. run_name="." keeps torch's internal hparams
+        # SummaryWriter in *this* log_dir; the default (str(time.time())) opens a
+        # second writer in a nested subdir, which TensorBoard lists as a duplicate run.
+        if self._config_dict is not None:
+            hparams = _hparams(self._config_dict)
+            metrics = {
+                k: v for k, v in self._last_metrics.items()
+                if k.startswith(("train/", "eval/"))
+            }
+            self._writer.add_hparams(
+                hparams,
+                metrics,
+                run_name=".",
+                global_step=self._last_step,
+            )
+
+        self._writer.flush()
+        self._writer.close()
+        self._writer = None
+
+
+# Keys whose flattened value is a stringified list/target and therefore useless
+# as an HParams column. They remain fully visible in the TEXT tab.
+_HPARAM_SKIP = ("transforms", "_target_", "_partial_")
+
+
+def _hparams(config_dict: dict) -> dict:
+    """Flatten the config to the scalar subset worth showing as HParams columns."""
+    return {
+        key: value
+        for key, value in _flatten(config_dict).items()
+        if not any(skip in key for skip in _HPARAM_SKIP)
+    }
+
+
+def _as_markdown_code(text: str) -> str:
+    """Indent every line by 4 spaces -> a Markdown code block.
+
+    TensorBoard's text plugin renders Markdown with only the ``tables`` extension
+    enabled, so triple-backtick fences are not recognised and would show up
+    literally. A 4-space indented block is core Markdown and renders verbatim,
+    preserving the YAML indentation.
+    """
+    return "\n".join("    " + line for line in text.splitlines())
 
 
 def _flatten(d, prefix="") -> dict:

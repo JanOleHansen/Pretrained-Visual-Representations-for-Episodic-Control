@@ -266,8 +266,16 @@ class MFECAlgorithm(BaseAlgorithm):
 
         # --- 2. Embed all observations in one GPU matmul ------------------
         # embed() does reshape(-1, flat_dim) internally, so any leading shape works.
-        obs        = batch[self.obs_key]                          # (E, T, *obs)
-        states_all = self.qec_policy.embed(obs)                   # (E*T, d)
+        obs = batch[self.obs_key]
+        obs_flat = obs.reshape(-1, *obs.shape[-3:])
+
+        chunk = max(1, self._num_envs)
+        states_all = torch.cat(
+            [self.qec_policy.embed(obs_flat[i : i + chunk])
+             for  i in range(0, obs_flat.shape[0], chunk)],
+            dim = 0
+        )
+
         if states_all.device != dev:
             states_all = states_all.to(dev)
         states_2d = states_all.reshape(E, T, -1)                  # (E, T, d)
