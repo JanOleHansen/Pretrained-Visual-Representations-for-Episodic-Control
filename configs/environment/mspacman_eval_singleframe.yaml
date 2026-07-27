@@ -2,6 +2,7 @@ name: ALE/MsPacman-v5
 gym_backend: gymnasium
 gym_kwargs:
   frame_skip: 4
+  repeat_action_probability: 0.0
   from_pixels: true
   pixels_only: false
   categorical_action_encoding: true

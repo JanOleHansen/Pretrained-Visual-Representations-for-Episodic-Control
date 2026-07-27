@@ -16,7 +16,7 @@
     "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/${localWorkspaceFolderBasename},type=bind",
     "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
     "runArgs": [
-        "--gpus", "device=2",
+        "--gpus", "all",
         "--cpus=8",
         "--memory=32g",
         "--memory-reservation=16g",

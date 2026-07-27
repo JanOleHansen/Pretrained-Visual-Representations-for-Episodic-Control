@@ -19,3 +19,4 @@ ModuleNotFoundError("No module named 'faiss.swigfaiss_avx2'")
 [2026-05-26 09:09:29,919][faiss.loader][INFO] - Successfully loaded faiss.
 [2026-07-24 10:41:11,936][dinov2][INFO] - using MLP layer as FFN
 [2026-07-24 10:52:29,737][dinov2][INFO] - using MLP layer as FFN
+[2026-07-24 12:46:08,279][dinov2][INFO] - using MLP layer as FFN
