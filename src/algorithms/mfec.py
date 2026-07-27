@@ -388,33 +388,42 @@ class MFECAlgorithm(BaseAlgorithm):
             # --- Exact-match path: O(m) hash lookup, no kNN needed --------
             keys_a = self.qec._make_keys(act_states)
             k_to_s = self.qec._key_to_slot[a]
-            exact_list = [key in k_to_s for key in keys_a]
-            n_hits = sum(exact_list)
-            total_hits += n_hits
 
-            if n_hits:
-                hit_positions = [i for i, hit in enumerate(exact_list) if hit]
-                ex_slots = torch.tensor(
-                    [k_to_s[keys_a[i]] for i in hit_positions],
-                    dtype=torch.long, device=dev,
-                )
-                exact_t = torch.tensor(exact_list, dtype=torch.bool, device=dev)
-                # In-place max-aggregation; duplicate slots (rare) overwrite (acceptable).
-                self.qec.values[a, ex_slots] = torch.maximum(
-                    self.qec.values[a, ex_slots], act_values[exact_t]
-                )
+            total_hits += sum(1 for key in keys_a if key in k_to_s)
+
+            act_values_list = act_values.tolist()
+            best_row: dict[bytes, int] = {}
+            for i, key in enumerate(keys_a):
+                j = best_row.get(key)
+                if j is None or act_values_list[i] > act_values_list[j]:
+                    best_row[key] = i
+
+            hit_rows: list[int] = []
+            hit_slots: list[int] = []
+            novel_rows: list[int] = []
+
+            for key, i in best_row.items():
+                slot = k_to_s.get(key)
+                if slot is not None:
+                    hit_rows.append(i)
+                    hit_slots.append(slot)
+                else:
+                    novel_rows.append(i)
+
+
+            if hit_rows:
+                rows_t = torch.tensor(hit_rows, dtype=torch.long, device=dev)
+                slots_t = torch.tensor(hit_slots, dtype=torch.long, device=dev)
+
+                self.qec.values[a, slots_t] = torch.maximum(self.qec.values[a, slots_t], act_values[rows_t])
 
             # --- Novel states → ring-buffer insertion ---------------------
-            n_new = m - n_hits
-            if n_new:
-                if n_hits:
-                    novel_mask = torch.tensor(
-                        [not hit for hit in exact_list], dtype=torch.bool, device=dev
-                    )
-                    self.qec.add_batch(a, act_states[novel_mask], act_values[novel_mask])
-                else:
-                    self.qec.add_batch(a, act_states, act_values)
+           
+            if novel_rows:
+                rows_t = torch.tensor(novel_rows, dtype=torch.long, device=dev)
+                self.qec.add_batch(a, act_states[rows_t], act_values[rows_t])
 
+            
         hit_rate = total_hits / total_queries if total_queries > 0 else 0.0
 
         return {
@@ -877,7 +886,7 @@ class QEC:
         self.device      = d["device"]
         self._key_scale  = d.get("key_scale", 1e5)   # default for old checkpoints
         self._sizes      = list(d["_sizes"])
-        self._write_ptrs = list(d["_write_ptrs"])
+        self._write_ptrs = [sz % self.capacity for sz in self._sizes]
 
         dev = self.device
         self.values = torch.empty(self.num_actions, self.capacity, dtype=torch.float64, device=dev)

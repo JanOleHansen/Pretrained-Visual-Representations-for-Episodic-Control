@@ -9,6 +9,18 @@ defaults:
   - override hydra/job_logging: colorlog
   - override hydra/hydra_logging: colorlog
 
+# Run identity -> directory name: {algorithm}_{game}_{encoder}_seed{n}.
+# Deterministic (no timestamp) so resuming from a checkpoint writes back into the
+# same directory instead of creating a second TensorBoard run for one experiment.
+# Experiment configs should override `algorithm` and `game` with short names;
+# the defaults fall back to the selected config-group option.
+run:
+  algorithm: ${hydra:runtime.choices.algorithm}
+  game: ${hydra:runtime.choices.environment}
+  encoder: ${oc.select:algorithm.encoder_name,none}
+  seed: ${trainer.seed}
+  name: ${run.algorithm}_${run.game}_${run.encoder}_seed${run.seed}
+
 trainer:
   _target_: src.trainers.StepTrainer   # or src.trainers.EpisodeTrainer
   accelerator: cpu        # "cpu" | "gpu" | "mps"
@@ -28,7 +40,7 @@ checkpoint:
 
 hydra:
   run:
-    dir: ${paths.log_dir}/train/runs/${now:%Y-%m-%d_%H-%M-%S}
+    dir: ${paths.log_dir}/train/runs/${run.name}
   sweep:
-    dir: ${paths.log_dir}/train/multiruns/${now:%Y-%m-%d_%H-%M-%S}
-    subdir: ${hydra.job.num}
+    dir: ${paths.log_dir}/train/runs
+    subdir: ${run.name}

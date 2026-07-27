@@ -137,6 +137,14 @@ def _fit(vae, optimizer, frames: torch.Tensor, device: torch.device, cfg: DictCo
 
     n = frames.shape[0]
     batch_size = int(cfg.train.batch_size)
+    if n < batch_size:
+            raise ValueError(
+                f"Collected only {n} frames but train.batch_size={batch_size}; "
+                f"the epoch loop would never yield a batch. Increase "
+                f"collect.frames or lower train.batch_size."
+        )
+
+
     beta_target = float(cfg.vae.beta)
     beta_warmup = int(cfg.vae.get("beta_warmup_steps", 0))
     log_every = int(cfg.train.log_every_n_steps)

@@ -78,7 +78,15 @@ class TensorBoardLogger:
         from torch.utils.tensorboard import SummaryWriter
         from omegaconf import OmegaConf
 
-        self._writer = SummaryWriter(log_dir=self.log_dir)
+        # Run directories are deterministic (see hydra.run.dir in configs/train.yaml),
+        # so on resume this dir already holds an event file. purge_step tells
+        # TensorBoard to drop events at or beyond the restart step, so the interval
+        # replayed between the last checkpoint and the crash isn't drawn twice.
+        resume_step = int(state.get("step") or 0)
+        self._writer = SummaryWriter(
+            log_dir=self.log_dir,
+            purge_step=resume_step or None,
+        )
 
         cfg = state.get("cfg")
         if cfg is None:
@@ -86,7 +94,10 @@ class TensorBoardLogger:
         config_dict = OmegaConf.to_container(cfg, resolve=True)
 
         hparams = _flatten(config_dict)          # -> {"trainer.total_frames": 500000, ...}
-        self._writer.add_hparams(hparams, {})    # empty metric dict is allowed
+        # run_name="." keeps torch's internal hparams SummaryWriter in *this* log_dir.
+        # The default (str(time.time())) opens a second writer in a nested subdir with
+        # its own event file, which TensorBoard lists as a duplicate run.
+        self._writer.add_hparams(hparams, {}, run_name=".")
 
     def on_step_end(self, metrics: dict[str, float], step: int) -> None:
         if self._writer is None:

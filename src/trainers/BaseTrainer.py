@@ -98,13 +98,16 @@ class BaseTrainer(ABC):
     def fit(self) -> dict[str, float]:
         """Run the full training loop.
 
+        ``state`` carries the current step so loggers can tell a fresh run from a
+        resume (``load_checkpoint`` runs before ``fit``; see ``src/train.py``).
+
         Returns:
             dict of final training metrics
         """
         fire_callbacks(
             TrainerEvent.ON_TRAIN_START,
             self.callbacks,
-            state={"cfg": self.cfg},
+            state={"cfg": self.cfg, "step": self._step},
         )
 
         metrics = self._training_loop()

@@ -5,6 +5,10 @@ defaults:
   - override /environment@eval_environment: mspacman_eval_dinov2
   - _self_
 
+run:
+  algorithm: mfec
+  game: mspacman
+
 algorithm:
   encoder_name: dinov2
   dinov2_weights: /datahome/rschwinger/models/dinov2_vits14_pretrain.pth
