@@ -1,0 +1,58 @@
+# @package _global_
+# MFEC on Ms. Pac-Man, 5 seeds — the setup Figure 1 of Blundell et al. (2016)
+# actually plots.  Figure 1's caption: "Dark curves show the mean of five runs
+# ... initialised with different random number seeds. Light shading shows the
+# standard error of the mean across runs."
+#
+# A single MFEC seed is a step function, not a curve: Eq. (1) stores
+# max-over-returns and never decreases, so the greedy policy latches onto a
+# trajectory discontinuously and can be captured by an over-optimistic value
+# (footnote 1: "strong risk seeking behaviour in stochastic environments" —
+# and Ms. Pac-Man's ghosts are stochastic).  Figure 1 looks smooth because it
+# averages five such step functions, not because any single run is smooth.
+#
+# Run it with (no -m needed, hydra.mode is set below):
+#     python src/train.py experiment=mfec/mspacman_5seed
+#
+# WHICH METRIC TO PLOT: `train/episode_reward`, not `eval/return_mean`.  The
+# paper's y-axis is reward *experienced* while acting with eps=0.005 during
+# training ("Average reward vs. number of frames ... experienced") — there is
+# no separate greedy-evaluation protocol anywhere in the paper.  The x-axis is
+# emulator frames at 4 per decision, so multiply the logged step count by 4.
+defaults:
+  - override /algorithm: mfec_atari
+  - override /environment: mspacman_mfec_train
+  - override /environment@eval_environment: mspacman_mfec_eval
+  - _self_
+
+# Single source of truth for the sweep; both consumers below interpolate it.
+# trainer.seed drives seed_everything() (python/numpy/torch/cuda); algorithm.seed
+# drives the fixed random projection matrix.  The paper varies both.
+seed: 42
+
+algorithm:
+  seed: ${seed}
+
+trainer:
+  seed: ${seed}
+  # 12.5M decisions = 50M emulator frames = Figure 1's full x-range.
+  total_frames: 12_500_000
+  accelerator: gpu
+  devices: [0]
+  num_envs: 4
+  log_every_n_steps: 10_000
+  eval_every_n_steps: 200_000
+  num_eval_episodes: 15
+
+hydra:
+  # Enables multirun without passing -m on the command line.
+  mode: MULTIRUN
+  sweeper:
+    params:
+      seed: 42,43,44,45,46
+  sweep:
+    # Deterministic (no timestamp), matching the single-run convention in
+    # configs/train.yaml: resuming from a checkpoint writes back into the same
+    # directory instead of creating a second TensorBoard run per experiment.
+    dir: ${paths.log_dir}/mfec_mspacman_5seed
+    subdir: ${run.name}
