@@ -1,0 +1,56 @@
+name: ALE/MsPacman-v5
+gym_backend: gymnasium
+gym_kwargs:
+  # ALE/MsPacman-v5 already applies action-repeat 4 internally, and TorchRL's
+  # frame_skip stacks a second action repeat ON TOP of it. frame_skip: 1 leaves
+  # exactly the paper's "repeating each action four times" (Pritzel et al. 2017
+  # §4), so one agent step == 4 raw ALE frames.
+  frame_skip: 1
+  # ALE v5 defaults to 0.25 sticky actions (Machado et al. 2018). The 2017 paper
+  # predates that protocol, so disable it for comparable results.
+  repeat_action_probability: 0.0
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# NEC variant of mspacman_train.yaml.
+#
+# KEY DIFFERENCE — no SignTransform (no reward clipping). Pritzel et al. (2017)
+# §4: "NEC and MFEC do not require reward clipping, which results in qualitative
+# changes in behaviour and better performance relative to other algorithms on
+# games requiring clipping (Bowling, Frostbite, H.E.R.O., Ms. Pac-Man, Alien out
+# of the seven shown)."  Ms. Pac-Man is named explicitly, and the paper explains
+# why: eating a power pill makes ghosts vulnerable and yields rewards far larger
+# than ordinary pellets, but "clipping implies there is no difference between
+# large and small rewards", so a clipped agent never learns to prefer it.
+# Clipping here would remove the exact behaviour the paper credits for NEC's
+# Ms. Pac-Man result, so this config must not use SignTransform.
+#
+# EndOfLifeTransform is kept: the paper applies "the same preprocessing steps as
+# (Mnih et al., 2015)", which treats a life loss as an episode boundary.
+#
+# VecNorm is omitted for the same reason as the other episodic-control configs:
+# its running statistics drift, so the same raw observation encodes differently
+# over time, which degrades the DND's exact-match hit rate.
+#
+# NOTE — reward scale: because clipping is dropped, train/episode_reward here is
+# the TRUE Ms. Pac-Man score and is directly comparable to eval/return_mean.
+# (In the MFEC Ms. Pac-Man configs train rewards are clipped to {-1, 0, +1} and
+# only eval/return_mean is comparable to paper figures.)
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.EndOfLifeTransform
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.GrayScale
+  - _target_: torchrl.envs.Resize
+    w: 84
+    h: 84
+  - _target_: torchrl.envs.CatFrames
+    N: 4
+    dim: -3
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    max_steps: 4500   # 4500 agent steps x 4 raw frames = 18k frames = 5 min @60fps
+  - _target_: torchrl.envs.DoubleToFloat

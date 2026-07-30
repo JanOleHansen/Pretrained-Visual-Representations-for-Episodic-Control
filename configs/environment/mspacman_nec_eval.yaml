@@ -1,0 +1,39 @@
+name: ALE/MsPacman-v5
+gym_backend: gymnasium
+gym_kwargs:
+  # Must match mspacman_nec_train.yaml exactly: ALE/MsPacman-v5 applies
+  # action-repeat 4 internally, so frame_skip: 1 avoids a second, stacked
+  # action repeat and keeps 1 agent step == 4 raw ALE frames.
+  frame_skip: 1
+  repeat_action_probability: 0.0   # sticky actions off (2017 protocol)
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# NEC eval variant of mspacman_eval.yaml — identical except for the two
+# gym_kwargs above, which must mirror the training env so the policy is
+# evaluated under the same dynamics it was trained on.
+#
+# Eval drops EndOfLifeTransform so episodes end on game-over rather than life
+# loss, giving a full-game score. It carries no SignTransform (the NEC training
+# env has none either — see mspacman_nec_train.yaml), and no VecNorm, whose
+# running stats are not checkpointed and would distort a fresh eval env.
+#
+# eval/return_mean from this env is the number to compare against the paper:
+# Table 3 reports NEC Ms. Pac-Man = 4142.8 at 10 million frames.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.GrayScale
+  - _target_: torchrl.envs.Resize
+    w: 84
+    h: 84
+  - _target_: torchrl.envs.CatFrames
+    N: 4
+    dim: -3
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    max_steps: 4500
+  - _target_: torchrl.envs.DoubleToFloat

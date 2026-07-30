@@ -45,6 +45,8 @@ Two derived rules:
 | MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`         |
 | MFEC      | ALE/MsPacman-v5  | `experiment=mfec/mspacman`      |
 | NEC       | ALE/Pong-v5      | `experiment=nec/pong`           |
+| NEC       | ALE/Hero-v5      | `experiment=nec/hero`           |
+| NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman`       |
 
 ## Main technologies
 

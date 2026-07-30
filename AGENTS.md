@@ -20,6 +20,8 @@ Implemented experiments:
 | MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`        |
 | MFEC      | ALE/MsPacman-v5  | `experiment=mfec/mspacman`     |
 | NEC       | ALE/Pong-v5      | `experiment=nec/pong`          |
+| NEC       | ALE/Hero-v5      | `experiment=nec/hero`          |
+| NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman`      |
 
 ## Design principles
 
@@ -374,6 +376,10 @@ configs/
   experiment/mfec/mspacman_vae.yaml — same, with encoder_name=vae + singleframe env
                               (vae_checkpoint is required, no default — see "Encoders" above)
   experiment/nec/pong.yaml     — NEC on Pong (40M frames, num_envs=16)
+  experiment/nec/hero.yaml     — NEC on H.E.R.O. (40M frames, num_envs=16)
+  experiment/nec/mspacman.yaml — NEC on Ms. Pac-Man; uses mspacman_nec_{train,eval}
+                              (no reward clipping — paper §4 names Ms. Pac-Man
+                              explicitly), num_updates=400, num_envs=8
   logger/{wandb,tensorboard}.yaml
   paths/default.yaml
   train.yaml, eval.yaml, train_vae.yaml
@@ -620,6 +626,7 @@ python src/train.py experiment=mfec/pong           # MFEC on Pong (40M frames, G
 python src/train.py experiment=mfec/qbert          # MFEC on Q*Bert (40M frames, GPU)
 python src/train.py experiment=mfec/mspacman       # MFEC on Ms. Pac-Man (40M frames, GPU)
 python src/train.py experiment=mfec/mspacman_vae algorithm.vae_checkpoint=<path>  # + paper-exact VAE encoder
+python src/train.py experiment=nec/mspacman        # NEC on Ms. Pac-Man (40M raw frames, GPU)
 python src/train_vae.py                            # pretrain the MFEC "vae" encoder (see above)
 pytest tests/test_smoke.py -v
 ```
