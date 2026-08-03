@@ -265,7 +265,10 @@ configs/
 │   ├── a2c.yaml            <- A2C HPs (HalfCheetah/MuJoCo defaults)
 │   ├── mfec_atari.yaml     <- MFEC HPs (Atari defaults; random projection, QEC)
 │   ├── nec.yaml            <- NEC HPs (base defaults; trainable CNN, DND)
-│   └── nec_atari.yaml      <- NEC HPs (Atari defaults per Pritzel et al. 2017)
+│   ├── nec_atari.yaml      <- NEC HPs (Atari defaults per Pritzel et al. 2017)
+│   └── embedding_network/  <- NEC encoder config group (see "NEC embedding networks")
+│       ├── nature.yaml     <- NatureDQN trunk + dense layer (default)
+│       └── dinov2_finetune.yaml <- finetunable DINOv2 ViT (SCAFFOLDING, unvalidated)
 ├── environment/
 │   ├── cartpole.yaml       <- env name + transforms
 │   ├── pong_train.yaml     <- Pong with EndOfLife + Sign + VecNorm (training)
@@ -389,6 +392,61 @@ MFEC's state embedding is pluggable (`algorithm.encoder_name`):
   python src/train.py experiment=mfec/mspacman_vae \
       algorithm.vae_checkpoint=<checkpoint.save_path printed above>
   ```
+
+## NEC embedding networks
+
+MFEC's encoder is **frozen**; NEC's is **trained end-to-end**, so the two have
+separate systems that should not be merged. NEC's φ is a Hydra config group,
+`configs/algorithm/embedding_network/`, listed in the defaults of both
+`configs/algorithm/nec.yaml` and `nec_atari.yaml`:
+
+| option | factory | status |
+|---|---|---|
+| `nature` (default) | `src.networks.NatureEmbedding` — NatureDQN conv trunk + one dense layer to `embedding_dim` | the paper's network; used by every `experiment/nec/*.yaml` |
+| `dinov2_finetune` | `src.networks.DINOv2Embedding` — DINOv2 ViT, backbone **not** frozen | scaffolding, unvalidated (see below) |
+
+```shell
+# Standard encoder (this is what every experiment/nec/*.yaml already does):
+python src/train.py experiment=nec/pong
+python src/train.py experiment=nec/pong algorithm/embedding_network=nature   # explicit
+
+# Swap in another one — no YAML editing:
+python src/train.py experiment=nec/pong algorithm/embedding_network=<name>
+```
+
+### The contract
+
+A new embedding network is any callable
+
+```python
+factory(obs_shape: Sequence[int], embedding_dim: int, **kwargs) -> nn.Module
+```
+
+(everything after the two positional args keyword-only, so a Hydra
+`_partial_` can pre-bind design kwargs) whose module maps
+`(B, *obs_shape) -> (B, embedding_dim)` float32. **All parameters must be
+trainable by default** — `NECAlgorithm.setup()` hands
+`embedding_net.parameters()` straight to Adam, so a frozen parameter is a
+dead one. The output must not be pre-normalised: NEC L2-normalises before
+every DND read/write, and that normalisation is what keeps the
+inverse-distance kernel from collapsing (see
+`tests/test_nec_kernel_scale.py`).
+
+The contract is written up as `src.networks.NECEmbeddingNetwork` (a
+documentation `Protocol`); AGENTS.md § "Adding a new NEC embedding network"
+has the step-by-step, including how to persist extra checkpoint state via
+`_get_training_state` / `_load_training_state`.
+
+### `dinov2_finetune` is scaffolding
+
+`DINOv2Embedding` + its YAML sketch a finetunable DINOv2 ViT (torch.hub
+architecture + local `.pth`, 1×1 conv channel adapter, resize, ImageNet
+normalisation, linear head), deliberately **without** the
+`requires_grad_(False)` freeze that MFEC's `DINOv2Encoder` applies, and with
+a `freeze_backbone: bool = False` toggle. Composition, construction, forward
+shape and the freeze flag are tested against a stub backbone (no downloads);
+real weight loading, the preprocessing choices, and whether NEC learns with
+it are **untested**. No training run has used it.
 
 ## Adding a new algorithm
 

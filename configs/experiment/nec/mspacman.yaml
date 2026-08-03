@@ -3,9 +3,14 @@
 #
 # This is the NEC analogue of experiment/mfec/mspacman.yaml. Note there is only
 # ONE NEC Ms. Pac-Man config, whereas MFEC has three (mspacman / mspacman_vae /
-# mspacman_dinov2): MFEC's encoder is a swappable design choice, while NEC's
-# CNN embedding network is trained jointly with the DND, so there is no encoder
-# variant to select.
+# mspacman_dinov2). NEC's embedding network IS swappable, but via its own config
+# group (configs/algorithm/embedding_network/) rather than per-experiment files:
+#
+#   python src/train.py experiment=nec/mspacman algorithm/embedding_network=<name>
+#
+# The two encoder systems are separate on purpose — MFEC's is frozen and keyed
+# by `algorithm.encoder_name`, NEC's is trained jointly with the DND. This
+# config uses the default (`nature`), the network from the paper.
 #
 # Ms. Pac-Man has 9 actions, so the nec_atari defaults (dnd_capacity=5e5 per
 # action, k=50, embedding_dim=64, kernel_delta=1e-3, n_step=100, gamma=0.99)

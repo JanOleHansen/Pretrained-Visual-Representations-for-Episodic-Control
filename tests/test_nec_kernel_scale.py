@@ -170,28 +170,32 @@ def test_gradient_step_normalises_before_kernel_lookup():
         storage=LazyTensorStorage(max_size=100, device="cpu")
     )
 
-    base = torch.zeros(4, 4, 84, 84)
-    base[:, :, 40:44, 10:12] = 1.0
-    obs = base.clone()
-    obs[0, :, 20:22, 50:52] = 1.0
-    obs[1, :, 60:62, 50:52] = 1.0
-    obs[2, :, 20:22, 50:52] = 1.0
-    obs[3, :, 60:62, 50:52] = 1.0
-    actions = torch.tensor([0, 0, 1, 1])
-    targets = torch.tensor([1.0, -1.0, -1.0, 1.0])
+    # Three DISTINCT frames per action. The sparsity guard in
+    # _gradient_step skips any action with `_sizes[a] <= k`, and
+    # write_batch de-duplicates by quantised key -- so seeding with repeated
+    # frames stores fewer entries than rows written and silently skips the
+    # whole loss computation, leaving `captured` empty.
+    obs = torch.zeros(6, 4, 84, 84)
+    obs[:, :, 40:44, 10:12] = 1.0                      # static paddle region
+    for i in range(6):
+        obs[i, :, 10 + 12 * i: 12 + 12 * i, 50:52] = 1.0   # ball position i
+    actions = torch.tensor([0, 0, 0, 1, 1, 1])
+    targets = torch.tensor([1.0, -1.0, 0.0, -1.0, 1.0, 0.0])
+    alg.batch_size = 6
 
     alg.replay_buffer.extend(TensorDict(
         {"obs": obs, "action": actions, "n_step_return": targets},
-        batch_size=[4],
+        batch_size=[6],
     ))
-    # Seed the DND so the sparsity guard (`_sizes[a] <= k`) doesn't skip the
-    # loss computation for either action. k=2 requires > 2 stored entries, so
-    # duplicate the two points per action (3 rows > k).
     with torch.no_grad():
         h0 = alg.embedding_net(obs)
         h0 = nn.functional.normalize(h0, dim=-1)
-    alg.dnd.write_batch(0, h0[[0, 1, 0]], targets[[0, 1, 0]], dnd_lr=1.0)
-    alg.dnd.write_batch(1, h0[[2, 3, 2]], targets[[2, 3, 2]], dnd_lr=1.0)
+    alg.dnd.write_batch(0, h0[0:3], targets[0:3], dnd_lr=1.0)
+    alg.dnd.write_batch(1, h0[3:6], targets[3:6], dnd_lr=1.0)
+    assert all(s > alg.k for s in alg.dnd._sizes), (
+        f"DND sizes {alg.dnd._sizes} <= k={alg.k}: _gradient_step would skip "
+        "every action and this test would assert on nothing"
+    )
 
     captured = {}
     orig_knn_action = alg.dnd.knn_action
@@ -204,6 +208,10 @@ def test_gradient_step_normalises_before_kernel_lookup():
 
     alg._gradient_step()
 
+    assert "h" in captured, (
+        "knn_action was never called -- _gradient_step took an early-return "
+        "path, so the normalisation this test guards was not exercised"
+    )
     all_h = torch.cat(captured["h"], dim=0)
     norms = all_h.norm(dim=-1)
     torch.testing.assert_close(norms, torch.ones_like(norms), atol=1e-5, rtol=1e-5)

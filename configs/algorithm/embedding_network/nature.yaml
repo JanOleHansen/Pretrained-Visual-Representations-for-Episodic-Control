@@ -1,0 +1,17 @@
+# NEC embedding network: NatureDQN convolutional trunk + one dense layer.
+#
+# The standard/default choice — Pritzel et al. 2017 §4 uses the Mnih et al.
+# 2015 ConvNet with the MLP Q-head replaced by a single linear layer to
+# `algorithm.embedding_dim`.  Trained end-to-end by NECAlgorithm's Adam
+# optimizer (see the NECEmbeddingNetwork contract in src/networks.py).
+#
+# Selected by `configs/algorithm/nec.yaml` / `nec_atari.yaml`; swap on the
+# CLI with `algorithm/embedding_network=<other>`.
+_partial_: true
+_target_: src.networks.NatureEmbedding
+num_cells_cnn: [32, 64, 64]
+kernel_sizes: [8, 4, 3]
+strides: [4, 2, 1]
+activation_class:
+  _target_: hydra.utils.get_class
+  path: torch.nn.ReLU

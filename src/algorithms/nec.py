@@ -765,7 +765,13 @@ class NECAlgorithm(BaseAlgorithm):
     Design notes
     ------------
     * ``embedding_network`` factory is called as
-      ``embedding_network(obs_shape, embedding_dim)`` in ``setup()``.
+      ``embedding_network(obs_shape, embedding_dim)`` in ``setup()``.  Its
+      full contract lives in ``src.networks.NECEmbeddingNetwork``; the
+      choice is a Hydra config group
+      (``configs/algorithm/embedding_network/``), so it is swapped with
+      ``algorithm/embedding_network=<name>`` rather than by editing nested
+      YAML.  Unlike MFEC's frozen ``src.encoders.Encoder``, this network is
+      trained end-to-end — every parameter it returns goes into Adam below.
     * ``replay_buffer`` is a no-arg factory returning a ``ReplayBuffer``.
     * The optimizer covers the CNN embedding network only.  DND values are
       updated by the in-place blend rule, not by gradient descent.

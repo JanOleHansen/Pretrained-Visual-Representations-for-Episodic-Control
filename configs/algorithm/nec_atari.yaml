@@ -1,20 +1,17 @@
+# NEC on Atari — hyperparameters from Pritzel et al. (2017), Table S1.
+# The paper's embedding network is the NatureDQN convolutional trunk (Mnih
+# et al. 2015) with the Q-head replaced by a single dense layer — that is the
+# `nature` option of the embedding_network config group, selected below.
+# Swap it without editing this file:
+#   python src/train.py experiment=nec/pong algorithm/embedding_network=<name>
+defaults:
+  - embedding_network: nature
+  - _self_
+
 _target_: src.algorithms.nec.NECAlgorithm
 
-# NEC on Atari — hyperparameters from Pritzel et al. (2017), Table S1.
-# Uses the same NatureDQN convolutional trunk (Mnih et al. 2015) with the
-# Q-head replaced by a single dense embedding layer.
-
 # Callable factories
-embedding_network:
-  _partial_: true
-  _target_: src.networks.NatureEmbedding
-  num_cells_cnn: [32, 64, 64]
-  kernel_sizes: [8, 4, 3]
-  strides: [4, 2, 1]
-  activation_class:
-    _target_: hydra.utils.get_class
-    path: torch.nn.ReLU
-
+#
 # 1×10⁵ replay buffer on CPU (pixel obs are ~110 KB each; 10⁵ ≈ 11 GB uint8
 # but ToTensorImage converts to float32 so actual storage is ~44 GB).
 # Keep max_size=100_000 as in the paper; reduce for memory-constrained hosts.

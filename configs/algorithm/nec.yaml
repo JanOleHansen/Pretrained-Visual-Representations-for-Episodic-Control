@@ -1,16 +1,13 @@
+# The embedding network is a first-class config group
+# (configs/algorithm/embedding_network/). Swap it without editing this file:
+#   python src/train.py algorithm=nec algorithm/embedding_network=nature
+defaults:
+  - embedding_network: nature
+  - _self_
+
 _target_: src.algorithms.nec.NECAlgorithm
 
 # Callable factories (override via nested configs; requires instantiate(cfg.algorithm)).
-embedding_network:
-  _partial_: true
-  _target_: src.networks.NatureEmbedding
-  num_cells_cnn: [32, 64, 64]
-  kernel_sizes: [8, 4, 3]
-  strides: [4, 2, 1]
-  activation_class:
-    _target_: hydra.utils.get_class
-    path: torch.nn.ReLU
-
 replay_buffer:
   _partial_: true
   _target_: torchrl.data.TensorDictReplayBuffer
