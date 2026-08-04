@@ -1,10 +1,11 @@
 name: ALE/MsPacman-v5
 gym_backend: gymnasium
 gym_kwargs:
-  # Must match mspacman_nec_train.yaml exactly: ALE/MsPacman-v5 applies
-  # action-repeat 4 internally, so frame_skip: 1 avoids a second, stacked
-  # action repeat and keeps 1 agent step == 4 raw ALE frames.
-  frame_skip: 1
+  # Must match mspacman_nec_train.yaml exactly. This value is forwarded into
+  # `gym.make(..., frameskip=N)` and IS the ALE action repeat — TorchRL does not
+  # stack a second one on top. 4 = the paper's protocol; see the longer note in
+  # mspacman_nec_train.yaml.
+  frame_skip: 4
   repeat_action_probability: 0.0   # sticky actions off (2017 protocol)
   from_pixels: true
   pixels_only: false

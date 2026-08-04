@@ -19,6 +19,8 @@ replay_buffer:
 obs_key: pixels
 
 # DND parameters
+# (Same values as nec_atari.yaml; see that file for which of these the paper
+# actually specifies and which it swept without reporting.)
 embedding_dim: 64
 dnd_capacity: 500_000
 k: 50
@@ -45,4 +47,8 @@ init_random_frames: 50_000
 max_frames_per_traj: -1
 
 # Learning schedule
-num_updates: 100    # gradient steps per collector batch (≈1 per 16 frames)
+# Gradient steps per collector batch. The paper's ratio is 1 update per 16 raw
+# frames; frames_per_batch counts AGENT STEPS, so the right value is
+# frames_per_batch * action_repeat / 16. This base config assumes no action
+# repeat (1600 / 16 = 100); nec_atari.yaml overrides to 400 for action-repeat 4.
+num_updates: 100

@@ -1,0 +1,57 @@
+name: ALE/Hero-v5
+gym_backend: gymnasium
+gym_kwargs:
+  # This value is forwarded into `gym.make(..., frameskip=N)` and IS the ALE
+  # action repeat — TorchRL does not stack a second one on top (see the note in
+  # mspacman_nec_train.yaml). 4 = the paper's protocol.
+  frame_skip: 4
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# NEC variant of hero_train.yaml.
+#
+# KEY DIFFERENCE — no SignTransform (no reward clipping). Pritzel et al. (2017)
+# §4: "NEC and MFEC do not require reward clipping, which results in qualitative
+# changes in behaviour and better performance relative to other algorithms on
+# games requiring clipping (Bowling, Frostbite, H.E.R.O., Ms. Pac-Man, Alien out
+# of the seven shown)."  H.E.R.O. is named explicitly, so training NEC on it
+# through hero_train.yaml's SignTransform — which experiment/nec/hero.yaml did
+# until this was caught in review — removes exactly the property the paper
+# credits for NEC's result on this game. This config must not use SignTransform.
+#
+# Mirrors mspacman_nec_train.yaml, which drops clipping for the same reason.
+# Pong deliberately keeps its clipped config: the paper notes Pong's "original
+# rewards are in the range [-1, 1]", so SignTransform is a genuine no-op there.
+#
+# EndOfLifeTransform is kept for parity with the other Atari configs, but it is
+# INERT for NEC and MFEC: it writes a separate `end-of-life` key and does not
+# touch `done`, and nothing in src/ reads that key. Episodes here are whole
+# games or StepCounter truncations, not per-life segments.
+#
+# VecNorm is omitted for the same reason as the other episodic-control configs:
+# its running statistics drift, so the same raw observation encodes differently
+# over time, which degrades the DND's exact-match hit rate.
+#
+# NOTE — reward scale: because clipping is dropped, train/episode_reward here is
+# the TRUE H.E.R.O. score and is directly comparable to eval/return_mean.
+#
+# H.E.R.O. has 18 actions (the full minimal action set) — no algorithm
+# hyperparameters need to change; num_actions is read from the env spec.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.EndOfLifeTransform
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.GrayScale
+  - _target_: torchrl.envs.Resize
+    w: 84
+    h: 84
+  - _target_: torchrl.envs.CatFrames
+    N: 4
+    dim: -3
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    max_steps: 4500   # 4500 agent steps x 4 raw frames = 18k frames = 5 min @60fps
+  - _target_: torchrl.envs.DoubleToFloat

@@ -1,8 +1,15 @@
-# NEC on Atari — hyperparameters from Pritzel et al. (2017), Table S1.
-# The paper's embedding network is the NatureDQN convolutional trunk (Mnih
-# et al. 2015) with the Q-head replaced by a single dense layer — that is the
-# `nature` option of the embedding_network config group, selected below.
-# Swap it without editing this file:
+# NEC on Atari — hyperparameters from Pritzel et al. (2017) §4.
+#
+# NOTE: this file used to cite "Table S1". There is no such table — the paper's
+# only appendix is "A. Scores on Atari Games" and every hyperparameter is prose
+# in §4. What §4 actually states is marked "(paper §4)" below; what it says it
+# SWEPT and never reported is marked "(swept, unreported)". Do not re-add paper
+# authority to the latter.
+#
+# The paper's embedding network is "the same convolutional architecture as DQN"
+# (Mnih et al. 2015) with the Q-head replaced by a dense layer to the embedding
+# width — that is the `nature` option of the embedding_network config group,
+# selected below. Swap it without editing this file:
 #   python src/train.py experiment=nec/pong algorithm/embedding_network=<name>
 defaults:
   - embedding_network: nature
@@ -12,9 +19,13 @@ _target_: src.algorithms.nec.NECAlgorithm
 
 # Callable factories
 #
-# 1×10⁵ replay buffer on CPU (pixel obs are ~110 KB each; 10⁵ ≈ 11 GB uint8
-# but ToTensorImage converts to float32 so actual storage is ~44 GB).
-# Keep max_size=100_000 as in the paper; reduce for memory-constrained hosts.
+# 1×10⁵ replay buffer on CPU — "our replay buffer stores the only last 10^5
+# states" (paper §4).  Memory: one obs is 4×84×84 = 28,224 elements, i.e.
+# 28 KB as uint8 and 113 KB as the float32 ToTensorImage produces, so 10⁵
+# transitions is ~11.3 GB (not the ~44 GB an earlier version of this comment
+# claimed — it mistook the float32 per-frame size for the uint8 one).
+# LazyTensorStorage preallocates, so that RAM is committed up front.
+# Reduce max_size for memory-constrained hosts.
 replay_buffer:
   _partial_: true
   _target_: torchrl.data.TensorDictReplayBuffer
@@ -25,31 +36,46 @@ replay_buffer:
 
 obs_key: pixels
 
-# DND parameters (paper Table S1)
-embedding_dim: 64        # h ∈ ℝ^64
-dnd_capacity: 500_000    # 5×10⁵ entries per action
-k: 50                    # p = 50 nearest neighbours
-kernel_delta: 1.0e-3     # δ = 10⁻³
-dnd_lr: 0.1              # α = 0.1 for blending existing entries
+# DND parameters
+embedding_dim: 64        # (swept, unreported) — §4 lists "dimensionality of
+                         # the embeddings" among the swept hyperparameters
+dnd_capacity: 500_000    # (paper §4) "store up to 5 × 10^5 memories per action"
+k: 50                    # (paper §4) "we set the number of nearest neighbours
+                         # p = 50 in all our experiments"
+kernel_delta: 1.0e-3     # (paper §4, Eq. 5) "we set δ = 10^-3"
+dnd_lr: 0.1              # (swept, unreported) — §4's "fast-update learning-rate α"
 
-# N-step return (paper §2.2)
-n_step: 100
+# N-step return
+n_step: 100              # (paper §4) "for the N-step Q estimates we picked a
+                         # horizon of N = 100"
 
 # Optimisation
-lr: 1.0e-4
-gamma: 0.99
-batch_size: 32
-max_grad_norm: 10.0
+# NOTE — the paper uses RMSProp ("we used the RMSProp algorithm for gradient
+# descent training", §4); NECAlgorithm uses Adam. Deviation, see nec.py's
+# module docstring.
+lr: 1.0e-4               # (swept, unreported) — §4's "SGD learning-rate"
+gamma: 0.99              # (paper §4) "all algorithms were trained using
+                         # discount rate γ = 0.99"
+batch_size: 32           # (paper §4) "with a minibatch of size 32"
+max_grad_norm: 10.0      # not in the paper
 
-# Exploration
+# Exploration — (swept, unreported); §4 lists the "ε-greedy exploration-rate"
+# among the swept values.
 eps_start: 1.0
 eps_end: 0.01
 annealing_frames: 4_000_000
 
-# Data collection (same cadence as DQN Atari)
+# Data collection.  frames_per_batch counts AGENT STEPS, and every Atari config
+# here runs action-repeat 4, so 1600 agent steps == 6400 raw ALE frames.
 frames_per_batch: 1_600
 init_random_frames: 50_000
 max_frames_per_traj: -1
 
-# 1 gradient update per 16 frames; 1600 / 16 = 100
-num_updates: 100
+# (paper §4) "we do one replay update for every 16 observed frames".  "Frames"
+# in the paper are raw ALE frames — fixed by its own remark that 40M frames
+# "corresponds to 185 hours of gameplay" (40e6 / 60fps = 185.2 h).  With
+# action-repeat 4: 1600 agent steps = 6400 raw frames, 6400 / 16 = 400.
+# This was 100 until review — that value assumed 1 agent step == 1 raw frame,
+# which is true for no Atari config in this repo, so pong/hero were doing 4x
+# too few gradient updates.
+num_updates: 400

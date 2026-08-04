@@ -1,11 +1,21 @@
 name: ALE/MsPacman-v5
 gym_backend: gymnasium
 gym_kwargs:
-  # ALE/MsPacman-v5 already applies action-repeat 4 internally, and TorchRL's
-  # frame_skip stacks a second action repeat ON TOP of it. frame_skip: 1 leaves
-  # exactly the paper's "repeating each action four times" (Pritzel et al. 2017
-  # §4), so one agent step == 4 raw ALE frames.
-  frame_skip: 1
+  # TorchRL does NOT stack a second action repeat on top of ALE's: GymEnv
+  # forwards this straight into `gym.make(..., frameskip=N)` (torchrl
+  # envs/libs/gym.py, `kwargs["frameskip"] = self.frame_skip;
+  # self.wrapper_frame_skip = 1`) and only falls back to a wrapper-level repeat
+  # if gym.make REJECTS the kwarg — which ALE-v5 does not. So this value IS the
+  # ALE action repeat, and 4 is what Pritzel et al. (2017) §4 specifies ("the
+  # same preprocessing steps as (Mnih et al., 2015), including repeating each
+  # action four times"). One agent step == 4 raw ALE frames.
+  #
+  # This was `1` until it was caught in review, which meant NEC Ms. Pac-Man ran
+  # with NO action repeat at all and every frame-denominated number downstream
+  # (total_frames, eval cadence, num_updates, StepCounter.max_steps) was off by
+  # 4x. Verify with:
+  #   GymEnv("ALE/MsPacman-v5", frame_skip=4).wrapper_frame_skip  -> 1
+  frame_skip: 4
   # ALE v5 defaults to 0.25 sticky actions (Machado et al. 2018). The 2017 paper
   # predates that protocol, so disable it for comparable results.
   repeat_action_probability: 0.0
@@ -26,8 +36,18 @@ gym_kwargs:
 # Clipping here would remove the exact behaviour the paper credits for NEC's
 # Ms. Pac-Man result, so this config must not use SignTransform.
 #
-# EndOfLifeTransform is kept: the paper applies "the same preprocessing steps as
-# (Mnih et al., 2015)", which treats a life loss as an episode boundary.
+# EndOfLifeTransform is kept for parity with the other Atari configs, but be
+# aware it is INERT for NEC and MFEC: it writes a separate `end-of-life` key and
+# deliberately does NOT touch `done` (its own docstring: "isn't registered
+# within the done_spec because it should not instruct the env to reset"), and
+# nothing in src/ reads that key. Verified by rollout: with EndOfLifeTransform
+# + StepCounter(max_steps=8), `done` fires only at the StepCounter cutoffs and
+# `end-of-life` never fires in `next`.
+#
+# So NEC episodes here are whole games (or StepCounter truncations), NOT
+# per-life segments — the paper's Mnih-style episodic-life preprocessing is
+# effectively absent. Making it real would mean segmenting on `end-of-life` in
+# NECAlgorithm.step(); that is a behaviour change, not a config fix.
 #
 # VecNorm is omitted for the same reason as the other episodic-control configs:
 # its running statistics drift, so the same raw observation encodes differently
@@ -53,4 +73,5 @@ transforms:
   - _target_: torchrl.envs.RewardSum
   - _target_: torchrl.envs.StepCounter
     max_steps: 4500   # 4500 agent steps x 4 raw frames = 18k frames = 5 min @60fps
+                      # (correct now that frame_skip is 4; it was 1)
   - _target_: torchrl.envs.DoubleToFloat

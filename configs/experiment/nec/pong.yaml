@@ -1,11 +1,17 @@
 
 # @package _global_
 # NEC on Atari Pong (Pritzel et al. 2017).
+#
 # Uses pong_mfec_train.yaml (no VecNorm) for the same reason as MFEC: the
 # exact-match dict keys the DND on quantised CNN embeddings; VecNorm changes
 # raw pixel values over time which would shift the embedding distribution and
 # impair the exact-match hit rate (though less severely than for MFEC, since
 # NEC's CNN is trainable and embeddings shift anyway as the network learns).
+#
+# Unlike nec/hero.yaml and nec/mspacman.yaml, this config KEEPS the clipped
+# training env: Pong needs no NEC-specific variant because the paper notes its
+# "original rewards are in the range [-1, 1]", so pong_mfec_train.yaml's
+# SignTransform is a genuine no-op here rather than a deviation.
 defaults:
   - override /algorithm: nec_atari
   - override /environment: pong_mfec_train
@@ -13,11 +19,22 @@ defaults:
   - _self_
 
 trainer:
-  total_frames: 40_000_100
+  # Agent steps, not raw frames: with action-repeat 4 this is 40M raw ALE
+  # frames, matching the paper's x-axis. Was 40_000_100 until review, which
+  # would have been 160M raw frames — 4x the paper's budget.
+  total_frames: 10_000_100
   seed: 42
   accelerator: gpu
   devices: [0]
+  # WARNING — untested at this width for NEC. nec/mspacman.yaml documents an
+  # observed OOM at num_envs=16 on a 32 GB host (NEC adds a 100k-transition
+  # float32 replay buffer, ~11.3 GB preallocated, plus a per-env raw-pixel
+  # carry buffer, on top of the DND) and drops to 8. If this run dies with
+  # `EOFError: proc <pid> failed, last command: step_and_maybe_reset`, that is
+  # the OOM killer taking a ParallelEnv worker — set num_envs: 8.
   num_envs: 16
   log_every_n_steps: 10_000
-  eval_every_n_steps: 200_000   # paper §4: "evaluate MFEC and NEC every 200,000 frames"
+  # 50_000 agent steps == every 200k raw frames, per paper §4 ("We evaluate
+  # MFEC and NEC every 200.000 frames").
+  eval_every_n_steps: 50_000
   num_eval_episodes: 5

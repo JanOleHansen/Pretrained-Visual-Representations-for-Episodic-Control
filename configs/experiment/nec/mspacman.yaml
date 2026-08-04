@@ -30,13 +30,8 @@ run:
   game: mspacman
 
 algorithm:
-  # Paper §4: "We do one replay update for every 16 observed frames with a
-  # minibatch of size 32."  "Frames" throughout the paper are raw ALE frames —
-  # fixed by its own remark that 40M frames "corresponds to 185 hours of
-  # gameplay" (40e6 / 60fps = 185.2 h). With action-repeat 4 that is one update
-  # per 4 agent steps, so frames_per_batch (1600 agent steps) / 4 = 400.
-  # nec_atari.yaml's default of 100 assumes one collector step == one frame.
-  num_updates: 400
+  # num_updates: 400 is now the nec_atari.yaml default (it applies to every
+  # action-repeat-4 Atari config, not just this one), so no override here.
 
   # The paper swept epsilon and never published the schedule (§4 lists the
   # "epsilon-greedy exploration-rate" among the swept-but-unreported values,

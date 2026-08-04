@@ -45,6 +45,8 @@ Two derived rules:
 | MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`         |
 | MFEC      | ALE/MsPacman-v5  | `experiment=mfec/mspacman`      |
 | NEC       | ALE/Pong-v5      | `experiment=nec/pong`           |
+| NEC       | ALE/Hero-v5      | `experiment=nec/hero`           |
+| NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman`       |
 
 ## Main technologies
 
@@ -265,7 +267,9 @@ configs/
 │   ├── a2c.yaml            <- A2C HPs (HalfCheetah/MuJoCo defaults)
 │   ├── mfec_atari.yaml     <- MFEC HPs (Atari defaults; random projection, QEC)
 │   ├── nec.yaml            <- NEC HPs (base defaults; trainable CNN, DND)
-│   ├── nec_atari.yaml      <- NEC HPs (Atari defaults per Pritzel et al. 2017)
+│   ├── nec_atari.yaml      <- NEC HPs (Atari defaults per Pritzel et al. 2017 §4;
+│   │                          the paper has no hyperparameter table — several
+│   │                          values there were swept and never published)
 │   └── embedding_network/  <- NEC encoder config group (see "NEC embedding networks")
 │       ├── nature.yaml     <- NatureDQN trunk + dense layer (default)
 │       └── dinov2_finetune.yaml <- finetunable DINOv2 ViT (SCAFFOLDING, unvalidated)
@@ -301,8 +305,18 @@ configs/
     │   ├── mspacman.yaml   <- MFEC on Ms. Pac-Man (paper-faithful; 12.5M decisions = 50M frames)
     │   └── mspacman_vae.yaml <- same, with the paper-exact VAE encoder
     └── nec/
-        └── pong.yaml       <- NEC on Pong (40M frames)
+        ├── pong.yaml       <- NEC on Pong (40M raw frames)
+        ├── hero.yaml       <- NEC on H.E.R.O. (40M raw frames; unclipped rewards)
+        └── mspacman.yaml   <- NEC on Ms. Pac-Man (40M raw frames; unclipped rewards)
 ```
+
+> **Frames vs. agent steps.** Every count in these configs (`total_frames`,
+> `frames_per_batch`, `eval_every_n_steps`, `annealing_frames`) is in **agent
+> steps**, while the papers count **raw ALE frames**. With action repeat 4
+> (`gym_kwargs.frame_skip: 4`) the conversion is `raw = agent_steps * 4`, so
+> `total_frames: 10_000_100` is the paper's 40M-frame budget. Note that
+> `frame_skip` here *is* the ALE action repeat — TorchRL forwards it into
+> `gym.make(..., frameskip=N)` rather than stacking a second repeat on top.
 
 ### Override hierarchy
 

@@ -1,22 +1,40 @@
 # @package _global_
 # NEC on Atari H.E.R.O. (Pritzel et al. 2017).
-# Uses hero_train.yaml (no VecNorm) for the same reason as MFEC: the
-# exact-match dict keys the DND on quantised CNN embeddings; VecNorm changes
-# raw pixel values over time which would shift the embedding distribution and
-# impair the exact-match hit rate (though less severely than for MFEC, since
-# NEC's CNN is trainable and embeddings shift anyway as the network learns).
+#
+# Uses hero_nec_train.yaml, NOT hero_train.yaml: the latter applies
+# SignTransform, and the paper names H.E.R.O. explicitly among the games where
+# NEC's lack of reward clipping is what produces the result (§4). This config
+# pointed at hero_train until the mismatch was caught in review.
+#
+# Neither config uses VecNorm, for the same reason as MFEC: the exact-match dict
+# keys the DND on quantised CNN embeddings; VecNorm changes raw pixel values
+# over time which would shift the embedding distribution and impair the
+# exact-match hit rate (though less severely than for MFEC, since NEC's CNN is
+# trainable and embeddings shift anyway as the network learns).
 defaults:
   - override /algorithm: nec_atari
-  - override /environment: hero_train
+  - override /environment: hero_nec_train
   - override /environment@eval_environment: hero_eval
   - _self_
 
 trainer:
-  total_frames: 40_000_100
+  # Agent steps, not raw frames: with action-repeat 4 this is 40M raw ALE
+  # frames, matching the paper's x-axis. Was 40_000_100 until review, which
+  # would have been 160M raw frames — 4x the paper's budget.
+  total_frames: 10_000_100
   seed: 42
   accelerator: gpu
   devices: [0]
+  # WARNING — untested at this width for NEC, and H.E.R.O. is the heaviest
+  # case: 18 actions makes the DND key table 18 x 5e5 x 64 x 4 B = 2.3 GB.
+  # nec/mspacman.yaml documents an observed OOM at num_envs=16 on a 32 GB host
+  # (NEC adds a 100k-transition float32 replay buffer, ~11.3 GB preallocated,
+  # plus a per-env raw-pixel carry buffer) and drops to 8. If this run dies
+  # with `EOFError: proc <pid> failed, last command: step_and_maybe_reset`,
+  # that is the OOM killer taking a ParallelEnv worker — set num_envs: 8.
   num_envs: 16
   log_every_n_steps: 10_000
-  eval_every_n_steps: 200_000   # paper §4: "evaluate MFEC and NEC every 200,000 frames"
+  # 50_000 agent steps == every 200k raw frames, per paper §4 ("We evaluate
+  # MFEC and NEC every 200.000 frames").
+  eval_every_n_steps: 50_000
   num_eval_episodes: 5

@@ -357,7 +357,9 @@ configs/
                               NOTE §4.2's Labyrinth settings differ (k=50, gamma=0.99)
   algorithm/nec.yaml        — NEC HPs (base defaults); defaults-lists the
                               embedding_network config group + _partial_ replay_buffer
-  algorithm/nec_atari.yaml  — NEC HPs (Atari defaults per Pritzel et al. 2017 Table S1)
+  algorithm/nec_atari.yaml  — NEC HPs (Atari defaults per Pritzel et al. 2017 §4;
+                              the paper has NO hyperparameter table — see "NEC" below
+                              for which values it states vs. swept-and-unreported)
   algorithm/embedding_network/  — NEC encoder config group (swap with
                               `algorithm/embedding_network=<name>`)
     nature.yaml             — NatureDQN trunk + dense layer (DEFAULT; the paper's net)
@@ -377,6 +379,15 @@ configs/
   environment/mspacman_mfec_train.yaml — ALE/MsPacman-v5, paper-faithful MFEC stack: single frame,
                               no SignTransform, repeat_action_probability=0.0 (see "MFEC on Atari" below)
   environment/mspacman_mfec_eval.yaml  — eval counterpart (identical by design; nothing to strip)
+  environment/mspacman_nec_train.yaml — ALE/MsPacman-v5 for NEC: action-repeat 4, NO
+                              SignTransform (paper §4 names Ms. Pac-Man as a game where
+                              NEC's lack of reward clipping is what produces the result)
+  environment/mspacman_nec_eval.yaml  — eval counterpart (drops EndOfLife)
+  environment/hero_nec_train.yaml — ALE/Hero-v5 for NEC: same idea, NO SignTransform
+                              (paper §4 names H.E.R.O. in the same list). Use this rather
+                              than hero_train.yaml for any NEC H.E.R.O. run.
+  environment/hero_train.yaml     — ALE/Hero-v5 with SignTransform (MFEC / DQN)
+  environment/hero_eval.yaml      — ALE/Hero-v5 (eval transforms)
   environment/halfcheetah.yaml — HalfCheetah-v4 (DoubleToFloat + InitTracker)
   experiment/dqn/cartpole.yaml — composed CartPole experiment
   experiment/dqn/pong.yaml     — composed Atari Pong experiment
@@ -389,7 +400,13 @@ configs/
                               50M emulator frames = Figure 1's full x-range; num_envs=4)
   experiment/mfec/mspacman_vae.yaml — same, with encoder_name=vae + singleframe env
                               (vae_checkpoint is required, no default — see "Encoders" above)
-  experiment/nec/pong.yaml     — NEC on Pong (40M frames, num_envs=16)
+  experiment/nec/pong.yaml     — NEC on Pong (10M agent steps = 40M raw frames, num_envs=16);
+                              keeps the clipped env — Pong's rewards are already in [-1, 1]
+                              so SignTransform is a no-op there, not a deviation
+  experiment/nec/hero.yaml     — NEC on H.E.R.O. (10M agent steps = 40M raw frames);
+                              uses hero_nec_train (unclipped)
+  experiment/nec/mspacman.yaml — NEC on Ms. Pac-Man (10M agent steps = 40M raw frames,
+                              num_envs=8); uses mspacman_nec_train (unclipped)
   logger/{wandb,tensorboard}.yaml
   paths/default.yaml
   train.yaml, eval.yaml, train_vae.yaml
@@ -604,6 +621,60 @@ Two implementations:
 `NECAlgorithm` (Pritzel et al. 2017) differs from MFEC in two ways that
 require special care:
 
+### 0. Where NEC's hyperparameters actually come from
+
+The paper has **no hyperparameter table** — its only appendix is
+"A. Scores on Atari Games", and everything is prose in §4. Do not cite a
+"Table S1"; `configs/algorithm/nec_atari.yaml` used to and it was wrong.
+
+Stated in §4 (safe to cite): `k`/p = 50, `kernel_delta` δ = 1e-3,
+`n_step` N = 100, `dnd_capacity` 5e5 per action, replay buffer of the last
+1e5 states, `batch_size` 32, one replay update per **16 raw ALE frames**,
+`gamma` 0.99, action repeat 4, and no reward clipping.
+
+Explicitly **swept and never reported** (do not claim paper authority):
+the SGD learning rate (`lr`), the fast-update rate α (`dnd_lr`), the
+embedding dimensionality (`embedding_dim`), and the ε-greedy rate.
+
+Two deviations from §4 that are intentional but were undocumented until a
+review caught them: the paper uses **RMSProp**, this uses **Adam**; and the
+exact-match blend rule is **largely inert in practice** (see §5 below).
+
+### 0b. Frames are raw ALE frames; `frames_per_batch` is agent steps
+
+Every frame-denominated number in the paper counts **raw ALE frames** — the
+paper fixes this itself by noting 40M frames "corresponds to 185 hours of
+gameplay" (40e6 / 60fps = 185.2 h). Everything in this repo's configs
+(`total_frames`, `frames_per_batch`, `eval_every_n_steps`,
+`annealing_frames`, `init_random_frames`) counts **agent steps**. With
+action repeat 4 the conversion is `raw = agent_steps * 4`.
+
+`gym_kwargs.frame_skip` **is** the ALE action repeat. TorchRL does not stack
+a second repeat on top of ALE-v5's default: `GymEnv` forwards it into
+`gym.make(..., frameskip=N)` and sets `wrapper_frame_skip = 1`, only falling
+back to a wrapper-level repeat if `gym.make` *rejects* the kwarg (ALE-v5 does
+not). Check with `GymEnv("ALE/Pong-v5", frame_skip=4).wrapper_frame_skip`.
+
+`mspacman_nec_train.yaml` had `frame_skip: 1` on the mistaken belief that
+TorchRL stacked a second repeat — that ran Ms. Pac-Man with no action repeat
+at all and put every derived number out by 4x. All three
+`experiment/nec/*.yaml` now land on the paper's targets exactly: 40M raw
+frames total, eval every 200k raw frames, 1 update / 16 raw frames.
+
+### 0c. `EndOfLifeTransform` is INERT for NEC and MFEC
+
+It writes a separate `end-of-life` key and deliberately does **not** touch
+`done` ("isn't registered within the done_spec because it should not instruct
+the env to reset"). Nothing in `src/` reads that key, so life losses do not
+segment episodes for either episodic-control algorithm — episodes are whole
+games or `StepCounter` truncations. Several env-config comments claimed
+otherwise; the NEC ones are corrected. Making it real means segmenting on
+`end-of-life` in `NECAlgorithm.step()`, which is a behaviour change.
+
+`done == terminated | truncated` does hold, so NEC's truncation test
+(`not term_2d[env_idx, raw_end]` → bootstrap the tail from the DND) correctly
+identifies `StepCounter` cutoffs versus real game-overs.
+
 ### 1. DND `values` tensor is a plain (non-grad) tensor, NOT gradient-enabled
 
 The paper's §3.4 backpropagates into both the embedding network *and* the
@@ -645,6 +716,21 @@ Adam's per-slot state on eviction, or use a plain low-LR SGD step for
 optimizer's parameter list, that's the change that caused the original
 regression.
 
+### 5. The exact-match blend rule is largely inert in practice
+
+`write_batch` blends `Q_i ← Q_i + α(G − Q_i)` only on a bit-level hash match
+of the quantised 64-d embedding. The CNN takes `num_updates` (100–400) Adam
+steps between successive `step()` calls, so a state re-encountered in a later
+batch essentially never re-hashes to its stored key. Blends therefore only
+happen between duplicate frames embedded *within one* `step()` call, and the
+DND behaves close to an insert-only FIFO log — which also means the
+FIFO-vs-LRU deviation above matters more than it looks.
+
+`train/dnd_blend_rate` measures this directly; expect it near 0. This is a
+consequence of porting MFEC's exact-hash design onto a *moving* embedding.
+Making the rule fire would mean matching within a radius rather than exactly
+— a design change needing empirical validation, deliberately **not** done.
+
 ### 2. N-step returns (per-env, complete-episodes-only)
 
 NEC uses bootstrapped N-step returns:
@@ -666,7 +752,57 @@ n_step_G[:T - n_step] = where(valid, mc[:T - n_step] + correction, mc[:T - n_ste
 Bootstrapping uses the CURRENT DND state (written by previous episodes in
 the same batch, or prior batches).  The carry stores RAW observations (not
 pre-computed embeddings) so they are re-embedded with the current network
-at the start of each step() call.
+at the start of each step() call, via `NECAlgorithm._embed()` — the single
+place the L2 normalisation lives, chunked at `_EMBED_CHUNK` frames so a
+4500-step episode does not go through the CNN in one pass.
+
+`q_max` comes from `_max_finite_q()`, **not** a plain `.max(dim=-1)`.
+`DND.estimate_all` returns +inf for actions holding `<= k` entries, so a
+plain max lets a single under-populated action poison `max_a Q` for every
+state in the episode and silently drop the whole episode back to plain Monte
+Carlo, with no metric revealing it. On H.E.R.O. (18 actions, k=50) one rarely
+chosen action can sit below 51 entries for millions of frames once ε has
+annealed, which would disable N-step bootstrapping for an entire run.
+
+### 2a. Metrics: never report a skipped update as a zero
+
+`NECAlgorithm._gradient_step()` returns **`None`**, not `(0.0, 0.0)`, when it
+skips — replay buffer below `batch_size`, or every sampled action's DND table
+still at/below `k`. `step()` averages only the updates that actually ran and
+emits `train/q_loss` / `train/q_values` **only if there were any**, plus
+`train/updates` (how many of `num_updates` ran) on every batch.
+
+A skipped step is not a zero-loss step. Folding it in reported a
+`train/q_loss` of exactly 0.0, which reads as "converged" rather than "never
+ran" — and that is guaranteed for the first batches after *every* checkpoint
+resume, because the replay buffer is not checkpointed. Watch `train/updates`;
+if it sits below `num_updates`, the gradient path is starving.
+
+Also watch the *magnitude* of `train/q_loss`. Every replayed state was also
+written into `DND[a]` at episode end with a value equal to its own target, so
+it is its own nearest neighbour at distance ~0 (weight 1/δ = 1000) and `Q̂`
+reproduces the target almost exactly. A curve pinned around 1e-6 means the
+network is not being pushed anywhere. Inherent to the paper's design, not a
+defect in this implementation, but it makes the loss a poor progress signal.
+
+### 2b. `estimate_all` has no exact-match shortcut (unlike QEC)
+
+`DND.estimate_all` computes the kernel sum and nothing else. It does **not**
+consult `_key_to_slot` to short-circuit an exact re-encounter to its stored
+value, and does not special-case a near-zero nearest distance. `QEC` does
+both, because MFEC's Eq. (2) genuinely defines an exact hit as a separate
+case; NEC's Q is always the kernel sum.
+
+The reason this matters is `_gradient_step`: it cannot reproduce a shortcut
+(returning a stored constant kills the gradient), so any shortcut in
+`estimate_all` makes the network **act** under a different Q-function than
+the one it is **trained** on. Measured divergence when the shortcut was
+present: ~0.3% on exact hits. Do not re-add it. The kernel needs no
+shortcut — an exact re-encounter has distance 0 and therefore weight
+1/δ = 1000, already dominating every genuine neighbour.
+
+`_key_to_slot` / `_slot_to_key` remain write-path structures, used only by
+`write_batch`'s blend rule and ring-buffer eviction.
 
 ### 3. Embedding networks — a config group, and it is TRAINABLE
 
@@ -774,6 +910,30 @@ flow, Hydra-composition architecture regression, config-swap end-to-end).
    `TrainingState.extra` in `_get_training_state()` and restore it in
    `_load_training_state()` — the same way MFEC threads `extra["encoder_state"]`
    through for its frozen encoders.
+
+   Three checkpoint rules that are easy to get wrong (all were, and were
+   fixed after a review):
+
+   - **`greedy_state` must be saved.** `EGreedyModule` keeps the live ε in
+     its own buffer, which is *not* part of `embedding_net.state_dict()`.
+     Restoring `collected_frames` without it makes a resumed run restart
+     exploration at `eps_init` and re-anneal from scratch. Both NEC and MFEC
+     now save `extra["greedy_state"]`.
+   - **Re-pin the DND/QEC device on load.** `torch.load`'s `map_location`
+     does not rewrite the pickled `torch.device` inside `dnd_state`, so
+     `_load_training_state` overwrites `dnd_state["device"]` with
+     `self._buffer_device` before calling `__setstate__`. Without it a
+     checkpoint written on `cuda:0` rebuilds the DND on `cuda:0` regardless
+     of what the resuming run resolved to.
+   - **The replay buffer and `_carry` are deliberately NOT checkpointed.**
+     1e5 float32 pixel transitions is 11.3 GB, and `_carry` holds raw pixels
+     for the in-flight episode (up to 508 MB/env, ~4 GB across 8 envs).
+     Dropping `_carry` is nearly free: returns are computed *backwards* from
+     the episode end, so a partial episode starting mid-stream still yields
+     correct return-to-go for every step it contains — the cost is at most
+     `num_envs` partial episodes per process restart. Dropping the replay
+     buffer means the gradient path no-ops until it refills; `step()` reports
+     **`train/updates`** so that gap is visible.
 6. **Add tests** to `tests/test_nec_embedding_network.py` (shape/dtype,
    all-params-trainable, YAML composes + instantiates). If the network needs
    downloaded weights, monkeypatch the loader to a stub backbone so CI stays

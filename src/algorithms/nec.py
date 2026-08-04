@@ -89,6 +89,34 @@ insertion order), not LRU as §3.1 specifies — nothing updates recency on
 lookup. Since stored keys go stale as the CNN trains (they are never
 gradient-refreshed, see above), FIFO evicts the stalest keys first, which
 is a reasonable heuristic for this implementation.
+
+Two more deviations, both undocumented until they were caught in review:
+
+4. The paper uses **RMSProp** ("We used the RMSProp algorithm for gradient
+   descent training", §4); this uses Adam. Nothing here depends on that
+   choice, but it is not paper-faithful.
+5. The exact-match blend rule (a) above is **largely inert in practice**.
+   ``write_batch`` blends only on a bit-level hash match of the quantised
+   64-d embedding, and the CNN takes ``num_updates`` Adam steps between
+   successive ``step()`` calls, so a state re-encountered in a later batch
+   essentially never re-hashes to its stored key. Blends therefore only
+   happen between duplicate frames embedded within one ``step()`` call, and
+   the DND behaves close to an insert-only FIFO log. ``train/dnd_blend_rate``
+   measures this directly — expect it near 0. Making the blend rule fire
+   would mean matching within a radius rather than exactly, which is a
+   design change, not a bug fix, and is deliberately NOT done here.
+
+Where the paper's hyperparameters actually come from
+----------------------------------------------------
+Pritzel et al. (2017) has no hyperparameter table — its only appendix is
+"A. Scores on Atari Games". Everything is prose in §4. Stated there:
+p = 50 neighbours, δ = 10⁻³, N = 100, 5×10⁵ memories per action, replay
+buffer of the last 10⁵ states, minibatch 32, one replay update per 16
+observed frames, γ = 0.99, action repeat 4, and no reward clipping.
+Explicitly **swept and never reported**: the SGD learning rate, the
+fast-update rate α (``dnd_lr``), the embedding dimensionality, and the
+ε-greedy exploration rate. Config comments must not claim paper authority
+for those four.
 """
 
 from __future__ import annotations
@@ -114,13 +142,19 @@ from src.networks import NatureEmbedding
 # ---------------------------------------------------------------------------
 
 class DND:
-    """Differentiable Neural Dictionary — fused GPU tensors, grad-enabled values.
+    """Differentiable Neural Dictionary — fused GPU tensors, frozen values.
 
     Extends the QEC ring-buffer / exact-match-dict / chunked-kNN pattern from
-    mfec.py with one NEC-specific change:
+    mfec.py with two NEC-specific changes:
 
-    ``estimate_all()`` uses the inverse-distance kernel instead of a plain
-    average: w_i = 1 / (‖h − h_i‖² + δ).
+    1. ``estimate_all()`` uses the inverse-distance kernel instead of a plain
+       average: w_i = 1 / (‖h − h_i‖² + δ).
+    2. ``estimate_all()`` has **no exact-match shortcut** — the kernel sum is
+       the only Q definition, because ``NECAlgorithm._gradient_step`` has to
+       be able to reproduce it differentiably. ``_key_to_slot`` /
+       ``_slot_to_key`` are write-path structures here, used only by
+       ``write_batch``'s blend rule and ring-buffer eviction. See
+       ``estimate_all``'s docstring.
 
     ``values`` is a plain (no grad) tensor updated only by the in-place blend
     rule Q_i ← Q_i + α(G − Q_i).  The regression loss gradient reaches the
@@ -206,14 +240,31 @@ class DND:
     def estimate_all(self, queries: torch.Tensor) -> torch.Tensor:
         """Estimate Q(s, a) for all actions via kernel-weighted kNN lookup.
 
-        Per-query, per-action strategy:
-          1. Exact-match dict: O(1) — return stored value directly.
-          2. kNN + kernel weighting for queries not in the dict.
-          3. +∞ for actions with too few stored entries (optimistic init).
+        Implements the paper's Eq. (4)/(5) verbatim over the k nearest keys:
 
-        The kNN step is batched across all actions in a single
-        :meth:`knn_all_actions` call rather than looping over actions in
-        Python — see that method's docstring for why.
+            Q(s, a) = Σ_i w_i Q_i / Σ_i w_i,   w_i = 1 / (‖h − h_i‖² + δ)
+
+        Actions holding ``<= k`` entries return +∞ (optimistic init).
+
+        No exact-match shortcut
+        -----------------------
+        Unlike :meth:`QEC.estimate_all` in mfec.py, this does **not** consult
+        ``_key_to_slot`` to short-circuit an exact re-encounter to its stored
+        value, and does not special-case a near-zero nearest distance.  Those
+        shortcuts exist in QEC because MFEC's Eq. (2) genuinely defines an
+        exact hit as a separate case; NEC has no such case — its Q is always
+        the kernel sum.  More importantly, ``NECAlgorithm._gradient_step``
+        cannot reproduce a shortcut (returning a stored constant kills the
+        gradient), so any shortcut here would make the network act under a
+        different Q-function than the one it is regressed onto.  Measured
+        divergence when the shortcut was present: ~0.3% on exact hits.
+
+        The kernel needs no shortcut anyway: an exact re-encounter has
+        distance 0 and therefore weight 1/δ = 1000, which already dominates
+        every genuine neighbour (~1–2 on the unit sphere).
+
+        ``_key_to_slot`` remains a write-path structure, used by
+        :meth:`write_batch` for the blend rule.
 
         Parameters
         ----------
@@ -228,56 +279,31 @@ class DND:
         dev_q = queries.device
 
         max_size = max(self._sizes) if self._sizes else 0
-        if self.keys is None or max_size == 0:
+        # Nothing stored, or every action still at/below the kNN threshold:
+        # the answer is +inf everywhere, so skip the kNN sweep entirely.
+        # (QEC gets this early-out per action via `continue`; the batched
+        # kNN here can only take it for the whole table at once.)
+        if self.keys is None or max_size <= self.k:
             return torch.full((B, A), float("inf"), dtype=torch.float32, device=dev_q)
 
         if queries.device != self.device:
             queries = queries.to(self.device)
 
-        keys_b = self._make_keys(queries)
-
-        # --- Exact-match lookups (cheap CPU dict ops; unchanged) -----------
-        hit_mask = torch.zeros(A, B, dtype=torch.bool, device=self.device)
-        hit_vals = torch.zeros(A, B, dtype=torch.float32, device=self.device)
-        for a in range(A):
-            k_to_s = self._key_to_slot[a]
-            hit_b:    list[int] = []
-            hit_slots: list[int] = []
-            for b, key in enumerate(keys_b):
-                slot = k_to_s.get(key)
-                if slot is not None:
-                    hit_b.append(b)
-                    hit_slots.append(slot)
-            if hit_b:
-                hit_b_t = torch.tensor(hit_b,     dtype=torch.long, device=self.device)
-                hit_s_t = torch.tensor(hit_slots, dtype=torch.long, device=self.device)
-                hit_mask[a, hit_b_t] = True
-                hit_vals[a, hit_b_t] = self.values.data[a, hit_s_t].float()
-
-        # --- kNN, batched across ALL actions in one pass -------------------
-        # k+1: column 0 is the nearest neighbour (used for the near-exact
-        # check), columns 0..k-1 feed the kernel-weighted average.
-        dists, idx = self.knn_all_actions(queries, self.k + 1)  # (A, B, <=k+1)
-        cols  = dists.shape[-1]
-        k_use = min(self.k, cols)
+        dists, idx = self.knn_all_actions(queries, self.k)        # (A, B, k_use)
 
         a_idx    = torch.arange(A, device=self.device).view(A, 1, 1).expand_as(idx)
-        knn_vals = self.values.data[a_idx, idx].float()          # (A, B, cols)
+        knn_vals = self.values[a_idx, idx].float()                # (A, B, k_use)
 
-        near_exact = dists[..., 0] < 1e-5                        # (A, B)
-        dists_sq   = dists[..., :k_use] ** 2                     # (A, B, k_use)
-        weights    = 1.0 / (dists_sq + self.kernel_delta)
-        knn_q      = (weights * knn_vals[..., :k_use]).sum(-1) / weights.sum(-1)
-        exact_val  = knn_vals[..., 0]
+        weights = 1.0 / (dists ** 2 + self.kernel_delta)          # (A, B, k_use)
+        knn_q   = (weights * knn_vals).sum(-1) / weights.sum(-1)  # (A, B)
 
-        knn_result = torch.where(near_exact, exact_val, knn_q)   # (A, B)
-
+        # Sparse actions: their padded +inf distances make knn_q meaningless
+        # (possibly NaN when every slot is padding), so overwrite wholesale.
         sizes_t     = torch.tensor(self._sizes, device=self.device)
-        sparse_mask = (sizes_t <= self.k).view(A, 1)              # too sparse → +inf
+        sparse_mask = (sizes_t <= self.k).view(A, 1)
         result = torch.where(
-            sparse_mask, torch.full_like(knn_result, float("inf")), knn_result
+            sparse_mask, torch.full_like(knn_q, float("inf")), knn_q
         )
-        result = torch.where(hit_mask, hit_vals, result)          # exact hits always win
 
         return result.T.to(dev_q)  # (B, A)
 
@@ -310,6 +336,24 @@ class DND:
         sparse" actions (``size_a <= k``) themselves, exactly as with the
         per-action ``knn_action``.
 
+        Chunking
+        --------
+        Two levels, **queries outermost**.  The outer loop splits the query
+        set so one iteration's distance matrix fits ``_CHUNK_BYTES``; the
+        inner loop splits the key table only when even a single query chunk
+        still cannot fit.  The ordering is the point: with queries outermost
+        the inner loop runs exactly once for any realistic
+        (num_actions, capacity), which skips the cat/topk/gather merge
+        entirely.
+
+        The previous capacity-outermost version ran that merge once per
+        capacity chunk, and its byte budget counted only the ``cdist``
+        output.  The merge materialises ``(A, B, k_eff + chunk)`` in float32
+        *and* int64, so the true peak was 3-4x the budget: for the
+        episode-end bootstrap on H.E.R.O. (A=18, B≈4400, capacity=5e5) that
+        was 591 iterations of ~2.0 GB each, on top of the 2.3 GB key table
+        already resident on the same device.
+
         Parameters
         ----------
         queries : (B, d) float32 — same query set evaluated against every
@@ -333,39 +377,56 @@ class DND:
         max_size = int(sizes_t.max().item()) if self._sizes else 0
         k_eff    = min(k, max_size)
 
-        if k_eff <= 0:
+        if k_eff <= 0 or B == 0:
             return (
                 torch.full((A, B, 0), float("inf"), device=self.device),
                 torch.zeros((A, B, 0), dtype=torch.long, device=self.device),
             )
 
-        chunk_size = max(1, self._CHUNK_BYTES // (A * B * 4))
-        chunk_size = min(chunk_size, max_size)
+        out_d = torch.empty((A, B, k_eff), device=self.device)
+        out_i = torch.empty((A, B, k_eff), dtype=torch.long, device=self.device)
 
-        best_dists = torch.full((A, B, k_eff), float("inf"), device=self.device)
-        best_idx   = torch.zeros((A, B, k_eff), dtype=torch.long,  device=self.device)
+        # (A, 1, max_size): which slots hold a live entry, broadcast over queries.
+        slot_idx = torch.arange(max_size, device=self.device).view(1, 1, -1)
+        valid    = slot_idx < sizes_t.view(A, 1, 1)
 
-        q_exp = queries.unsqueeze(0).expand(A, B, d)
+        q_chunk = max(1, self._CHUNK_BYTES // (A * max_size * 4))
+        q_chunk = min(q_chunk, B)
 
-        for cs in range(0, max_size, chunk_size):
-            ce = min(cs + chunk_size, max_size)
-            cd = torch.cdist(q_exp, self.keys[:, cs:ce, :])       # (A, B, ce-cs)
+        for qs in range(0, B, q_chunk):
+            qe    = min(qs + q_chunk, B)
+            b     = qe - qs
+            q_exp = queries[qs:qe].unsqueeze(0).expand(A, b, d)
 
-            slot_idx = torch.arange(cs, ce, device=self.device).view(1, 1, -1)
-            valid    = slot_idx < sizes_t.view(A, 1, 1)
-            cd       = cd.masked_fill(~valid, float("inf"))
+            k_chunk = max(1, self._CHUNK_BYTES // (A * b * 4))
+            k_chunk = min(k_chunk, max_size)
 
-            ck = min(k_eff, ce - cs)
-            chd, chi = cd.topk(ck, dim=-1, largest=False)
-            chi = chi + cs
+            if k_chunk >= max_size:
+                # Common path: whole table in one shot, no merge.
+                cd = torch.cdist(q_exp, self.keys[:, :max_size, :])
+                cd = cd.masked_fill(~valid, float("inf"))
+                bd, bi = cd.topk(k_eff, dim=-1, largest=False)
+            else:
+                bd = torch.full((A, b, k_eff), float("inf"), device=self.device)
+                bi = torch.zeros((A, b, k_eff), dtype=torch.long, device=self.device)
+                for cs in range(0, max_size, k_chunk):
+                    ce = min(cs + k_chunk, max_size)
+                    cd = torch.cdist(q_exp, self.keys[:, cs:ce, :])
+                    cd = cd.masked_fill(~valid[..., cs:ce], float("inf"))
 
-            merged_d = torch.cat([best_dists, chd], dim=-1)
-            merged_i = torch.cat([best_idx,   chi], dim=-1)
-            _, keep  = merged_d.topk(k_eff, dim=-1, largest=False)
-            best_dists = merged_d.gather(-1, keep)
-            best_idx   = merged_i.gather(-1, keep)
+                    ck = min(k_eff, ce - cs)
+                    chd, chi = cd.topk(ck, dim=-1, largest=False)
+                    chi = chi + cs
 
-        return best_dists, best_idx
+                    merged_d = torch.cat([bd, chd], dim=-1)
+                    merged_i = torch.cat([bi, chi], dim=-1)
+                    bd, keep = merged_d.topk(k_eff, dim=-1, largest=False)
+                    bi = merged_i.gather(-1, keep)
+
+            out_d[:, qs:qe] = bd
+            out_i[:, qs:qe] = bi
+
+        return out_d, out_i
 
     # ------------------------------------------------------------------
     # kNN for a single action (identical to QEC.knn_action) — used by
@@ -395,8 +456,22 @@ class DND:
             queries = queries.to(self.device)
 
         m = queries.shape[0]
-        d = queries.shape[1]
-        chunk_size = max(1, self._CHUNK_BYTES // (m * d * 4))
+
+        # An empty table (or query set) has no neighbours to return.  Without
+        # this, `chunk_size` collapses to 0 below and the loop raises
+        # `ValueError: range() arg 3 must not be zero`.  Every current caller
+        # gates on `_sizes[a] > k` first, but this is a public method.
+        if k_eff <= 0 or m == 0:
+            return (
+                torch.full((m, 0), float("inf"), device=self.device),
+                torch.zeros((m, 0), dtype=torch.long, device=self.device),
+            )
+
+        # Bytes per stored slot: the (m, chunk) cdist output plus the
+        # cat/topk/gather merge, which holds (m, k_eff + chunk) in float32 and
+        # int64.  (QEC's formula divides by the embedding dim instead, which is
+        # unrelated to the allocation size — conservative in practice, but wrong.)
+        chunk_size = max(1, self._CHUNK_BYTES // (m * (4 + 4 + 8)))
         chunk_size = min(chunk_size, size)
 
         best_dists = torch.full((m, k_eff), float("inf"), device=self.device)
@@ -411,8 +486,7 @@ class DND:
 
             merged_d = torch.cat([best_dists, chd], dim=1)
             merged_i = torch.cat([best_idx,   chi], dim=1)
-            _, keep  = merged_d.topk(k_eff, dim=1, largest=False)
-            best_dists = merged_d.gather(1, keep)
+            best_dists, keep = merged_d.topk(k_eff, dim=1, largest=False)
             best_idx   = merged_i.gather(1, keep)
 
         return best_dists, best_idx
@@ -729,7 +803,7 @@ def _compute_n_step_returns(
     tail_boot = np.zeros(T, dtype=np.float64)
     if final_state is not None:
         with torch.no_grad():
-            q_T = dnd.estimate_all(final_state.to(dnd.device)).max().item()
+            q_T = _max_finite_q(dnd.estimate_all(final_state.to(dnd.device)))[0]
         if np.isfinite(q_T):
             t_idx = np.arange(max(0, T - n_step), T)
             tail_boot[t_idx] = (gamma ** (T - t_idx)) * q_T
@@ -739,17 +813,43 @@ def _compute_n_step_returns(
 
     boot_states = states[n_step:].to(dnd.device)      # (T-n_step, d)
     with torch.no_grad():
-        q_all  = dnd.estimate_all(boot_states)         # (T-n_step, A) float32
-        q_max  = q_all.max(dim=-1).values.cpu().numpy().astype(np.float64)
+        q_all        = dnd.estimate_all(boot_states)   # (T-n_step, A) float32
+        q_max, valid = _max_finite_q(q_all)
 
     gamma_n = float(gamma ** n_step)
     n_step_G = mc.copy()
-    valid    = ~np.isinf(q_max)
     correction = gamma_n * (q_max - mc[n_step:])
     n_step_G[:T - n_step] = np.where(
         valid, mc[:T - n_step] + correction, mc[:T - n_step]
     )
     return n_step_G + tail_boot
+
+
+def _max_finite_q(q_all: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+    """``max_a Q(s, a)`` over the actions whose DND table is populated.
+
+    ``DND.estimate_all`` returns +inf for actions holding ``<= k`` entries
+    (optimistic initialisation).  A plain ``.max(dim=-1)`` therefore lets a
+    SINGLE under-populated action poison ``max_a Q`` for *every* state in the
+    episode, silently dropping the whole episode back to plain Monte Carlo —
+    with no metric revealing it.  On H.E.R.O. (18 actions, k=50) one rarely
+    chosen action can sit below 51 entries for millions of frames once epsilon
+    has annealed, which would disable N-step bootstrapping for the entire run.
+
+    Masking the sentinels lets the bootstrap use the actions that do have
+    enough data; only a state with no usable action at all falls back to MC.
+
+    Returns
+    -------
+    (q_max, valid) — float64 ``(B,)`` maxima (0.0 where unusable) and a bool
+    ``(B,)`` mask of rows with at least one populated action.
+    """
+    finite = torch.isfinite(q_all)
+    q_max  = (q_all.masked_fill(~finite, float("-inf"))
+              .max(dim=-1).values.cpu().numpy().astype(np.float64))
+    valid  = finite.any(dim=-1).cpu().numpy()
+    # -inf would propagate through the (discarded) invalid branch of np.where.
+    return np.where(valid, q_max, 0.0), valid
 
 
 # ---------------------------------------------------------------------------
@@ -905,6 +1005,40 @@ class NECAlgorithm(BaseAlgorithm):
         self._carry: list[dict | None] = [None] * self._num_envs
 
     # ------------------------------------------------------------------
+    # Embedding helper
+    # ------------------------------------------------------------------
+
+    #: Frames per forward pass in :meth:`_embed`.  Bounds peak activation
+    #: memory independently of how long the episode being embedded is.
+    _EMBED_CHUNK = 256
+
+    @torch.no_grad()
+    def _embed(self, obs: torch.Tensor, out_device: torch.device) -> torch.Tensor:
+        """Embed ``(N, *obs_shape)`` observations, L2-normalised, in chunks.
+
+        Every DND read and write goes through here, so the unit-norm
+        projection lives in exactly one place (``tests/test_nec_kernel_scale.py``
+        explains why it must never be skipped: without it the inverse-distance
+        kernel is dominated by ``kernel_delta`` and collapses).
+
+        Chunked because a completed episode arrives in a single call and can
+        be as long as ``StepCounter``'s ``max_steps`` — 4500 on the Atari
+        configs.  One un-chunked pass over 4500 x 4 x 84 x 84 float32 frames
+        costs ~0.5 GB of input plus ~0.5 GB of conv activations, on top of a
+        DND key table that is already 1-2 GB on the same device.
+        """
+        n = obs.shape[0]
+        if n == 0:
+            return torch.empty(0, self.embedding_dim, device=out_device)
+
+        parts: list[torch.Tensor] = []
+        for i in range(0, n, self._EMBED_CHUNK):
+            block = obs[i: i + self._EMBED_CHUNK].to(self.device).float()
+            h = self.embedding_net(block)
+            parts.append(nn.functional.normalize(h, dim=-1).to(out_device))
+        return torch.cat(parts, dim=0)
+
+    # ------------------------------------------------------------------
     # Training step
     # ------------------------------------------------------------------
 
@@ -998,12 +1132,9 @@ class NECAlgorithm(BaseAlgorithm):
             last = int(ends[-1])
 
             # Embed the complete portion with the current network
-            obs_complete = obs_e[:last + 1].to(self.device).float()  # (T_c, *obs)
-            with torch.no_grad():
-                h_complete = self.embedding_net(
-                    obs_complete.reshape(last + 1, *obs_shape)
-                ).to(dev)                                          # (T_c, d)
-                h_complete = nn.functional.normalize(h_complete, dim=-1)  # unit-norm per paper §2
+            h_complete = self._embed(
+                obs_e[:last + 1].reshape(last + 1, *obs_shape), dev
+            )                                                      # (T_c, d)
 
             # Process each complete episode individually
             ep_start = 0
@@ -1017,12 +1148,9 @@ class NECAlgorithm(BaseAlgorithm):
                     # terminal: bootstrap the return tail from the state
                     # after the cutoff instead of assuming zero future
                     # reward.  True terminals keep h_final=None.
-                    nxt = (next_obs_2d[env_idx, raw_end]
-                           .reshape(1, *obs_shape).to(self.device).float())
-                    with torch.no_grad():
-                        h_final = nn.functional.normalize(
-                            self.embedding_net(nxt), dim=-1
-                        ).to(dev)
+                    h_final = self._embed(
+                        next_obs_2d[env_idx, raw_end].reshape(1, *obs_shape), dev
+                    )
 
                 r_ep = rewards_e[ep_start: ep_end + 1]             # (L,) f64
                 h_ep = h_complete[ep_start: ep_end + 1]            # (L, d)
@@ -1107,20 +1235,31 @@ class NECAlgorithm(BaseAlgorithm):
             return base_metrics
 
         # --- Gradient steps ------------------------------------------------
-        losses  = torch.zeros(self.num_updates, device=self.device)
-        q_vals  = torch.zeros(self.num_updates, device=self.device)
-        for j in range(self.num_updates):
-            loss_val, mean_q = self._gradient_step()
-            losses[j] = loss_val
-            q_vals[j]  = mean_q
+        # Only updates that actually ran are averaged.  `_gradient_step`
+        # returns None when it skipped (replay buffer below batch_size, or
+        # every sampled action's DND table still too sparse); folding those in
+        # as 0.0 would report a fabricated `train/q_loss` of exactly 0.0,
+        # which reads as "converged" rather than "never ran".  That is not
+        # hypothetical: the replay buffer is NOT checkpointed (see
+        # `_load_training_state`), so the first batches after every resume
+        # skip every single update.
+        losses: list[float] = []
+        q_vals: list[float] = []
+        for _ in range(self.num_updates):
+            result = self._gradient_step()
+            if result is None:
+                continue
+            loss_val, mean_q = result
+            losses.append(loss_val)
+            q_vals.append(mean_q)
 
-        return {
-            **base_metrics,
-            "train/q_loss":   losses.mean().item(),
-            "train/q_values": q_vals.mean().item(),
-        }
+        metrics = {**base_metrics, "train/updates": float(len(losses))}
+        if losses:
+            metrics["train/q_loss"]   = float(np.mean(losses))
+            metrics["train/q_values"] = float(np.mean(q_vals))
+        return metrics
 
-    def _gradient_step(self) -> tuple[float, float]:
+    def _gradient_step(self) -> tuple[float, float] | None:
         """One minibatch gradient update on the embedding network.
 
         Samples (obs, action, n_step_return) from the replay buffer, re-embeds
@@ -1133,12 +1272,27 @@ class NECAlgorithm(BaseAlgorithm):
         DND values Q_i are frozen constants here; they are updated separately
         by the in-place blend rule in step().
 
+        Known weakness (inherent to the paper's design, not a bug here): every
+        state sampled from the replay buffer was ALSO written into DND[a] at
+        episode end with a value equal to its own target.  That entry is then
+        the query's own nearest neighbour at distance ~0, i.e. weight
+        1/δ = 1000 against ~1-2 for genuine neighbours, so Q̂ reproduces the
+        target almost exactly and the loss is tiny (measured ~2e-06 on a
+        synthetic fixture).  Real learning signal only appears once the CNN
+        has drifted enough, or the entry has been evicted, to break the
+        self-match.  Watch the magnitude of ``train/q_loss``: a curve pinned
+        around 1e-6 means the network is not actually being pushed anywhere.
+
         Returns
         -------
-        (loss, mean_q) — scalar MSE loss and mean kernel-weighted Q-estimate
+        ``(loss, mean_q)`` for an update that actually ran, or ``None`` when
+        this step was skipped — replay buffer below ``batch_size``, or every
+        sampled action's DND table still at/below ``k`` entries.  ``None``
+        rather than ``(0.0, 0.0)``: a skipped step is not a zero-loss step,
+        and ``step()`` must not average it into ``train/q_loss``.
         """
         if len(self.replay_buffer) < self.batch_size:
-            return 0.0, 0.0
+            return None
 
         sample  = self.replay_buffer.sample(self.batch_size)
         obs     = sample[self.obs_key].to(self.device).float()
@@ -1197,7 +1351,7 @@ class NECAlgorithm(BaseAlgorithm):
             target_parts.append(t_a)
 
         if not q_hat_parts:
-            return 0.0, 0.0
+            return None
 
         q_hat  = torch.cat(q_hat_parts)
         tgt    = torch.cat(target_parts)
@@ -1239,6 +1393,23 @@ class NECAlgorithm(BaseAlgorithm):
     # ------------------------------------------------------------------
 
     def _get_training_state(self) -> TrainingState:
+        """Snapshot everything that is not cheaply recomputable.
+
+        NOT checkpointed, deliberately:
+
+        * **The replay buffer.**  1e5 float32 pixel transitions is 11.3 GB;
+          writing that on every checkpoint is not viable.  On resume the
+          gradient path therefore no-ops until the buffer refills — `step()`
+          reports `train/updates` so that gap is visible rather than
+          masquerading as a zero loss.
+        * **The per-env `_carry`.**  It holds RAW pixels for the in-flight
+          episode (up to `StepCounter.max_steps` = 4500 frames = 508 MB per
+          env; ~4 GB across 8 envs), and it is the one piece of state whose
+          loss is nearly free: returns are computed backwards from the episode
+          end, so a partial episode that starts mid-stream still yields
+          correct return-to-go for every step it contains.  Dropping it costs
+          at most `num_envs` partial episodes per process restart.
+        """
         return TrainingState(
             step=0,
             policy_state_dict=self.embedding_net.state_dict(),
@@ -1246,47 +1417,37 @@ class NECAlgorithm(BaseAlgorithm):
             extra={
                 "dnd_state":        self.dnd.__getstate__(),
                 "collected_frames": self._collected_frames,
-                "carry":            self._serialise_carry(),
+                # EGreedyModule keeps the live epsilon in its own buffer, which
+                # is NOT part of embedding_net.state_dict().  Without this a
+                # resumed run silently restarts exploration at eps_init and
+                # re-anneals from scratch, even though _collected_frames says
+                # the anneal finished millions of frames ago.
+                "greedy_state":     self.greedy_module.state_dict(),
             },
         )
 
     def _load_training_state(self, state: TrainingState) -> None:
         self.embedding_net.load_state_dict(state.policy_state_dict)
-        self.dnd.__setstate__(state.extra["dnd_state"])
+
+        # torch.load's map_location does not rewrite the pickled torch.device
+        # inside dnd_state, so a checkpoint written on cuda:0 would rebuild the
+        # DND on cuda:0 regardless of what this run resolved to (a hard failure
+        # on a CPU-only host, a silent cross-device copy on a different GPU).
+        # Re-pin to the device this algorithm actually owns.
+        dnd_state = dict(state.extra["dnd_state"])
+        dnd_state["device"] = self._buffer_device
+        self.dnd.__setstate__(dnd_state)
+
         self.optimizer = torch.optim.Adam(
             self.embedding_net.parameters(),
             lr=self.lr,
         )
         self.optimizer.load_state_dict(state.optimizer_state_dict)
         self._collected_frames = int(state.extra["collected_frames"])
-        if "carry" in state.extra:
-            self._deserialise_carry(state.extra["carry"])
-        else:
-            self._carry = [None] * self._num_envs
 
-    def _serialise_carry(self) -> list:
-        out = []
-        for c in self._carry:
-            if c is None:
-                out.append(None)
-            else:
-                out.append({
-                    "obs":     c["obs"].cpu().numpy(),
-                    "rewards": c["rewards"],
-                    "dones":   c["dones"],
-                    "actions": c["actions"].cpu().numpy().astype(np.int64),
-                })
-        return out
+        greedy_state = state.extra.get("greedy_state")
+        if greedy_state is not None:
+            self.greedy_module.load_state_dict(greedy_state)
 
-    def _deserialise_carry(self, data: list) -> None:
-        self._carry = []
-        for c in data:
-            if c is None:
-                self._carry.append(None)
-            else:
-                self._carry.append({
-                    "obs":     torch.from_numpy(c["obs"]),
-                    "rewards": c["rewards"],
-                    "dones":   c["dones"],
-                    "actions": torch.from_numpy(c["actions"]).long().to(self._buffer_device),
-                })
+        # See _get_training_state: the carry is intentionally not persisted.
+        self._carry = [None] * self._num_envs

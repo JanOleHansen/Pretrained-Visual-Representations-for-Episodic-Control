@@ -488,13 +488,29 @@ class MFECAlgorithm(BaseAlgorithm):
                 "qec_state":        self.qec.__getstate__(),
                 "collected_frames": self._collected_frames,
                 "carry":            self._serialise_carry(),
+                # EGreedyModule keeps the live epsilon in its own buffer, and
+                # MFEC has no policy_state_dict to carry it.  Without this a
+                # resumed run silently restarts exploration at eps_init and
+                # re-anneals from scratch, even though _collected_frames says
+                # the anneal finished long ago.
+                "greedy_state":     self.greedy_module.state_dict(),
             },
         )
 
     def _load_training_state(self, state: TrainingState) -> None:
         self.encoder.load_state(state.extra["encoder_state"])
         self._collected_frames = int(state.extra["collected_frames"])
-        self.qec.__setstate__(state.extra["qec_state"])
+
+        # QEC's device is pickled inside qec_state and torch.load's
+        # map_location does not rewrite it; re-pin to the device this run owns.
+        qec_state = dict(state.extra["qec_state"])
+        qec_state["device"] = self._buffer_device
+        self.qec.__setstate__(qec_state)
+
+        greedy_state = state.extra.get("greedy_state")
+        if greedy_state is not None:
+            self.greedy_module.load_state_dict(greedy_state)
+
         if "carry" in state.extra:
             self._deserialise_carry(state.extra["carry"])
         else:
@@ -792,6 +808,17 @@ class QEC:
 
         m = queries.shape[0]
         d = queries.shape[1]
+
+        # An empty buffer (or query set) has no neighbours to return.  Without
+        # this, chunk_size collapses to 0 below and the loop raises
+        # `ValueError: range() arg 3 must not be zero`.  estimate_all() gates
+        # on `size_a > self.k` first, but this is a public method.
+        if k_eff <= 0 or m == 0:
+            return (
+                torch.full((m, 0), float("inf"), device=self.device),
+                torch.zeros((m, 0), dtype=torch.long, device=self.device),
+            )
+
         chunk_size = max(1, self._CHUNK_BYTES // (m * d * 4))
         chunk_size = min(chunk_size, size)
 
