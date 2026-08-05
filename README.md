@@ -341,6 +341,25 @@ python src/train.py experiment=dqn/cartpole 'logger=[tensorboard]'
 python src/train.py experiment=dqn/cartpole logger=[]
 ```
 
+### Training metrics are interval means
+
+`train/episode_reward`, `train/episode_length` and `train/q_values` are
+averaged over **every** episode finished since the previous logging boundary,
+not over the single batch that happened to cross it. `train/episodes_completed`
+reports how many episodes each point averages over.
+
+This matters whenever `log_every_n_steps` is much larger than
+`frames_per_batch`: at 10,000 vs. 1,024 a single batch contains only ~1-2
+finished Ms. Pac-Man episodes, so a per-batch mean is a 1-2 sample estimate of
+a quantity with several hundred points of spread — and it throws away ~90% of
+the episodes played. If an interval finished no episodes, nothing is emitted
+for it (a real gap in the chart) rather than a stale or zero value.
+
+`train/q_values` drops executed-action values above 1e8, which are
+optimistic-initialisation sentinels from episodic-control policies (MFEC/NEC
+substitute ~1e9 for state-actions their memory cannot yet evaluate) rather than
+real returns.
+
 ## Callbacks
 
 The trainer fires events at key points:
@@ -387,6 +406,17 @@ The remaining Atari MFEC experiments (`pong`, `breakout`, `qbert`) still use
 the DQN-style env configs and have **not** been given the same treatment; they
 pick up the corrected `gamma`/`eps` defaults from `mfec_atari.yaml` but still
 clip rewards, stack 4 frames and run with sticky actions.
+
+**Optimistic initialisation is tie-broken randomly.** The QEC reports `+inf`
+for any action with `<= k` stored entries so untried actions are always
+preferred. `QECPolicy.forward` turns those into a large finite value *plus
+independent random jitter*, because argmax breaks exact ties by lowest index:
+with one shared constant the agent played a single fixed action for whole
+episodes (action 0 for 499/500 states on an empty QEC, then action 1 once
+action 0 filled) and seeded the memory with degenerate single-action
+trajectories. Real Q-values are never perturbed, so a populated QEC evaluates
+deterministically. See "Optimistic init must be tie-broken RANDOMLY" in
+AGENTS.md.
 
 ## MFEC encoders
 

@@ -270,7 +270,13 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--frames", type=int, default=150,
-                   help="frames to sample (default 150)")
+                   help="frames to sample (default 150). Must comfortably "
+                        "exceed --far or the adjacency AUC has no negative "
+                        "pairs to score against.")
+    p.add_argument("--near", type=int, default=2,
+                   help="|i-j| <= near counts as the same game state (default 2)")
+    p.add_argument("--far", type=int, default=50,
+                   help="|i-j| >= far counts as unrelated (default 50)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--key-scale", type=float, default=1e5,
                    help="must match algorithm.key_scale (default 1e5)")
@@ -287,6 +293,14 @@ def main() -> int:
                         "shape-dependent-kernel effect and does not reproduce "
                         "on CPU, where reduction order is stable.")
     args = p.parse_args()
+
+    if args.frames < args.far * 2:
+        p.error(
+            f"--frames {args.frames} is too small for --far {args.far}: the "
+            f"adjacency AUC needs pairs at least {args.far} apart, and with so "
+            "few frames there are none (or too few to mean anything). Use "
+            f"--frames >= {args.far * 2}, or lower --far."
+        )
 
     dev = torch.device(args.device)
     print(f"[device ] embedding on {dev}\n")
@@ -314,7 +328,7 @@ def main() -> int:
             "dim": emb.shape[-1],
             "key_batch_single": bs,
             "key_repeat": rp,
-            "auc": adjacency_auc(emb),
+            "auc": adjacency_auc(emb, near=args.near, far=args.far),
             **g,
         })
 
@@ -344,11 +358,21 @@ def main() -> int:
             bad = True
             print(f"  FAIL  {r['label']}: not run-to-run deterministic "
                   f"({r['key_repeat']:.3f}); violates src/encoders/base.py.")
-        if r["auc"] == r["auc"] and r["auc"] < 0.65:
+        if r["auc"] != r["auc"]:          # NaN
+            bad = True
+            print(f"  ERROR {r['label']}: adjacency AUC could not be computed "
+                  "(no valid pairs).\n        This row measured NOTHING — do not "
+                  "read the other columns as a pass.")
+        elif r["auc"] < 0.65:
             bad = True
             print(f"  WEAK  {r['label']}: adjacency AUC {r['auc']:.3f} — φ barely\n"
                   "        separates near-identical game states from unrelated ones,\n"
                   "        so the kNN average is close to state-independent.")
+        if r["rel_contrast"] > 0.999:
+            print(f"  NOTE  {r['label']}: relative contrast {r['rel_contrast']:.3f} "
+                  "means the\n        nearest neighbour sits at ~zero distance, i.e. the "
+                  "sample contains\n        duplicate frames. Expected on Atari (idle "
+                  "frames); it makes this\n        one column uninformative, not wrong.")
     if not bad:
         print("  All encoders pass key stability and show usable discriminability.")
     return 0

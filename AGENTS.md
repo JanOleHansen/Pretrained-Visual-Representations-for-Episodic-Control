@@ -153,12 +153,32 @@ def step(self, batch: TensorDict) -> dict[str, float]:
 ```
 
 The trainer never touches the replay buffer, target network or epsilon — those are
-algorithm internals. Per-batch metrics (`train/episode_reward`,
-`train/episode_length`, `train/q_values`) and timing (`time/collect`,
-`time/step`, `time/speed`) are computed by `StepTrainer` from the collector
-batch and merged into the algorithm's metrics dict at logging boundaries.
-This mirrors the torchrl SOTA DQN reference and keeps batch-level bookkeeping
-out of the algorithm.
+algorithm internals. Episode metrics (`train/episode_reward`,
+`train/episode_length`, `train/episodes_completed`, `train/q_values`) and timing
+(`time/collect`, `time/step`, `time/speed`) are computed by `StepTrainer` from
+the collector batches and merged into the algorithm's metrics dict at logging
+boundaries, keeping batch-level bookkeeping out of the algorithm.
+
+**Episode metrics are interval means, not per-batch samples.**
+`StepTrainer._IntervalStats.update()` runs on *every* collector batch;
+`flush()` runs only on a logging boundary, returns the mean over the whole
+interval, and resets. This is not cosmetic: with `frames_per_batch=1024` and
+`log_every_n_steps=10_000`, measuring only the boundary-crossing batch (as the
+old `_batch_metrics` did) discarded ~90% of finished episodes and left ~1-2
+Ms. Pac-Man episodes behind each logged point — a 1-2 sample estimate of a
+quantity with several hundred points of per-episode spread, which reads as pure
+noise. `train/episodes_completed` exposes the sample size behind each point.
+
+Two consequences worth knowing:
+- An interval in which **no** episode finished emits no `train/episode_reward`
+  at all (a genuine gap), never a stale or zero value.
+- `train/q_values` excludes executed-action values above
+  `StepTrainer._OPTIMISTIC_Q_THRESHOLD` (1e8). Episodic-control policies
+  substitute ~1e9 for state-actions their memory cannot evaluate, and averaging
+  those in makes the metric read 1e9 for the whole warm-up. An algorithm that
+  reports its own `train/q_values` from `step()` still wins (`setdefault`).
+
+Guarded by `tests/test_interval_metrics.py`.
 
 ### On-policy variant (A2C)
 
@@ -592,6 +612,38 @@ Embedding is chunked by a **byte budget** (`_EMBED_CHUNK_BYTES`), not by
 `frames_per_batch // num_envs` forward passes at batch size `num_envs` — free
 for a random-projection matmul, but for a ViT it leaves the GPU idle and pays
 that many times the launch overhead.
+
+### Optimistic init must be tie-broken RANDOMLY
+
+`QEC.estimate_all` returns `+inf` for actions whose buffer holds `<= k`
+entries, so untried actions are always preferred (Blundell et al. 2016 §2).
+`QECPolicy.forward` converts those sentinels to a finite value — `QValueActor`
+cannot argmax over `inf` — as
+`QECPolicy.OPTIMISTIC_VALUE + U(0, QECPolicy.OPTIMISTIC_JITTER)`, drawn
+independently per `(state, action)`.
+
+The jitter is load-bearing. Mapping every `+inf` onto one constant makes the
+untried actions **exact ties**, and argmax resolves ties by lowest index.
+Measured on a 9-action Ms. Pac-Man spec: an empty QEC emitted action 0 for
+499/500 states; once action 0's buffer passed `k`, action 1 for 499/500. The
+agent played one fixed action per episode, cycling 0..8, and seeded the QEC
+with 9 degenerate single-action trajectories whose max-returns then persist
+forever (Eq. 1 never decreases). Guarded by
+`tests/test_mfec_optimistic_tiebreak.py`.
+
+Constraints if you touch this:
+- **The jitter cannot be small.** `q_values` is float32 and the ULP at 1e9 is
+  64.0, so `uniform(0, 1)` jitter rounds straight back to exactly 1e9 and
+  restores the tie. `OPTIMISTIC_JITTER` is 1e6.
+- **`OPTIMISTIC_VALUE` must exceed any achievable return** (unclipped
+  Ms. Pac-Man tops out ~3e4) or a real Q-value would outrank an untried action.
+- **Only the `+inf` path is perturbed.** Finite estimates pass through
+  `torch.where` untouched, so a QEC that has information about a state is
+  exactly as deterministic as before — the guarantee that matters for eval.
+  The draw uses the global torch RNG, so seeded runs stay reproducible.
+- `NECPolicy` (`src/algorithms/nec.py`) still has the un-jittered
+  `torch.where(isinf, 1e9, ...)` form and the same latent defect. It has not
+  been changed, because the failure was only confirmed experimentally for MFEC.
 
 Contract (`Encoder`):
 - `embed(obs) -> (B, d) float32` on `obs.device`; **must be deterministic**

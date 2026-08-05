@@ -640,7 +640,45 @@ class QECPolicy(nn.Module):
     step earlier in the policy chain so the result can be reused by ``step()``.
     ``encoder`` is still held (and still shared on deepcopy) so ``embed()``
     remains available as a convenience for tests and offline analysis.
+
+    Optimistic initialisation
+    -------------------------
+    ``QEC.estimate_all`` returns ``+inf`` for any action whose buffer holds
+    ``<= k`` entries, so untried actions are always preferred (Blundell et al.
+    2016 §2).  ``forward`` maps those sentinels onto a large finite value —
+    ``QValueActor`` cannot argmax over ``inf`` — **plus independent uniform
+    jitter per (state, action)**.
+
+    The jitter is load-bearing, not cosmetic.  Mapping every ``+inf`` onto a
+    single constant makes all untried actions exact ties, and ``argmax``
+    resolves ties by *lowest index*: with an empty QEC the policy emitted
+    action 0 for essentially every state, then action 1 once action 0's buffer
+    passed ``k``, and so on.  The agent played one fixed action per episode,
+    cycling 0..A-1, and seeded the QEC with A degenerate single-action
+    trajectories whose max-returns then persist forever (Eq. 1 never
+    decreases).  Jitter makes the argmax uniform over the untried set instead.
+
+    Finite estimates are never perturbed, so a QEC that has real information
+    about a state is exactly as deterministic as before — which is the
+    guarantee that matters for evaluation.  The jitter draws from the global
+    torch RNG, so seeded runs stay reproducible.
     """
+
+    #: Finite stand-in for the ``+inf`` optimistic estimate.  Must exceed any
+    #: achievable Monte-Carlo return so an untried action always wins the
+    #: argmax against a real Q-value (unclipped Ms. Pac-Man tops out ~3e4).
+    OPTIMISTIC_VALUE = 1e9
+
+    #: Width of the uniform jitter added to each optimistic entry.
+    #:
+    #: This cannot be made small.  ``q_values`` is float32, where the ULP at
+    #: 1e9 is 64.0 — jitter drawn from ``uniform(0, 1)`` would round straight
+    #: back to exactly 1e9 and restore the very tie it is meant to break.
+    #: 1e6 leaves ~15k distinct representable values per entry while keeping
+    #: every optimistic entry (<= 1.001e9) far above any real return, and far
+    #: above the sentinel threshold the trainer uses to keep these values out
+    #: of ``train/q_values``.
+    OPTIMISTIC_JITTER = 1e6
 
     def __init__(self, qec, encoder, num_actions):
         super().__init__()
@@ -665,11 +703,19 @@ class QECPolicy(nn.Module):
         leading = states.shape[:-1]
         flat = states.reshape(-1, states.shape[-1])
         q_values = self.qec.estimate_all(flat)
-        q_values = torch.where(
-            torch.isinf(q_values),
-            torch.full_like(q_values, 1e9),
-            q_values,
-        )
+
+        # Optimistic entries -> large finite value + per-entry jitter, so the
+        # downstream argmax picks uniformly among untried actions rather than
+        # always returning the lowest index.  See the class docstring.
+        optimistic = torch.isposinf(q_values)
+        if optimistic.any():
+            jitter = torch.rand_like(q_values) * self.OPTIMISTIC_JITTER
+            q_values = torch.where(
+                optimistic,
+                self.OPTIMISTIC_VALUE + jitter,
+                q_values,          # finite estimates pass through untouched
+            )
+
         if leading:
             return q_values.reshape(*leading, self.num_actions)
         return q_values.squeeze(0) if q_values.shape[0] == 1 else q_values
