@@ -44,15 +44,21 @@ k: 50                    # (paper §4) "we set the number of nearest neighbours
                          # p = 50 in all our experiments"
 kernel_delta: 1.0e-3     # (paper §4, Eq. 5) "we set δ = 10^-3"
 dnd_lr: 0.1              # (swept, unreported) — §4's "fast-update learning-rate α"
+# Gradient learning rates for the stored DND keys/values. Paper Fig. 2:
+# "Gradients flow through the entire architecture" — the regression loss
+# updates the DND, not just the CNN. (swept, unreported); §3.4 only constrains
+# the value rate to sit below the fast-update rate α.
+dnd_key_lr: 1.0e-4
+dnd_value_lr: 1.0e-5
 
 # N-step return
 n_step: 100              # (paper §4) "for the N-step Q estimates we picked a
                          # horizon of N = 100"
 
 # Optimisation
-# NOTE — the paper uses RMSProp ("we used the RMSProp algorithm for gradient
-# descent training", §4); NECAlgorithm uses Adam. Deviation, see nec.py's
-# module docstring.
+# NECAlgorithm uses RMSProp, per paper §4 ("we used the RMSProp algorithm for
+# gradient descent training"). It was Adam until the paper was re-checked, so
+# `lr` below was tuned against Adam — revisit it.
 lr: 1.0e-4               # (swept, unreported) — §4's "SGD learning-rate"
 gamma: 0.99              # (paper §4) "all algorithms were trained using
                          # discount rate γ = 0.99"

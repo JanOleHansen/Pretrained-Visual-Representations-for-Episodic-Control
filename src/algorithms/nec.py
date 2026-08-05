@@ -74,28 +74,46 @@ documents these deviations from the paper (README + source comments):
    is trained.
 3. Slightly different episode-reset handling.
 
-This implementation follows the paper on (1) and (3). It does **not** follow
-the paper on (2): the paper's §3.4 has gradients update both the embedding
-network *and* the DND keys/values (values at a lower LR than the blend rate
-α). Here, ``DND.values`` is a plain (non-grad) tensor updated only by the
-blend rule — see the ``DND`` class docstring for why: making ``values`` a
-gradient-enabled Adam parameter conflicted with the ring-buffer's in-place
-overwrites (a newly-inserted entry inherits Adam's stale per-slot momentum
-from whatever it evicted) and drove values negative. This is the same
-deviation the reference repo makes, for a related reason.
+This implementation follows the paper on all three. In particular it does
+**not** take the reference repo's deviation (2): gradients DO flow into
+``DND.keys`` and ``DND.values``, as paper Figure 2 requires ("Gradients flow
+through the entire architecture").
 
-One further deviation from the paper: DND eviction is FIFO (ring-buffer
+An earlier version of this file froze both, because making them
+gradient-enabled Adam parameters conflicted with the ring-buffer's in-place
+overwrites — a newly inserted entry inherited Adam's stale per-slot momentum
+from whatever it evicted, which drove stored values negative. That is fixed
+by construction now: ``DND.apply_gradient`` does a **stateless sparse SGD**
+step on only the slots a minibatch retrieved (``dnd_key_lr`` /
+``dnd_value_lr``), so there is no per-slot optimiser state to go stale and
+untouched slots are left bit-identical. See that method for the two
+invariants it restores (unit-norm keys, exact-match hash validity).
+
+Why this matters more than it looks: stored keys were previously write-once
+and never refreshed, so with ``dnd_capacity`` = 5e5 and ~178 inserts per
+action per collector batch an entry survived ~2800 batches — over a million
+gradient steps of CNN drift — while the kNN kept retrieving it as though it
+still lived in the current embedding space.
+
+One remaining deviation from the paper: DND eviction is FIFO (ring-buffer
 insertion order), not LRU as §3.1 specifies — nothing updates recency on
-lookup. Since stored keys go stale as the CNN trains (they are never
-gradient-refreshed, see above), FIFO evicts the stalest keys first, which
-is a reasonable heuristic for this implementation.
+lookup.
 
-Two more deviations, both undocumented until they were caught in review:
+The old justification for FIFO ("stored keys go stale, so evicting the
+oldest evicts the stalest") no longer applies now that gradients refresh the
+keys. It is left as FIFO on cost/benefit grounds, not principle: **eviction
+policy has no effect at all until a table is full**, and at
+``dnd_capacity`` = 5e5 with ~178 inserts per action per collector batch that
+is ~2800 batches (~4.5M agent steps). Below that the two policies are
+bit-identical, so switching would change nothing for any run shorter than
+that, while touching the ring-buffer serialisation
+(``__getstate__``/``__setstate__`` rotate by ``_write_ptrs``) and the
+recency bookkeeping on the hottest path. Worth doing before a full-length
+40M-frame run; not worth it to debug one.
 
-4. The paper uses **RMSProp** ("We used the RMSProp algorithm for gradient
-   descent training", §4); this uses Adam. Nothing here depends on that
-   choice, but it is not paper-faithful.
-5. The exact-match blend rule (a) above is **largely inert in practice**.
+One further caveat, caught in review:
+
+4. The exact-match blend rule (a) above is **largely inert in practice**.
    ``write_batch`` blends only on a bit-level hash match of the quantised
    64-d embedding, and the CNN takes ``num_updates`` Adam steps between
    successive ``step()`` calls, so a state re-encountered in a later batch
@@ -156,17 +174,18 @@ class DND:
        ``write_batch``'s blend rule and ring-buffer eviction. See
        ``estimate_all``'s docstring.
 
-    ``values`` is a plain (no grad) tensor updated only by the in-place blend
-    rule Q_i ← Q_i + α(G − Q_i).  The regression loss gradient reaches the
-    CNN via ∂w_i/∂h (distance term); stored Q-values are frozen constants in
-    that computation.  Including ``values`` in Adam conflicted with the blend
-    writes and caused values to drift negative (stale momentum applied to
-    post-blend values).
+    ``keys`` and ``values`` are plain tensors (no autograd), but they ARE
+    updated by the regression loss — see :meth:`apply_gradient`, which does a
+    stateless sparse SGD step on just the slots a minibatch retrieved.  Making
+    them autograd leaves instead would allocate a dense gradient the size of
+    the whole table on every backward (1.15 GB at the Atari defaults).
+    ``values`` additionally moves by the in-place blend rule
+    Q_i ← Q_i + α(G − Q_i) at episode end.
 
     Storage layout mirrors QEC:
 
-        keys   : (num_actions, capacity, embedding_dim)  float32   — no grad
-        values : (num_actions, capacity)                 float32   — no grad (blend-only updates)
+        keys   : (num_actions, capacity, embedding_dim)  float32
+        values : (num_actions, capacity)                 float32
 
     Parameters
     ----------
@@ -210,6 +229,10 @@ class DND:
 
         self._key_to_slot: list[dict[bytes, int]] = [{} for _ in range(num_actions)]
         self._slot_to_key: list[dict[int, bytes]] = [{} for _ in range(num_actions)]
+
+        # Slots whose key was moved by apply_gradient() and whose exact-match
+        # hash is therefore stale; drained by flush_moved_slots().
+        self._moved_slots: list[list[torch.Tensor]] = [[] for _ in range(num_actions)]
 
     # ------------------------------------------------------------------
     # Key generation (identical to QEC._make_keys)
@@ -492,6 +515,102 @@ class DND:
         return best_dists, best_idx
 
     # ------------------------------------------------------------------
+    # Gradient update of stored keys/values (paper Fig. 2, §3.4)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def apply_gradient(
+        self,
+        action:     int,
+        indices:    torch.Tensor,          # (m, k) slots that were read
+        key_grad:   torch.Tensor | None,   # (m, k, d) dL/d(neighbour keys)
+        value_grad: torch.Tensor | None,   # (m, k)    dL/d(neighbour values)
+        key_lr:     float,
+        value_lr:   float,
+    ) -> None:
+        """Stateless SGD step on the slots a minibatch actually retrieved.
+
+        Paper Figure 2: "Gradients flow through the entire architecture."  The
+        regression loss therefore updates the stored keys and values, not just
+        the CNN.  ``NECAlgorithm._gradient_step`` gathers the retrieved
+        neighbours into small leaf tensors and hands their ``.grad`` here, so
+        this is a sparse scatter rather than a dense pass over the table.
+
+        Two invariants have to be restored afterwards:
+
+        1. **Unit norm.**  Every key is written L2-normalised (the kernel
+           collapses otherwise — see ``tests/test_nec_kernel_scale.py``).  A
+           raw gradient step moves keys off the unit sphere, so touched rows
+           are re-projected onto it.
+        2. **Hash validity.**  ``_key_to_slot`` maps a *quantised copy of the
+           stored key* to its slot.  Once a key moves, that entry is stale and
+           a later ``write_batch`` could blend a value into a slot whose key is
+           no longer the one that hashed there.  Moved slots are recorded and
+           delisted by :meth:`flush_moved_slots`.  Re-hashing instead would
+           cost a GPU->CPU sync per touched slot per update.
+
+        ``indices`` may repeat a slot (several queries can share a neighbour);
+        ``index_put_(..., accumulate=True)`` sums those contributions, which is
+        what the maths requires.
+        """
+        # A zero learning rate must be a true no-op, not "add zero then
+        # re-normalise": re-projecting an already-unit-norm key still perturbs
+        # it at float32 rounding level, and that noise would accumulate over
+        # num_updates x batches. Setting both rates to 0 has to reproduce the
+        # frozen-DND behaviour bit-for-bit so the change can be A/B'd.
+        do_keys = key_grad is not None and key_lr != 0.0
+        do_vals = value_grad is not None and value_lr != 0.0
+        if not do_keys and not do_vals:
+            return
+
+        flat_idx = indices.reshape(-1)
+
+        if do_keys:
+            d = self.keys.shape[-1]
+            self.keys[action].index_put_(
+                (flat_idx,), -key_lr * key_grad.reshape(-1, d), accumulate=True
+            )
+        if do_vals:
+            self.values[action].index_put_(
+                (flat_idx,), -value_lr * value_grad.reshape(-1), accumulate=True
+            )
+
+        if do_keys:
+            touched = torch.unique(flat_idx)
+            # Invariant 1: back onto the unit sphere.
+            self.keys[action, touched] = nn.functional.normalize(
+                self.keys[action, touched], dim=-1
+            )
+            # Invariant 2: remember to delist (done in bulk, see flush_moved_slots).
+            self._moved_slots[action].append(touched)
+
+    def flush_moved_slots(self) -> int:
+        """Delist every slot whose key was moved by :meth:`apply_gradient`.
+
+        Called once per collector batch rather than per gradient step: the
+        Python dict work is proportional to the number of DISTINCT slots
+        touched, so batching collapses the 400 per-step passes into one.
+
+        Returns the number of slots delisted (exposed as ``train/dnd_delisted``).
+        """
+        total = 0
+        for a in range(self.num_actions):
+            chunks = self._moved_slots[a]
+            if not chunks:
+                continue
+            slots = torch.unique(torch.cat(chunks)).cpu().tolist()
+            self._moved_slots[a] = []
+
+            k_to_s = self._key_to_slot[a]
+            s_to_k = self._slot_to_key[a]
+            for slot in slots:
+                old_key = s_to_k.pop(slot, None)
+                if old_key is not None:
+                    k_to_s.pop(old_key, None)
+                    total += 1
+        return total
+
+    # ------------------------------------------------------------------
     # Write — blend existing, insert novel (ring-buffer + dict maintenance)
     # ------------------------------------------------------------------
 
@@ -672,6 +791,9 @@ class DND:
 
         self._key_to_slot = [{} for _ in range(self.num_actions)]
         self._slot_to_key = [{} for _ in range(self.num_actions)]
+        # Rebuilt empty: the dicts below are regenerated from the restored
+        # keys, so nothing is pending delisting at load time.
+        self._moved_slots = [[] for _ in range(self.num_actions)]
 
         if d["action_keys"] is None:
             self.keys = None
@@ -803,7 +925,11 @@ def _compute_n_step_returns(
     tail_boot = np.zeros(T, dtype=np.float64)
     if final_state is not None:
         with torch.no_grad():
-            q_T = _max_finite_q(dnd.estimate_all(final_state.to(dnd.device)))[0]
+            # float(): _max_finite_q returns an array, and final_state is a
+            # single (1, d) row.  Without the cast this stays shape (1,) and
+            # silently broadcasts — harmless today, wrong the moment anyone
+            # passes more than one final state.
+            q_T = float(_max_finite_q(dnd.estimate_all(final_state.to(dnd.device)))[0][0])
         if np.isfinite(q_T):
             t_idx = np.arange(max(0, T - n_step), T)
             tail_boot[t_idx] = (gamma ** (T - t_idx)) * q_T
@@ -899,6 +1025,13 @@ class NECAlgorithm(BaseAlgorithm):
         k:             int = 50,        # nearest neighbours for kNN lookup
         kernel_delta:  float = 1e-3,    # δ in inverse-distance kernel
         dnd_lr:        float = 0.1,     # α for blending existing DND entries
+        # Gradient (not blend) learning rates for the stored keys/values.
+        # Paper Fig. 2 — "gradients flow through the entire architecture" — so
+        # the regression loss updates the DND as well as the CNN.  §3.4 puts
+        # the value rate BELOW the fast-update rate α; neither number is
+        # published (§4 sweeps the SGD learning rate without reporting it).
+        dnd_key_lr:    float = 1e-4,
+        dnd_value_lr:  float = 1e-5,
         # --- N-step return -------------------------------------------------
         n_step: int = 100,
         # --- Optimisation --------------------------------------------------
@@ -925,6 +1058,8 @@ class NECAlgorithm(BaseAlgorithm):
         self.k               = k
         self.kernel_delta    = kernel_delta
         self.dnd_lr          = dnd_lr
+        self.dnd_key_lr      = dnd_key_lr
+        self.dnd_value_lr    = dnd_value_lr
         self.n_step          = n_step
         self.lr              = lr
         self.gamma           = gamma
@@ -992,10 +1127,13 @@ class NECAlgorithm(BaseAlgorithm):
         self.replay_buffer = self._make_replay_buffer()
 
         # 5. Optimizer — CNN embedding network only.
-        # DND values are updated exclusively by the in-place blend rule;
-        # including them in Adam causes the momentum state to conflict with
-        # the blend writes and drives stored Q-values negative.
-        self.optimizer = torch.optim.Adam(
+        # RMSProp per paper §4: "We used the RMSProp algorithm for gradient
+        # descent training."  (This was Adam until the paper was re-checked.)
+        # The DND's own keys/values are NOT in here: they are updated by a
+        # stateless sparse SGD step in _gradient_step, because a stateful
+        # optimiser's per-slot moments go stale when the ring buffer overwrites
+        # a slot.  See DND.apply_gradient.
+        self.optimizer = torch.optim.RMSprop(
             self.embedding_net.parameters(),
             lr=self.lr,
         )
@@ -1102,6 +1240,14 @@ class NECAlgorithm(BaseAlgorithm):
         total_writes = 0
 
         for env_idx in range(E):
+            # Host-side deliberately.  This costs one GPU->CPU->GPU round trip
+            # per frame (~360 MB per 1600-frame batch, ~70 ms) — measured to be
+            # noise next to the tens of seconds of kNN below — and in exchange
+            # the carry, which can hold a 4500-frame episode (508 MB per env),
+            # never occupies accelerator memory while it waits for its episode
+            # to finish.  Embedding in place instead would spike transient GPU
+            # memory by up to num_envs x carry length at the moment an episode
+            # completes.
             obs_e     = obs_2d[env_idx].cpu()                   # (T, *obs_shape)
             rewards_e = rewards_2d[env_idx]                     # (T,) f64 numpy
             dones_e   = dones_2d[env_idx]                       # (T,) bool numpy
@@ -1253,7 +1399,17 @@ class NECAlgorithm(BaseAlgorithm):
             losses.append(loss_val)
             q_vals.append(mean_q)
 
-        metrics = {**base_metrics, "train/updates": float(len(losses))}
+        # Gradient steps moved stored keys, so their exact-match hashes are
+        # stale.  Delist them once per batch rather than once per update — the
+        # cost is proportional to DISTINCT slots touched, so batching collapses
+        # num_updates passes into one.
+        delisted = self.dnd.flush_moved_slots()
+
+        metrics = {
+            **base_metrics,
+            "train/updates":      float(len(losses)),
+            "train/dnd_delisted": float(delisted),
+        }
         if losses:
             metrics["train/q_loss"]   = float(np.mean(losses))
             metrics["train/q_values"] = float(np.mean(q_vals))
@@ -1317,6 +1473,10 @@ class NECAlgorithm(BaseAlgorithm):
         # slower on CPU when tried; left as the per-action loop here.
         q_hat_parts:  list[torch.Tensor] = []
         target_parts: list[torch.Tensor] = []
+        # (action, slot indices, neighbour-key leaf, neighbour-value leaf) per
+        # action, kept so the DND can be updated from their .grad after
+        # backward().  See the scatter block below.
+        dnd_pending: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
         for a in range(self._num_actions):
             mask = (actions == a)
@@ -1335,20 +1495,29 @@ class NECAlgorithm(BaseAlgorithm):
             with torch.no_grad():
                 _, indices = self.dnd.knn_action(h_a.detach(), a, k_use)  # (n_a, k_use)
 
-            # Differentiable kernel-weighted combination
-            # keys[a, indices]: (n_a, k_use, d) — frozen; grad flows via distances
-            neighbor_keys = self.dnd.keys[a, indices]              # (n_a, k_use, d)
-            diffs         = h_a.unsqueeze(1) - neighbor_keys       # (n_a, k_use, d)
-            dists_sq      = (diffs ** 2).sum(dim=-1)               # (n_a, k_use)
-            weights       = 1.0 / (dists_sq + self.kernel_delta)   # (n_a, k_use)
-            weights       = weights / weights.sum(dim=-1, keepdim=True)
+            # Gather the retrieved neighbours into SMALL leaf tensors.
+            #
+            # Paper Figure 2: "Gradients flow through the entire architecture"
+            # — the loss updates the stored keys h_i and values Q_i as well as
+            # the CNN.  Doing that by making self.dnd.keys/.values autograd
+            # leaves would make every backward() allocate a DENSE gradient the
+            # size of the whole table (num_actions x capacity x d = 1.15 GB at
+            # the Atari defaults, per update, 400 updates per batch).  Gathering
+            # first keeps the graph at (n_a, k_use, d) and lets the update be
+            # scattered back into only the slots this minibatch actually read.
+            neighbor_keys = self.dnd.keys[a, indices].detach().requires_grad_(True)
+            neighbor_vals = self.dnd.values[a, indices].detach().requires_grad_(True)
 
-            # dnd.values[a, indices]: (n_a, k_use) — frozen; no grad into values
-            neighbor_vals = self.dnd.values[a, indices]            # (n_a, k_use)
-            q_hat_a       = (weights * neighbor_vals).sum(dim=-1)  # (n_a,)
+            diffs    = h_a.unsqueeze(1) - neighbor_keys        # (n_a, k_use, d)
+            dists_sq = (diffs ** 2).sum(dim=-1)                # (n_a, k_use)
+            weights  = 1.0 / (dists_sq + self.kernel_delta)    # (n_a, k_use)
+            weights  = weights / weights.sum(dim=-1, keepdim=True)
+
+            q_hat_a  = (weights * neighbor_vals).sum(dim=-1)   # (n_a,)
 
             q_hat_parts.append(q_hat_a)
             target_parts.append(t_a)
+            dnd_pending.append((a, indices, neighbor_keys, neighbor_vals))
 
         if not q_hat_parts:
             return None
@@ -1364,6 +1533,21 @@ class NECAlgorithm(BaseAlgorithm):
             self.max_grad_norm,
         )
         self.optimizer.step()
+
+        # --- Apply the DND half of the gradient -----------------------------
+        # Plain SGD, deliberately: a stateful optimiser (Adam/RMSProp) keeps
+        # per-slot momentum, and the ring buffer overwrites slots underneath
+        # it, so a freshly inserted entry would inherit the moments of whatever
+        # it evicted.  That is the failure that made an earlier attempt drive
+        # stored values negative.  Stateless SGD has nothing to go stale, and
+        # it leaves untouched slots bit-identical instead of decaying all
+        # num_actions x capacity of them on every step.
+        for a, indices, nk, nv in dnd_pending:
+            self.dnd.apply_gradient(
+                a, indices,
+                key_grad=nk.grad, value_grad=nv.grad,
+                key_lr=self.dnd_key_lr, value_lr=self.dnd_value_lr,
+            )
 
         mean_q = float(q_hat.detach().mean())
         return float(loss.detach()), mean_q
@@ -1438,7 +1622,7 @@ class NECAlgorithm(BaseAlgorithm):
         dnd_state["device"] = self._buffer_device
         self.dnd.__setstate__(dnd_state)
 
-        self.optimizer = torch.optim.Adam(
+        self.optimizer = torch.optim.RMSprop(
             self.embedding_net.parameters(),
             lr=self.lr,
         )

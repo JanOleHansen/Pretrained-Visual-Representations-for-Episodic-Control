@@ -667,10 +667,10 @@ Two implementations:
   `algorithm.state_dim` (64 by default): the exposed embedding is
   `mean ⊕ log-std`.
 
-## NEC — DND values, blend-only (deviates from the paper here)
+## NEC — gradients flow through the whole architecture
 
-`NECAlgorithm` (Pritzel et al. 2017) differs from MFEC in two ways that
-require special care:
+`NECAlgorithm` (Pritzel et al. 2017) differs from MFEC in ways that require
+special care:
 
 ### 0. Where NEC's hyperparameters actually come from
 
@@ -687,9 +687,12 @@ Explicitly **swept and never reported** (do not claim paper authority):
 the SGD learning rate (`lr`), the fast-update rate α (`dnd_lr`), the
 embedding dimensionality (`embedding_dim`), and the ε-greedy rate.
 
-Two deviations from §4 that are intentional but were undocumented until a
-review caught them: the paper uses **RMSProp**, this uses **Adam**; and the
-exact-match blend rule is **largely inert in practice** (see §5 below).
+The optimizer is **RMSProp**, per §4 ("we used the RMSProp algorithm for
+gradient descent training"). It was Adam until a review re-checked the paper,
+so `lr` was tuned against Adam — treat it as unvalidated.
+
+One remaining caveat: the exact-match blend rule is **largely inert in
+practice** (see §5 below).
 
 ### 0b. Frames are raw ALE frames; `frames_per_batch` is agent steps
 
@@ -726,23 +729,55 @@ otherwise; the NEC ones are corrected. Making it real means segmenting on
 (`not term_2d[env_idx, raw_end]` → bootstrap the tail from the DND) correctly
 identifies `StepCounter` cutoffs versus real game-overs.
 
-### 1. DND `values` tensor is a plain (non-grad) tensor, NOT gradient-enabled
+### 1. `DND.keys` and `DND.values` are updated by the loss — via sparse SGD
 
-The paper's §3.4 backpropagates into both the embedding network *and* the
-DND keys/values (values at a lower LR than the blend rate α). This
-implementation does **not** do that: `DND.values` is a plain `torch.Tensor`
-with no `requires_grad`, updated only by the in-place blend rule
+Paper Figure 2: *"Gradients flow through the entire architecture."* The
+regression loss updates the stored keys and values, not just the CNN.
 
-```python
-self.values.data[action, slots] += dnd_lr * (target - old)   # blend update
-self.values.data[action, slots]  = new_vals                  # ring-buffer insert
-```
-
-and the optimizer covers the embedding network only:
+They are still plain (non-autograd) tensors. `_gradient_step` gathers the
+retrieved neighbours into small leaf tensors, and `DND.apply_gradient`
+scatters `-lr * grad` back into only the slots that minibatch read:
 
 ```python
-optimizer = torch.optim.Adam(self.embedding_net.parameters(), lr=self.lr)
+nk = self.dnd.keys[a, indices].detach().requires_grad_(True)     # (n_a, k, d)
+nv = self.dnd.values[a, indices].detach().requires_grad_(True)   # (n_a, k)
+...                                     # after loss.backward():
+self.dnd.apply_gradient(a, indices, nk.grad, nv.grad,
+                        key_lr=self.dnd_key_lr, value_lr=self.dnd_value_lr)
 ```
+
+**Do not "simplify" this by making `keys`/`values` autograd leaves.** Indexing
+an autograd leaf produces a gradient the size of the *whole table* —
+`num_actions x dnd_capacity x embedding_dim` = 1.15 GB at the Atari defaults,
+allocated on every one of the 400 updates per collector batch.
+
+**Do not give the DND a stateful optimiser** (Adam/RMSProp). Two reasons:
+per-slot moments decay all 5e5 entries per action on every step, and the ring
+buffer overwrites slots underneath them, so a freshly inserted entry inherits
+the moments of whatever it evicted — that is the bug that previously drove
+stored values negative and caused an earlier version to freeze the DND
+entirely. Stateless SGD has no state to go stale.
+
+`apply_gradient` restores two invariants; both are pinned by
+`tests/test_nec_dnd_gradient.py`:
+
+1. **Unit-norm keys.** A raw step pushes keys off the unit sphere and the
+   kernel collapses back into `kernel_delta` domination (see
+   `test_nec_kernel_scale.py`). Touched rows are re-projected.
+2. **Hash validity.** `_key_to_slot` maps a quantised copy of a stored key to
+   its slot; once the key moves, that entry is stale and `write_batch` could
+   blend into the wrong slot. Moved slots are recorded and delisted in bulk by
+   `flush_moved_slots()`, called once per collector batch from `step()` and
+   reported as `train/dnd_delisted`.
+
+Setting `dnd_key_lr=dnd_value_lr=0` reproduces the old frozen-DND behaviour
+bit-for-bit, so the change can be A/B'd against earlier runs.
+
+**Why this mattered:** before this, a stored key was written once and never
+refreshed. At `dnd_capacity=5e5` with ~178 inserts per action per collector
+batch, an entry survived ~2800 batches — over a million gradient steps of CNN
+drift — while the kNN kept retrieving it as if it still lived in the current
+embedding space.
 
 `_gradient_step` reads `dnd.values[a, indices]` as a frozen constant — the
 regression-loss gradient reaches the CNN only through the distance term
@@ -767,15 +802,30 @@ Adam's per-slot state on eviction, or use a plain low-LR SGD step for
 optimizer's parameter list, that's the change that caused the original
 regression.
 
+### 4b. Eviction is still FIFO, and that is now a cost decision
+
+§3.1 specifies LRU. The old rationale for FIFO ("keys go stale, so oldest ==
+stalest") died with §1 — keys are refreshed now. It is left as FIFO because
+**eviction policy has no effect until a table is full**: at
+`dnd_capacity=5e5` and ~178 inserts per action per batch that is ~2800
+batches (~4.5M agent steps), and below that the two policies are
+bit-identical. Switching means reworking the ring-buffer serialisation
+(`__getstate__`/`__setstate__` rotate by `_write_ptrs`) plus recency
+bookkeeping on the hottest path. Do it before a full 40M-frame run.
+
 ### 5. The exact-match blend rule is largely inert in practice
 
 `write_batch` blends `Q_i ← Q_i + α(G − Q_i)` only on a bit-level hash match
-of the quantised 64-d embedding. The CNN takes `num_updates` (100–400) Adam
+of the quantised 64-d embedding. The CNN takes `num_updates` (100–400) RMSProp
 steps between successive `step()` calls, so a state re-encountered in a later
 batch essentially never re-hashes to its stored key. Blends therefore only
 happen between duplicate frames embedded *within one* `step()` call, and the
-DND behaves close to an insert-only FIFO log — which also means the
-FIFO-vs-LRU deviation above matters more than it looks.
+DND behaves close to an insert-only log.
+
+Now that gradients also move stored keys (§1), a hash entry additionally goes
+stale the moment its key is updated — `flush_moved_slots()` delists those, so
+the blend rate falls further rather than silently blending into a slot whose
+key has changed.
 
 `train/dnd_blend_rate` measures this directly; expect it near 0. This is a
 consequence of porting MFEC's exact-hash design onto a *moving* embedding.

@@ -26,6 +26,12 @@ dnd_capacity: 500_000
 k: 50
 kernel_delta: 1.0e-3   # δ in kernel k(h,h_i) = 1/(‖h−h_i‖²+δ)
 dnd_lr: 0.1            # α for blending existing entries on write
+# Gradient learning rates for the stored DND keys/values (paper Fig. 2:
+# "gradients flow through the entire architecture"). Not published — §4 sweeps
+# the SGD learning rate without reporting it; §3.4 only says the value rate is
+# below the fast-update rate α.
+dnd_key_lr: 1.0e-4
+dnd_value_lr: 1.0e-5
 
 # N-step return
 n_step: 100
