@@ -407,6 +407,35 @@ MFEC's state embedding is pluggable (`algorithm.encoder_name`):
   python src/train.py experiment=mfec/mspacman_vae \
       algorithm.vae_checkpoint=<checkpoint.save_path printed above>
   ```
+- `dinov2` — a frozen DINOv2 ViT (`src/encoders/dino_v2_encoder.py`); see
+  `experiment/mfec/mspacman_dinov2.yaml`.
+
+### Vet a new encoder before you train with it
+
+```shell
+python scripts/encoder_diagnostics.py --device cuda \
+    --dinov2-weights /path/dinov2_vits14_pretrain.pth
+```
+
+MFEC's learning signal depends on two properties of φ that are cheap to check
+and expensive to discover after a multi-day run:
+
+1. **Key stability** — Eq. (1)'s max-update fires only on an exact hash match.
+   The script reports the match rate between embedding a batch and embedding
+   one row at a time; **this must be 1.000**, or training (which embeds
+   `num_envs` rows) and `evaluate()` (1 row) disagree about what "the same
+   state" is and evaluation silently never takes the exact-match path.
+   `RandomProjectionEncoder` accumulates in float64 to guarantee this; a
+   float32 ViT does not. Run it on `--device cuda`: the failure is a
+   cuBLAS shape-dependent-kernel effect and does **not** reproduce on CPU.
+2. **Discriminability** — the kNN averages the k nearest stored returns, so an
+   encoder that maps visually different game states to nearly the same point
+   makes Q(s, a) state-independent. The script reports an adjacency AUC
+   (can φ tell near-identical frames from unrelated ones?) and the relative
+   contrast of nearest-neighbour vs. mean distance.
+
+The random-projection baseline scores AUC ≈ 0.92 with perfect key stability;
+use it as the reference when judging another encoder's numbers.
 
 ## NEC embedding networks
 

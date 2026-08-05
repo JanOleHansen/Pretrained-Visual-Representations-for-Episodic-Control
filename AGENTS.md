@@ -558,15 +558,54 @@ path. Guarded by `tests/test_mfec_qec_dict.py::test_embed_key_invariant_to_batch
 
 MFEC's `φ` (state embedding) is a pluggable `Encoder` (`src/encoders/base.py`),
 not hardcoded into `QECPolicy`. `MFECAlgorithm.setup()` builds it via
-`make_encoder(encoder_name, ...)` (`src/encoders/factory.py`) and hands the
-instance to `QECPolicy(qec, encoder, num_actions)`, which calls
-`encoder.embed(obs)`. `QECPolicy.__deepcopy__` shares the encoder by
-reference (same object the collector's policy uses), same as `qec`.
+`make_encoder(encoder_name, ...)` (`src/encoders/factory.py`).
+`QECPolicy.__deepcopy__` shares the encoder by reference (same object the
+collector's policy uses), same as `qec`.
+
+### Policy chain — φ runs ONCE per frame
+
+```
+pixels ──_EmbedModule(φ)──▶ "state_embedding" ──QValueActor(QECPolicy)──▶ action
+```
+
+`_EmbedModule` is a separate `TensorDictModule` so the **collector persists
+the embedding under `state_embedding`**, and `MFECAlgorithm.step()` reads it
+back instead of embedding the same frames a second time. This is exact, not an
+approximation: the encoder is frozen, so a cached vector is bit-identical to a
+recomputation (verified in
+`tests/test_mfec_encoder_refactor.py::test_step_reuses_collector_embedding_and_falls_back_when_absent`).
+
+Consequences for anyone editing this:
+- **`QECPolicy.forward()` takes a `(..., d)` embedding, NOT `(..., C, H, W)`
+  pixels.** `QECPolicy.embed()` still exists for tests/offline analysis.
+- `get_policy()` must return the full chain (`self._policy`), never
+  `self.q_actor` alone — the actor reads a key only `_EmbedModule` writes.
+- `step()` falls back to `_embed_observations()` if `state_embedding` is
+  absent. That is reachable only with `init_random_frames > 0`, which
+  `get_collector_config()` pins to 0 for MFEC.
+- **Do not copy this to NEC.** NEC's CNN is trained, so it changes between
+  collection and `step()`; a cached embedding would be stale. NEC re-embeds
+  deliberately (`NECAlgorithm._embed`).
+
+Embedding is chunked by a **byte budget** (`_EMBED_CHUNK_BYTES`), not by
+`num_envs`. Sizing it by `num_envs` (as it was until review) means
+`frames_per_batch // num_envs` forward passes at batch size `num_envs` — free
+for a random-projection matmul, but for a ViT it leaves the GPU idle and pays
+that many times the launch overhead.
 
 Contract (`Encoder`):
 - `embed(obs) -> (B, d) float32` on `obs.device`; **must be deterministic**
   (identical pixels -> identical embedding), or the QEC exact-hit hash path
   (`QEC._make_keys`) never fires.
+- Determinism must hold **across batch shapes**, not just across repeats:
+  training embeds `num_envs` rows while `BaseTrainer.evaluate` embeds 1, and a
+  float32 reduction picks a different kernel per shape.
+  `RandomProjectionEncoder` accumulates in float64 for exactly this reason
+  (see its docstring); a float32 ViT such as `DINOv2Encoder` has **no such
+  guarantee**. Check any new encoder with
+  `python scripts/encoder_diagnostics.py --device cuda` before trusting a
+  training run — it reports the batch-vs-single key match rate, which must be
+  1.000.
 - `state() -> dict` / `load_state(dict) -> None` for checkpointing — plugged
   into `MFECAlgorithm._get_training_state()` / `_load_training_state()` as
   `extra["encoder_state"]`.

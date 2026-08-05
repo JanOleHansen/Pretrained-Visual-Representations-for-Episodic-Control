@@ -215,10 +215,25 @@ class MFECAlgorithm(BaseAlgorithm):
 
         self.qec_policy = QECPolicy(self.qec, self.encoder, num_actions)
 
+        # Policy chain: pixels -> state_embedding -> Q(s,·) -> action.
+        #
+        # Splitting the embedding into its own TensorDictModule means the
+        # collector writes `state_embedding` into every collected transition,
+        # so step() reads it back instead of embedding the same frames a
+        # second time.  Safe because MFEC's encoder is frozen (see
+        # src/encoders/base.py): the cached vector is bit-identical to a
+        # recomputation.  This would NOT be valid for NEC, whose CNN changes
+        # between collection and step().
+        self._embed_module = TensorDictModule(
+            _EmbedModule(self.encoder),
+            in_keys=[self.obs_key],
+            out_keys=["state_embedding"],
+        )
+
         self.q_actor = QValueActor(
             module=self.qec_policy,
             spec=action_spec,
-            in_keys=[self.obs_key],
+            in_keys=["state_embedding"],
         )
 
         self.greedy_module = EGreedyModule(
@@ -228,7 +243,45 @@ class MFECAlgorithm(BaseAlgorithm):
             annealing_num_steps=self.annealing_frames,
         )
 
-        self._explore_policy = _SharedPolicy(self.q_actor, self.greedy_module)
+        # Eval (get_policy) needs the embedding step too, so both policies are
+        # built on the same chain.
+        self._policy = _SharedPolicy(self._embed_module, self.q_actor)
+        self._explore_policy = _SharedPolicy(
+            self._embed_module, self.q_actor, self.greedy_module
+        )
+
+    #
+    #   Embedding helper
+    #
+
+    #: Observation bytes per encoder forward pass.  Chunking exists to bound
+    #: peak memory when embedding a whole collector batch of pixel frames.
+    #: It must NOT be sized by ``num_envs`` (as it was until this was caught in
+    #: review): with frames_per_batch=1024 and num_envs=4 that is 256 forward
+    #: passes of batch size 4, which is free for a random-projection matmul but
+    #: leaves a GPU almost idle for a ViT and pays 256x the launch overhead.
+    #: 64 MB of raw observation is ~166 frames of (3, 210, 160) float32 or
+    #: ~2400 frames of (1, 84, 84).
+    _EMBED_CHUNK_BYTES = 64 * 1024 * 1024
+
+    def _embed_observations(self, obs: torch.Tensor) -> torch.Tensor:
+        """Embed ``(..., C, H, W)`` observations in memory-bounded chunks."""
+        obs_flat = obs.reshape(-1, *obs.shape[-3:])
+        n = obs_flat.shape[0]
+        if n == 0:
+            return obs_flat.new_zeros((0, self.state_dim))
+
+        per_obs = obs_flat[0].numel() * obs_flat.element_size()
+        chunk = max(1, self._EMBED_CHUNK_BYTES // max(1, per_obs))
+        chunk = min(chunk, n)
+
+        if chunk >= n:
+            return self.qec_policy.embed(obs_flat)
+        return torch.cat(
+            [self.qec_policy.embed(obs_flat[i: i + chunk])
+             for i in range(0, n, chunk)],
+            dim=0,
+        )
 
     #
     #   Training step
@@ -275,20 +328,23 @@ class MFECAlgorithm(BaseAlgorithm):
 
         dev = self._buffer_device
 
-        # --- 2. Embed all observations in one GPU matmul ------------------
-        # embed() does reshape(-1, flat_dim) internally, so any leading shape works.
-        obs = batch[self.obs_key]
-        obs_flat = obs.reshape(-1, *obs.shape[-3:])
+        # --- 2. Obtain one embedding per collected frame -------------------
+        # Preferred path: reuse what the policy already computed during
+        # collection (see _EmbedModule in setup()).  This is exact, not an
+        # approximation: MFEC's encoder is frozen by contract
+        # (src/encoders/base.py — "identical pixels -> identical embedding"),
+        # so re-embedding here would reproduce the same numbers at double the
+        # cost.  With a random projection that waste is invisible; with a
+        # DINOv2 ViT it is half the total runtime.
+        states_all = batch.get("state_embedding", default=None)
+        if states_all is not None:
+            states_all = states_all.reshape(n, -1).to(dev)
+        else:
+            # Fallback: no policy-written embedding in this batch. Reachable
+            # only if the collector ran a random policy (init_random_frames>0),
+            # which get_collector_config() pins to 0 for MFEC.
+            states_all = self._embed_observations(batch[self.obs_key]).to(dev)
 
-        chunk = max(1, self._num_envs)
-        states_all = torch.cat(
-            [self.qec_policy.embed(obs_flat[i : i + chunk])
-             for  i in range(0, obs_flat.shape[0], chunk)],
-            dim = 0
-        )
-
-        if states_all.device != dev:
-            states_all = states_all.to(dev)
         states_2d = states_all.reshape(E, T, -1)                  # (E, T, d)
 
         # Flatten to 1D then reshape to (E, T) — handles the (E,T,1) reward shape.
@@ -462,7 +518,9 @@ class MFECAlgorithm(BaseAlgorithm):
     #
 
     def get_policy(self) -> TensorDictModule:
-        return self.q_actor
+        # Must be the full chain: q_actor alone reads "state_embedding", which
+        # only _embed_module writes.
+        return self._policy
 
     def get_explore_policy(self) -> TensorDictModule:
         return self._explore_policy
@@ -551,7 +609,39 @@ class MFECAlgorithm(BaseAlgorithm):
 # Policy module
 # ---------------------------------------------------------------------------
 
+class _EmbedModule(nn.Module):
+    """φ as its own module: ``(..., C, H, W)`` pixels -> ``(..., d)`` embedding.
+
+    Exists so the collector persists the embedding under ``state_embedding``
+    and ``MFECAlgorithm.step()`` never has to recompute it.  Returns ``self``
+    on deepcopy so the collector shares the one frozen encoder.
+    """
+
+    def __init__(self, encoder):
+        super().__init__()
+        self.encoder = encoder
+
+    def __deepcopy__(self, memo):
+        memo[id(self)] = self
+        return self
+
+    def forward(self, obs):
+        leading = obs.shape[:-3]
+        states = self.encoder.embed(obs)          # (prod(leading) or 1, d)
+        if leading:
+            return states.reshape(*leading, states.shape[-1])
+        return states.squeeze(0)
+
+
 class QECPolicy(nn.Module):
+    """Q(s, ·) by QEC lookup.
+
+    Takes a **state embedding**, not raw pixels — ``_EmbedModule`` runs φ one
+    step earlier in the policy chain so the result can be reused by ``step()``.
+    ``encoder`` is still held (and still shared on deepcopy) so ``embed()``
+    remains available as a convenience for tests and offline analysis.
+    """
+
     def __init__(self, qec, encoder, num_actions):
         super().__init__()
         self.qec = qec
@@ -571,15 +661,15 @@ class QECPolicy(nn.Module):
     def embed(self, obs):
         return self.encoder.embed(obs)
 
-    def forward(self, obs):
-        states = self.embed(obs)
-        q_values = self.qec.estimate_all(states)
+    def forward(self, states):
+        leading = states.shape[:-1]
+        flat = states.reshape(-1, states.shape[-1])
+        q_values = self.qec.estimate_all(flat)
         q_values = torch.where(
             torch.isinf(q_values),
             torch.full_like(q_values, 1e9),
             q_values,
         )
-        leading = obs.shape[:-3]
         if leading:
             return q_values.reshape(*leading, self.num_actions)
         return q_values.squeeze(0) if q_values.shape[0] == 1 else q_values

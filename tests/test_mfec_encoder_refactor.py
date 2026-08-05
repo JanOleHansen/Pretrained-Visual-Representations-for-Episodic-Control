@@ -131,11 +131,17 @@ def test_embed_and_keys_are_deterministic():
 # 4. forward(): no inf leaks through, on empty and partially-populated QEC
 # ---------------------------------------------------------------------------
 
+# NOTE: QECPolicy.forward() takes a STATE EMBEDDING, not raw pixels.  φ runs
+# one step earlier in the policy chain (`_EmbedModule`, wired in setup()) so
+# the collector persists it under "state_embedding" and MFECAlgorithm.step()
+# reuses it instead of embedding every frame a second time.
+
 def test_forward_replaces_inf_when_qec_empty():
     alg = _make_setup_algorithm(seed=0)
     obs = torch.randint(0, 256, (2, 3, *OBS_SHAPE), dtype=torch.uint8)
+    states = alg.qec_policy.embed(obs).reshape(2, 3, -1)
 
-    q = alg.qec_policy.forward(obs)
+    q = alg.qec_policy.forward(states)
 
     assert q.shape == (2, 3, NUM_ACTIONS)
     assert not torch.isinf(q).any()
@@ -150,12 +156,33 @@ def test_forward_replaces_inf_when_partially_populated():
     # Populate action 0 only; actions 1..N-1 stay empty.
     alg.qec.add_batch(0, states[:3], torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64))
 
-    q = alg.qec_policy.forward(obs)
+    q = alg.qec_policy.forward(states)
 
     assert q.shape == (6, NUM_ACTIONS)
     assert not torch.isinf(q).any()
     # Untouched actions still saturate at the isinf -> 1e9 replacement.
     assert torch.all(q[:, 1:] == 1e9)
+
+
+def test_embed_module_matches_encoder_and_feeds_policy():
+    """_EmbedModule must produce exactly what QECPolicy.forward expects, with
+    leading dims preserved — that equivalence is what makes reusing the
+    collector's cached "state_embedding" in step() valid rather than an
+    approximation."""
+    from src.algorithms.mfec import _EmbedModule
+
+    alg = _make_setup_algorithm(seed=0)
+    mod = _EmbedModule(alg.encoder)
+
+    obs = torch.randint(0, 256, (2, 3, *OBS_SHAPE), dtype=torch.uint8)
+    got = mod(obs)
+    assert got.shape == (2, 3, alg.encoder.state_dim)
+    torch.testing.assert_close(
+        got.reshape(6, -1), alg.qec_policy.embed(obs), rtol=0, atol=0
+    )
+
+    # Unbatched (C, H, W) -> (d,), the shape a single-env eval rollout sees.
+    assert mod(obs[0, 0]).shape == (alg.encoder.state_dim,)
 
 
 # ---------------------------------------------------------------------------
@@ -245,3 +272,65 @@ def test_step_runs_and_returns_expected_metric_keys():
 
     assert set(metrics) == {"train/epsilon", "train/qec_size", "train/exact_hit_rate"}
     assert alg._collected_frames == E * T
+
+
+# ---------------------------------------------------------------------------
+# 7. step() reuses the collector's embedding instead of recomputing it
+# ---------------------------------------------------------------------------
+
+def test_step_reuses_collector_embedding_and_falls_back_when_absent():
+    """φ must run ONCE per frame, in the policy, not again in step().
+
+    Before this, `step()` re-embedded every collected frame even though the
+    policy had already embedded it during action selection — invisible with a
+    random-projection matmul, but half the total runtime with a DINOv2 ViT.
+    The reuse is exact rather than approximate because MFEC's encoder is
+    frozen (src/encoders/base.py), so this test also pins the fallback for the
+    case where the key is genuinely missing.
+    """
+    from tensordict import TensorDict
+
+    alg = _make_setup_algorithm(seed=0)
+    d = alg.encoder.state_dim
+    E, T = 2, 4
+
+    obs = torch.randint(0, 256, (E, T, *OBS_SHAPE), dtype=torch.uint8)
+    emb = alg.qec_policy.embed(obs).reshape(E, T, d)
+
+    calls = {"n": 0}
+    real_embed = alg.encoder.embed
+
+    def counting_embed(x):
+        calls["n"] += 1
+        return real_embed(x)
+
+    alg.encoder.embed = counting_embed  # type: ignore[method-assign]
+
+    def make_batch(with_embedding: bool) -> TensorDict:
+        data = {
+            "pixels": obs,
+            "action": torch.zeros(E, T, dtype=torch.long),
+            "next": TensorDict(
+                {
+                    "reward": torch.zeros(E, T, 1),
+                    "done": torch.zeros(E, T, 1, dtype=torch.bool),
+                    "terminated": torch.zeros(E, T, 1, dtype=torch.bool),
+                },
+                batch_size=[E, T],
+            ),
+        }
+        if with_embedding:
+            data["state_embedding"] = emb
+        return TensorDict(data, batch_size=[E, T])
+
+    # --- reuse path: zero encoder calls ---------------------------------
+    alg.step(make_batch(with_embedding=True))
+    assert calls["n"] == 0, (
+        f"step() called the encoder {calls['n']}x despite state_embedding being "
+        "present in the batch — the double-embed is back."
+    )
+
+    # --- fallback path: encoder is used when the key is missing ----------
+    calls["n"] = 0
+    alg.step(make_batch(with_embedding=False))
+    assert calls["n"] > 0, "fallback must embed when state_embedding is absent"

@@ -4,7 +4,7 @@ defaults:
   - algorithm: ???
   - environment: ???
   - environment@eval_environment: null   # optional eval env; falls back to environment
-  - logger: tensorboard
+  - logger: wandb
   - experiment: null
   - override hydra/job_logging: colorlog
   - override hydra/hydra_logging: colorlog
