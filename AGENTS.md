@@ -379,6 +379,10 @@ configs/
   environment/mspacman_mfec_train.yaml — ALE/MsPacman-v5, paper-faithful MFEC stack: single frame,
                               no SignTransform, repeat_action_probability=0.0 (see "MFEC on Atari" below)
   environment/mspacman_mfec_eval.yaml  — eval counterpart (identical by design; nothing to strip)
+  environment/mspacman_mfec_train_dinov2.yaml — the mspacman_mfec_train stack with GrayScale/Resize
+                              dropped (DINOv2 needs 3 channels and resizes internally); task
+                              settings held identical so encoder is the only variable
+  environment/mspacman_mfec_eval_dinov2.yaml  — eval counterpart (identical by design)
   environment/mspacman_nec_train.yaml — ALE/MsPacman-v5 for NEC: action-repeat 4, NO
                               SignTransform (paper §4 names Ms. Pac-Man as a game where
                               NEC's lack of reward clipping is what produces the result)
@@ -400,6 +404,13 @@ configs/
                               50M emulator frames = Figure 1's full x-range; num_envs=4)
   experiment/mfec/mspacman_vae.yaml — same, with encoder_name=vae + singleframe env
                               (vae_checkpoint is required, no default — see "Encoders" above)
+  experiment/mfec/mspacman_dinov2.yaml — same, with encoder_name=dinov2 (frozen ViT-S/14,
+                              state_dim=384) + the mspacman_mfec_*_dinov2 env pair.
+                              dinov2_weights is required and has no usable default — the
+                              checked-in path is cluster-local.  NOTE: this config used the
+                              DQN-style mspacman_train_dinov2 env pair until Aug 2026; runs
+                              logged before that carry reward clipping, sticky actions and a
+                              4,500-step cap, and are NOT comparable to mspacman.yaml.
   experiment/nec/pong.yaml     — NEC on Pong (10M agent steps = 40M raw frames, num_envs=16);
                               keeps the clipped env — Pong's rewards are already in [-1, 1]
                               so SignTransform is a no-op there, not a deviation
@@ -457,6 +468,7 @@ Concretely:
 | `mspacman_train.yaml` | ✗ | MFEC Ms. Pac-Man |
 | `mspacman_train_singleframe.yaml` | ✗ | MFEC Ms. Pac-Man + VAE encoder (paper-exact) |
 | `mspacman_mfec_train.yaml` | ✗ | MFEC Ms. Pac-Man (paper-faithful; see "MFEC on Atari" below) |
+| `mspacman_mfec_train_dinov2.yaml` | ✗ | MFEC Ms. Pac-Man + frozen DINOv2 encoder (paper-faithful) |
 
 The fixed random projection already compresses 28 k-pixel observations
 adequately without online whitening.

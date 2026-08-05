@@ -1,0 +1,34 @@
+name: ALE/MsPacman-v5
+gym_backend: gymnasium
+
+# Evaluation counterpart to mspacman_mfec_train_dinov2.yaml.
+#
+# As with the random-projection MFEC pair, these two configs are deliberately
+# *identical*: the paper-faithful training env already has no reward clipping
+# and no life-based episode ends, so there is nothing for eval to strip.  That
+# is the point — train/episode_reward and eval/return_mean then measure the
+# same quantity (true game score), so a gap between them means a real
+# train/eval discrepancy rather than a units mismatch.  Kept as a separate file
+# so `environment@eval_environment` stays explicit and can diverge later.
+gym_kwargs:
+  # Both of these must match mspacman_mfec_train_dinov2.yaml exactly, or the
+  # stored QEC keys describe a different environment than the one being
+  # evaluated — and for DINOv2 the keys are the encoder's output, so an env
+  # mismatch silently poisons every exact-match lookup.
+  frame_skip: 4
+  repeat_action_probability: 0.0
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# DINOv2 PVM eval variant: single RGB frame (no GrayScale, no CatFrames).
+# Resize + ImageNet-normalise happen inside DINOv2Encoder.embed().
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    max_steps: 27_000
+  - _target_: torchrl.envs.DoubleToFloat

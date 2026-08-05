@@ -20,6 +20,8 @@ run:
   encoder: ${oc.select:algorithm.encoder_name,none}
   seed: ${trainer.seed}
   name: ${run.algorithm}_${run.game}_${run.encoder}_seed${run.seed}
+  id: ${run.name}_${now:%Y%m%d-%H%M%S}
+
 
 trainer:
   _target_: src.trainers.StepTrainer   # or src.trainers.EpisodeTrainer

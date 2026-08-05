@@ -1,0 +1,78 @@
+name: ALE/MsPacman-v5
+gym_backend: gymnasium
+
+# Paper-faithful MFEC setup (Blundell et al. 2016, §4.1) with a DINOv2 PVM as φ.
+#
+# This is mspacman_mfec_train.yaml with exactly two changes, both forced by the
+# encoder: GrayScale/Resize are dropped (DINOv2 needs 3 channels, and resizing
+# to its 224x224 grid happens inside DINOv2Encoder.embed()).  Everything that
+# affects the *task* — sticky actions, reward scale, episode boundaries — is
+# held identical so DINOv2 vs. random-projection is a clean encoder ablation.
+#
+# It deliberately does NOT inherit from mspacman_train_dinov2.yaml, which was
+# derived from the DQN-style mspacman_train.yaml and carries reward clipping,
+# EndOfLifeTransform and a 4,500-step cap — all three are actively harmful to
+# MFEC (see the per-item notes below).
+gym_kwargs:
+  # frame_skip MUST stay at 4 — §4.1: "actions are repeated 4 times".  TorchRL
+  # does NOT apply this itself: GymEnv._build_env unconditionally does
+  # `kwargs["frameskip"] = self.frame_skip`, so the value is forwarded to ALE
+  # and *overrides* the ALE/*-v5 registry default.  Dropping this line does not
+  # fall back to v5's frameskip=4 — it silently sets ALE frameskip to 1.
+  frame_skip: 4
+
+  # Sticky actions OFF.  ALE/*-v5 defaults to repeat_action_probability=0.25
+  # and TorchRL does not touch it, so omitting this line leaves stochastic
+  # action repeats ON.  MFEC's Eq. (1) update is max-over-returns and never
+  # decreases, which the paper's own footnote 1 calls out as "not suited to
+  # rational action selection in stochastic environments" — it latches onto
+  # lucky returns.  Sticky actions also destroy the exact-match rate the method
+  # leans on (§4.1 measures ~50% exact state-action matches on Ms. Pac-Man),
+  # which matters even more here: DINOv2 features are continuous and the QEC
+  # hash key quantises at 1e-5, so exact re-encounters are already scarce.
+  repeat_action_probability: 0.0
+
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# DINOv2 PVM train variant: single RGB frame (no GrayScale, no CatFrames).
+# Resize + ImageNet-normalise happen inside DINOv2Encoder.embed().
+#
+# NO SignTransform.  MFEC stores raw Monte-Carlo returns and acts by argmax
+#     over them, so clipping rewards to {-1, 0, +1} makes one dot (10 pts)
+#     worth the same as a ghost (200-1600) or fruit (100-5000): the entire
+#     scoring upside of Ms. Pac-Man becomes invisible to the policy.  The paper
+#     clips observations, never rewards.  Clipping only the *training* env
+#     (as mspacman_train_dinov2.yaml does) is worse still — the QEC then stores
+#     returns in pellet-count units while eval/return_mean reports true score,
+#     so the two axes measure different quantities.
+#
+# NO CatFrames.  §3 embeds a single frame; a 4-stack folds three frames of
+#     history into the state and makes exact re-encounters strictly rarer.
+#
+# NO EndOfLifeTransform.  MFEC's backward replay (Algorithm 1, lines 9-11) is
+#     defined over whole episodes.  It is also inert in this pipeline anyway:
+#     `_step` writes the life-loss signal only to eol_key ("end-of-life"),
+#     never back to "done", and MFEC reads batch["next", "done"].
+#
+# VecNorm is omitted for the usual MFEC reason: its running statistics make the
+# same raw frame embed differently at different timesteps, which drives
+# train/exact_hit_rate to 0.  See "VecNorm + MFEC incompatibility" in AGENTS.md.
+#
+# NOTE — reward scale: with SignTransform gone, train/episode_reward is the
+# true game score and is directly comparable to eval/return_mean and to the
+# paper's Figure 1.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    # 27,000 decisions x 4 emulator frames = the standard 108,000-frame (30 min)
+    # ALE episode cap.  The 4,500 used by the DQN-style configs would cut a
+    # competent agent off after 5 minutes of game time, capping the return the
+    # QEC can ever observe.
+    max_steps: 27_000
+  - _target_: torchrl.envs.DoubleToFloat

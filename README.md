@@ -303,7 +303,8 @@ configs/
     │   ├── breakout.yaml   <- MFEC on Breakout (1M frames)
     │   ├── qbert.yaml      <- MFEC on Q*Bert (40M frames)
     │   ├── mspacman.yaml   <- MFEC on Ms. Pac-Man (paper-faithful; 12.5M decisions = 50M frames)
-    │   └── mspacman_vae.yaml <- same, with the paper-exact VAE encoder
+    │   ├── mspacman_vae.yaml <- same, with the paper-exact VAE encoder
+    │   └── mspacman_dinov2.yaml <- same, with a frozen DINOv2 ViT-S/14 as the encoder
     └── nec/
         ├── pong.yaml       <- NEC on Pong (40M raw frames)
         ├── hero.yaml       <- NEC on H.E.R.O. (40M raw frames; unclipped rewards)
