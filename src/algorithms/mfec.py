@@ -254,6 +254,20 @@ class MFECAlgorithm(BaseAlgorithm):
             in_keys=["state_embedding"],
         )
 
+        # Both e-greedy modules need an *unbatched* action spec.  proof_env is
+        # the TRAINING env, so with num_envs=4 its action_spec carries that
+        # batch dim (shape [4]) — but BaseTrainer.evaluate() builds a single
+        # env via make_env(num_envs=1), which factory.make_env returns bare
+        # (no ParallelEnv), so the eval action is a scalar of shape [].
+        # EGreedyModule.forward only auto-expands a spec when it is unbatched
+        # (`not len(spec.shape)`); a [4] spec meeting a [] action raises
+        # "Action spec shape does not match the action shape" at the first
+        # evaluate().  An unbatched spec is correct for both callers: it
+        # expands to [4] under the collector and compares equal at eval.
+        action_spec_unbatched = action_spec
+        for _ in range(len(env_bs)):
+            action_spec_unbatched = action_spec_unbatched[0]
+
         # `device=` is NOT optional here, and passing `spec` does not cover it:
         # EGreedyModule builds its `eps` buffer from the `device` kwarg alone
         # (torchrl exploration.py) and `forward` raises if `action.device` and
@@ -263,7 +277,7 @@ class MFECAlgorithm(BaseAlgorithm):
         # `_policy` never reaches the collector, so `eval_greedy_module` stayed
         # on CPU and the first evaluate() on GPU died on a cuda action.
         self.greedy_module = EGreedyModule(
-            spec=action_spec,
+            spec=action_spec_unbatched,
             eps_init=self.eps_start,
             eps_end=self.eps_end,
             annealing_num_steps=self.annealing_frames,
@@ -274,7 +288,7 @@ class MFECAlgorithm(BaseAlgorithm):
         # eval_eps=0.0 makes this a no-op (`rand() < 0` is never true), which
         # restores the old pure-argmax behaviour.
         self.eval_greedy_module = _EvalEGreedyModule(
-            spec=action_spec,
+            spec=action_spec_unbatched,
             eps_init=self.eval_eps,
             eps_end=self.eval_eps,
             annealing_num_steps=1,
