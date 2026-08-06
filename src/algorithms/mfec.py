@@ -140,6 +140,10 @@ class MFECAlgorithm(BaseAlgorithm):
             dinov2_model_name: str = "dinov2_vitb14",
             dinov2_repo_dir: str | None = None,
             dinov2_image_size: int = 224,
+            # resnet
+            resnet_weights_path: str | None = None,
+            resnet_model_name: str = "resnet18",
+            resnet_image_size: int = 224,
 
     ) -> None:
 
@@ -163,6 +167,10 @@ class MFECAlgorithm(BaseAlgorithm):
         self.dinov2_model_name = dinov2_model_name
         self.dinov2_repo_dir = dinov2_repo_dir
         self.dinov2_image_size = dinov2_image_size
+        #resnet
+        self.resnet_weights_path = resnet_weights_path
+        self.resnet_model_name = resnet_model_name
+        self.resnet_image_size = resnet_image_size
 
         self._collected_frames = 0
 
@@ -197,6 +205,10 @@ class MFECAlgorithm(BaseAlgorithm):
             dinov2_model_name=self.dinov2_model_name,
             dinov2_repo_dir=self.dinov2_repo_dir,
             dinov2_image_size=self.dinov2_image_size,
+            #resnet
+            resnet_weights_path=self.resnet_weights_path,
+            resnet_model_name=self.resnet_model_name,
+            resnet_image_size=self.resnet_image_size
         )
 
         # Detect number of parallel envs from the proof env's batch_size.

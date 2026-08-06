@@ -254,6 +254,43 @@ def build_encoders(args) -> list[tuple[str, object, str]]:
 
         out.append((label, enc, "mspacman_mfec_train_dinov2"))
 
+        if args.resnet or args.resnet_random_init:
+            from src.encoders.resnet_encoder import ResNetEncoder
+
+            if args.resnet_random_init:
+                # Architecture only: numerics (and therefore key stability, which is
+                # a BatchNorm/float32 property) match the real model; representation
+                # quality does NOT.  Same trick as _RandomInitDINOv2 above.
+                import torchvision.models as tvm
+
+                class _RandomInitResNet(ResNetEncoder):
+                    def __init__(self, model_name, image_size):
+                        import torch.nn as nn
+                        self.model = tvm.get_model(model_name, weights=None)
+                        self.state_dim = int(self.model.fc.in_features)
+                        self.model.fc = nn.Identity()
+                        self.image_size = image_size
+                        self.model.eval()
+                        for p in self.model.parameters():
+                            p.requires_grad_(False)
+                        self._mean = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+                        self._std = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+
+                enc = _RandomInitResNet(args.resnet_model, args.resnet_image_size)
+                label = f"ResNet {args.resnet_model} RANDOM-INIT ({enc.state_dim}-d)"
+        else:
+            enc = ResNetEncoder(
+                model_name=args.resnet_model,
+                weights_path=args.resnet_weights,
+                image_size=args.resnet_image_size,
+            )
+            label = f"ResNet {args.resnet_model} ({enc.state_dim}-d)"
+
+        # Same RGB stack as DINOv2; use "mspacman_mfec_train_rgb" instead once
+        # that config exists.
+        out.append((label, enc, "mspacman_mfec_train_dinov2"))
+
+
     if args.vae_checkpoint:
         from src.encoders.vae_encoder import VAEEncoder
 
@@ -286,6 +323,19 @@ def main() -> int:
     p.add_argument("--dinov2-model", default="dinov2_vits14")
     p.add_argument("--dinov2-repo-dir", default=None)
     p.add_argument("--dinov2-image-size", type=int, default=224)
+    #resnet
+    p.add_argument("--resnet", action="store_true",
+                   help="add an ImageNet-pretrained ResNet arm (torchvision "
+                        "downloads the weights unless --resnet-weights is given)")
+    p.add_argument("--resnet-weights", default=None,
+                   help="local .pth for offline boxes; implies --resnet")
+    p.add_argument("--resnet-random-init", action="store_true",
+                   help="build the ResNet untrained: valid for key stability ONLY")
+    p.add_argument("--resnet-model", default="resnet18",
+                   help="any torchvision resnet: resnet18/34/50/101/152")
+    p.add_argument("--resnet-image-size", type=int, default=224)
+
+
     p.add_argument("--vae-checkpoint", default=None)
     p.add_argument("--device", default="cpu",
                    help="device to embed on (default cpu). RUN THIS ON 'cuda' "

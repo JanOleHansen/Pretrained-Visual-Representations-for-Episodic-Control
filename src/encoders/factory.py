@@ -34,4 +34,11 @@ def make_encoder(
             image_size=dinov2_image_size,
             device=device,
         )
+    if name == "resnet":
+        return ResNetEncoder(
+            model_name=resnet_model_name,
+            weights_path=resnet_weights_path,
+            image_size=resnet_image_size,
+            device=device,
+        )
     raise ValueError(f"Unknown encoder name: {name}")

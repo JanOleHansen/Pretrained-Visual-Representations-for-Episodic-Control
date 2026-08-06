@@ -1,0 +1,64 @@
+name: ALE/MsPacman-v5
+gym_backend: gymnasium
+
+# Paper-faithful MFEC setup (Blundell et al. 2016, §4.1) for any PVM encoder
+# that wants raw RGB: DINOv2, ResNet, and anything else ImageNet-pretrained.
+#
+# This is mspacman_mfec_train.yaml with exactly two changes, both forced by the
+# encoder: GrayScale/Resize are dropped (ImageNet backbones need 3 channels, and
+# resizing to their input grid happens inside the encoder's embed()).  Everything
+# that affects the *task* — sticky actions, reward scale, episode boundaries — is
+# held identical, so the encoder is the only variable across arms.
+#
+# Byte-equivalent to mspacman_mfec_train_dinov2.yaml, which it supersedes; that
+# file is kept so existing dinov2 runs stay reproducible from their config.
+gym_kwargs:
+  # frame_skip MUST stay at 4 — §4.1: "actions are repeated 4 times".  TorchRL
+  # does NOT apply this itself: GymEnv._build_env unconditionally does
+  # `kwargs["frameskip"] = self.frame_skip`, so omitting this line silently sets
+  # ALE frameskip to 1 rather than falling back to the v5 default of 4.
+  frame_skip: 4
+
+  # Sticky actions OFF.  ALE/*-v5 defaults to repeat_action_probability=0.25 and
+  # TorchRL does not touch it.  MFEC's Eq. (1) max-update never decreases, which
+  # the paper's footnote 1 calls "not suited to rational action selection in
+  # stochastic environments" — it latches onto lucky returns.  Sticky actions
+  # also destroy the exact-match rate (§4.1 measures ~50% on Ms. Pac-Man), which
+  # matters more here: PVM features are continuous and the QEC hash quantises at
+  # 1e-5, so exact re-encounters are already scarce.
+  repeat_action_probability: 0.0
+
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# Single RGB frame (no GrayScale, no CatFrames).  Resize + ImageNet-normalise
+# happen inside the encoder's embed().
+#
+# NO SignTransform.  MFEC stores raw Monte-Carlo returns and acts by argmax over
+#     them, so clipping to {-1, 0, +1} makes one dot (10 pts) worth the same as a
+#     ghost (200-1600) or fruit (100-5000).  The paper clips observations, never
+#     rewards.
+#
+# NO CatFrames.  §3 embeds a single frame; a 4-stack folds three frames of
+#     history into the state and makes exact re-encounters strictly rarer.
+#
+# NO EndOfLifeTransform.  MFEC's backward replay (Algorithm 1, lines 9-11) is
+#     defined over whole episodes.  It is inert here anyway: `_step` writes the
+#     life-loss signal only to eol_key, never to "done", and MFEC reads
+#     batch["next", "done"].
+#
+# VecNorm is omitted for the usual MFEC reason: running statistics make the same
+# raw frame embed differently at different timesteps, driving
+# train/exact_hit_rate to 0.  See "VecNorm + MFEC incompatibility" in AGENTS.md.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    # 27,000 decisions x 4 emulator frames = the standard 108,000-frame (30 min)
+    # ALE episode cap.
+    max_steps: 27_000
+  - _target_: torchrl.envs.DoubleToFloat
