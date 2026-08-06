@@ -21,7 +21,7 @@ import torch
 from tensordict import TensorDict
 from torchrl.data import Bounded, Categorical, Composite
 
-from src.algorithms.mfec import MFECAlgorithm
+from src.algorithms.mfec import MFECAlgorithm, QECPolicy
 from src.encoders.random_projectins import RandomProjectionEncoder
 
 
@@ -145,7 +145,15 @@ def test_forward_replaces_inf_when_qec_empty():
 
     assert q.shape == (2, 3, NUM_ACTIONS)
     assert not torch.isinf(q).any()
-    assert torch.all(q == 1e9), "empty QEC must be optimistic everywhere (1e9 sentinel)"
+    # Optimistic entries are OPTIMISTIC_VALUE + U[0, OPTIMISTIC_JITTER), not a
+    # bare sentinel: the jitter makes the downstream argmax pick uniformly
+    # among untried actions instead of always taking the lowest index.
+    lo = QECPolicy.OPTIMISTIC_VALUE
+    hi = lo + QECPolicy.OPTIMISTIC_JITTER
+    assert torch.all((q >= lo) & (q < hi)), (
+        "empty QEC must be optimistic everywhere"
+    )
+    assert q.unique().numel() > 1, "jitter should break ties between actions"
 
 
 def test_forward_replaces_inf_when_partially_populated():
@@ -160,8 +168,12 @@ def test_forward_replaces_inf_when_partially_populated():
 
     assert q.shape == (6, NUM_ACTIONS)
     assert not torch.isinf(q).any()
-    # Untouched actions still saturate at the isinf -> 1e9 replacement.
-    assert torch.all(q[:, 1:] == 1e9)
+    # Untouched actions stay optimistic (jittered); action 0 is now a real,
+    # far smaller estimate, so optimism still wins the argmax.
+    lo = QECPolicy.OPTIMISTIC_VALUE
+    hi = lo + QECPolicy.OPTIMISTIC_JITTER
+    assert torch.all((q[:, 1:] >= lo) & (q[:, 1:] < hi))
+    assert torch.all(q[:, 0] < lo)
 
 
 def test_embed_module_matches_encoder_and_feeds_policy():
