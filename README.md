@@ -439,6 +439,31 @@ MFEC's state embedding is pluggable (`algorithm.encoder_name`):
   ```
 - `dinov2` — a frozen DINOv2 ViT (`src/encoders/dino_v2_encoder.py`); see
   `experiment/mfec/mspacman_dinov2.yaml`.
+- `resnet` — a frozen ImageNet ResNet (`src/encoders/resnet_encoder.py`), the
+  supervised counterpart to `dinov2`. `state_dim` is fixed by the backbone
+  (512 for resnet18/34, 2048 for resnet50+) and read off `fc.in_features`;
+  `fc` is replaced with `nn.Identity` so `embed()` returns pooled features.
+  Unlike `dinov2_weights_path`, `resnet_weights_path` may be `null` —
+  torchvision then downloads `IMAGENET1K_V1` into `~/.cache/torch`, so set a
+  path on an offline cluster. See `experiment/mfec/mspacman_resnet.yaml`.
+
+  The backbone is kept in `eval()` mode, which matters more here than for
+  DINOv2: in `train()` mode BatchNorm normalises with *batch* statistics, so
+  the same frame would embed differently depending on what else is in the
+  batch and the QEC exact-hit path would never fire.
+
+The RGB encoders (`dinov2`, `resnet`) share one env pair,
+`mspacman_mfec_train_rgb` / `mspacman_mfec_eval_rgb`: single RGB frame, no
+GrayScale/Resize (each encoder resizes and ImageNet-normalises inside
+`embed()`), and otherwise identical to the paper-faithful MFEC stack so the
+encoder is the only variable across arms.
+
+> Encoder keyword arguments are threaded `experiment YAML → MFECAlgorithm.__init__
+> → make_encoder(...)`, and `MFECAlgorithm.setup()` passes **every** encoder's
+> keywords on every call regardless of `encoder_name`. A keyword added for one
+> encoder must therefore land in all three places at once, or *every* encoder
+> breaks with a `TypeError`, not just the new one.
+> `tests/test_encoder_factory.py` pins that contract.
 
 ### Vet a new encoder before you train with it
 

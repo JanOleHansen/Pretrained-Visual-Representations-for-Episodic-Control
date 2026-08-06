@@ -403,6 +403,11 @@ configs/
                               dropped (DINOv2 needs 3 channels and resizes internally); task
                               settings held identical so encoder is the only variable
   environment/mspacman_mfec_eval_dinov2.yaml  — eval counterpart (identical by design)
+  environment/mspacman_mfec_train_rgb.yaml — the generalised version of the two above, for ANY
+                              RGB PVM (dinov2, resnet, ...); byte-equivalent to the _dinov2
+                              pair, which is kept only so existing runs stay reproducible.
+                              Prefer this one for new encoder arms.
+  environment/mspacman_mfec_eval_rgb.yaml  — eval counterpart (identical by design)
   environment/mspacman_nec_train.yaml — ALE/MsPacman-v5 for NEC: action-repeat 4, NO
                               SignTransform (paper §4 names Ms. Pac-Man as a game where
                               NEC's lack of reward clipping is what produces the result)
@@ -431,6 +436,10 @@ configs/
                               DQN-style mspacman_train_dinov2 env pair until Aug 2026; runs
                               logged before that carry reward clipping, sticky actions and a
                               4,500-step cap, and are NOT comparable to mspacman.yaml.
+  experiment/mfec/mspacman_resnet.yaml — same, with encoder_name=resnet (frozen ImageNet
+                              resnet18, state_dim=512) + the mspacman_mfec_*_rgb env pair.
+                              resnet_weights_path may be null (torchvision downloads
+                              IMAGENET1K_V1); set a path on an offline cluster.
   experiment/nec/pong.yaml     — NEC on Pong (10M agent steps = 40M raw frames, num_envs=16);
                               keeps the clipped env — Pong's rewards are already in [-1, 1]
                               so SignTransform is a no-op there, not a deviation
@@ -581,6 +590,39 @@ not hardcoded into `QECPolicy`. `MFECAlgorithm.setup()` builds it via
 `make_encoder(encoder_name, ...)` (`src/encoders/factory.py`).
 `QECPolicy.__deepcopy__` shares the encoder by reference (same object the
 collector's policy uses), same as `qec`.
+
+Available: `random_projection` (default), `vae`, `dinov2`, `resnet`
+(frozen ImageNet ResNet, `src/encoders/resnet_encoder.py`; `state_dim` comes
+off `fc.in_features`, `fc` becomes `nn.Identity`, and `weights_path=None` is
+legal — torchvision downloads `IMAGENET1K_V1`). The RGB backbones share the
+`mspacman_mfec_train_rgb` / `mspacman_mfec_eval_rgb` env pair.
+
+### Adding an encoder keyword is a THREE-file change
+
+Keywords are threaded `experiment YAML → MFECAlgorithm.__init__ →
+make_encoder(...)`, and `setup()` passes **every** encoder's keywords on every
+call regardless of `encoder_name`. So a keyword added in only some of those
+places does not fail "just for that encoder":
+
+| Missed step | Failure |
+|---|---|
+| Not in `make_encoder`'s signature | `TypeError: make_encoder() got an unexpected keyword argument ...` in `setup()`, for **every** encoder — the whole algorithm is down |
+| Encoder class not imported in `factory.py` | `NameError` the first time that branch is selected |
+| YAML key ≠ `__init__` parameter name | `TypeError` from Hydra `instantiate()` before setup even runs |
+
+All three shipped together when `resnet` was added (commit `9f9bbc4`) and took
+down every MFEC run, including `random_projection`. `tests/test_resnet_encoder.py`
+did not catch it because it constructs `ResNetEncoder` directly and never goes
+through the factory — the seam is now pinned by `tests/test_encoder_factory.py`,
+which checks the signature against the real call site (via `ast`), that every
+name the factory references is bound, and that each MFEC experiment's
+`algorithm:` keys bind to `MFECAlgorithm.__init__`.
+
+**Keep `ResNetEncoder` in `eval()` mode.** In `train()` mode BatchNorm
+normalises with batch statistics, so the same frame embeds differently
+depending on batch composition and the QEC exact-hit path never fires. This is
+the one way ResNet is more fragile than DINOv2 as a PVM; `load_state()`
+re-asserts it, and `tests/test_resnet_encoder.py` covers both.
 
 ### Policy chain — φ runs ONCE per frame
 

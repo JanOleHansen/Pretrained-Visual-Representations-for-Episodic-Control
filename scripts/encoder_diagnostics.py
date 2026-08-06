@@ -254,30 +254,35 @@ def build_encoders(args) -> list[tuple[str, object, str]]:
 
         out.append((label, enc, "mspacman_mfec_train_dinov2"))
 
-        if args.resnet or args.resnet_random_init:
-            from src.encoders.resnet_encoder import ResNetEncoder
+    # NOTE: this block is deliberately at function scope, NOT nested inside the
+    # DINOv2 branch above.  Nesting it there (as it was until this was caught)
+    # made the ResNet arms unreachable without DINOv2 flags, and made its `else`
+    # bind to the *DINOv2* `if` — so a plain `--dinov2_weights` run fell into
+    # the ResNet constructor with the import skipped, i.e. a NameError.
+    if args.resnet or args.resnet_random_init:
+        from src.encoders.resnet_encoder import ResNetEncoder
 
-            if args.resnet_random_init:
-                # Architecture only: numerics (and therefore key stability, which is
-                # a BatchNorm/float32 property) match the real model; representation
-                # quality does NOT.  Same trick as _RandomInitDINOv2 above.
-                import torchvision.models as tvm
+        if args.resnet_random_init:
+            # Architecture only: numerics (and therefore key stability, which is
+            # a BatchNorm/float32 property) match the real model; representation
+            # quality does NOT.  Same trick as _RandomInitDINOv2 above.
+            import torchvision.models as tvm
 
-                class _RandomInitResNet(ResNetEncoder):
-                    def __init__(self, model_name, image_size):
-                        import torch.nn as nn
-                        self.model = tvm.get_model(model_name, weights=None)
-                        self.state_dim = int(self.model.fc.in_features)
-                        self.model.fc = nn.Identity()
-                        self.image_size = image_size
-                        self.model.eval()
-                        for p in self.model.parameters():
-                            p.requires_grad_(False)
-                        self._mean = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
-                        self._std = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+            class _RandomInitResNet(ResNetEncoder):
+                def __init__(self, model_name, image_size):
+                    import torch.nn as nn
+                    self.model = tvm.get_model(model_name, weights=None)
+                    self.state_dim = int(self.model.fc.in_features)
+                    self.model.fc = nn.Identity()
+                    self.image_size = image_size
+                    self.model.eval()
+                    for p in self.model.parameters():
+                        p.requires_grad_(False)
+                    self._mean = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+                    self._std = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
 
-                enc = _RandomInitResNet(args.resnet_model, args.resnet_image_size)
-                label = f"ResNet {args.resnet_model} RANDOM-INIT ({enc.state_dim}-d)"
+            enc = _RandomInitResNet(args.resnet_model, args.resnet_image_size)
+            label = f"ResNet {args.resnet_model} RANDOM-INIT ({enc.state_dim}-d)"
         else:
             enc = ResNetEncoder(
                 model_name=args.resnet_model,
@@ -286,9 +291,7 @@ def build_encoders(args) -> list[tuple[str, object, str]]:
             )
             label = f"ResNet {args.resnet_model} ({enc.state_dim}-d)"
 
-        # Same RGB stack as DINOv2; use "mspacman_mfec_train_rgb" instead once
-        # that config exists.
-        out.append((label, enc, "mspacman_mfec_train_dinov2"))
+        out.append((label, enc, "mspacman_mfec_train_rgb"))
 
 
     if args.vae_checkpoint:

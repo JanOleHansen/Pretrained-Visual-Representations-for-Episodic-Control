@@ -18,7 +18,10 @@ algorithm:
   encoder_name: resnet
   # null -> torchvision downloads IMAGENET1K_V1 into ~/.cache/torch.  Set a path
   # on an offline cluster, the way dinov2_weights has to be set.
-  resnet_weights: null
+  # Key must match MFECAlgorithm.__init__'s parameter name exactly — Hydra
+  # instantiate() passes these straight through as keyword arguments, so
+  # `resnet_weights` (the name used until this was caught) is a TypeError.
+  resnet_weights_path: null
   resnet_model_name: resnet18
   resnet_image_size: 224
   # Fixed by the backbone: 512 for resnet18/34, 2048 for resnet50/101/152.

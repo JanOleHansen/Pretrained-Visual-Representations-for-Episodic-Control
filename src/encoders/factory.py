@@ -2,6 +2,8 @@ import torch
 from .random_projectins import RandomProjectionEncoder
 from .vae_encoder import VAEEncoder
 from .dino_v2_encoder import DINOv2Encoder
+from .resnet_encoder import ResNetEncoder
+
 
 def make_encoder(
         name: str,
@@ -17,7 +19,19 @@ def make_encoder(
         dinov2_model_name: str = "dinov2_vits14",
         dinov2_repo_dir: str | None = None,
         dinov2_image_size: int = 224,
+        # resnet
+        resnet_weights_path: str | None = None,
+        resnet_model_name: str = "resnet18",
+        resnet_image_size: int = 224,
 ):
+    """Build MFEC's φ.
+
+    NOTE: ``MFECAlgorithm.setup()`` passes *every* encoder-specific keyword on
+    every call, whatever ``name`` is — so a keyword added here for one encoder
+    must be accepted here before the call site starts sending it, or *all*
+    encoders break with a TypeError, not just the new one.
+    ``tests/test_encoder_factory.py`` pins that seam.
+    """
     if name == "random_projection":
         return RandomProjectionEncoder(obs_flat_dim, state_dim, seed)
     if name == "vae":
@@ -35,6 +49,8 @@ def make_encoder(
             device=device,
         )
     if name == "resnet":
+        # weights_path=None is legal here (unlike dinov2): torchvision downloads
+        # IMAGENET1K_V1 into ~/.cache/torch.  Set a path on an offline cluster.
         return ResNetEncoder(
             model_name=resnet_model_name,
             weights_path=resnet_weights_path,
