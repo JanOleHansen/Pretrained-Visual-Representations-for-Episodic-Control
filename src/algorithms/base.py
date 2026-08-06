@@ -77,6 +77,27 @@ class BaseAlgorithm(ABC):
         """Process one collected batch and return scalar metrics."""
 
     # ------------------------------------------------------------------
+    # Evaluation diagnostics (optional)
+    # ------------------------------------------------------------------
+
+    def reset_eval_metrics(self) -> None:
+        """Clear whatever :meth:`eval_metrics` accumulates.
+
+        ``BaseTrainer.evaluate`` calls this immediately before the rollout.
+        Gradient-based algorithms have nothing to report and inherit the no-op.
+        """
+
+    def eval_metrics(self) -> dict[str, float]:
+        """Algorithm-side ``eval/*`` diagnostics for the rollout just finished.
+
+        Merged into the trainer's ``eval/*`` dict. Episodic-control algorithms
+        use this to report how often the evaluation policy actually found the
+        query state in memory — the one number that distinguishes "the memory
+        holds a bad policy" from "the memory is never being hit at all".
+        """
+        return {}
+
+    # ------------------------------------------------------------------
     # Checkpointing
     # ------------------------------------------------------------------
 

@@ -16,6 +16,27 @@ from functools import partial
 from typing import Sequence
 
 
+def env_worker_device(num_envs: int, device: str) -> str:
+    """Device the env — and therefore its transform stack — actually runs on.
+
+    A CUDA context cannot survive the fork/spawn into a ``ParallelEnv`` worker,
+    so with ``num_envs > 1`` every per-worker transform (``ToTensorImage``,
+    ``GrayScale``, ``Resize``, ...) executes on **CPU** no matter what
+    ``device`` says; the collector only moves the finished observation to the
+    accelerator afterwards.
+
+    Anything that has to reproduce the *same observation values* as the
+    collector — chiefly ``BaseTrainer.evaluate``, which builds its own
+    ``num_envs=1`` env — must build that env on this device rather than on the
+    accelerator.  Bilinear-antialias ``Resize`` and ``GrayScale`` do not return
+    bit-identical floats on CPU and CUDA, and for MFEC/NEC that difference is
+    not cosmetic: the episodic memory is keyed on the embedding, so a few ULP
+    of drift turns every lookup into a miss.  See "Eval must preprocess
+    observations on the training env's device" in AGENTS.md.
+    """
+    return "cpu" if num_envs > 1 else device
+
+
 def make_env(
     name: str,
     num_envs: int = 1,
@@ -40,7 +61,7 @@ def make_env(
         gym_backend: optional gym backend name for ``set_gym_backend``
             (e.g. ``"gymnasium"``); if ``None`` torchrl picks the default.
     """
-    worker_device = "cpu" if num_envs > 1 else device
+    worker_device = env_worker_device(num_envs, device)
 
     env_fn = partial(
         _make_gymnasium_env,

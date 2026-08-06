@@ -572,6 +572,111 @@ after an Eq. (1) max-update. A kNN **read** deliberately does not refresh
 recency. A FIFO ring buffer would evict the oldest *insertions*, which on
 Atari are exactly the early-level states re-visited every episode.
 
+### Eval must preprocess observations on the training env's device
+
+**This is the bug that made `eval/return_mean` sit at random-play level (~350
+on Ms. Pac-Man) while `train/episode_reward` climbed past 3 000.**
+
+`env_worker_device(num_envs, device)` (`src/environments/factory.py`) is the
+device an env — and therefore its whole `ToTensorImage → GrayScale → Resize`
+stack — actually runs on. A CUDA context cannot survive the spawn into a
+`ParallelEnv` worker, so **`num_envs > 1` forces the transforms onto CPU** no
+matter what `trainer.accelerator` says; the collector only moves the finished
+observation to the GPU afterwards. `BaseTrainer.evaluate()` used to build its
+own `num_envs=1` eval env on `str(self.device)`, i.e. on **CUDA** — so on a GPU
+box the identical ALE frame went through CPU kernels during training and CUDA
+kernels during evaluation.
+
+Bilinear-antialias `Resize` is not bit-identical across the two, and MFEC keys
+its memory on `round(embedding * key_scale)`. Measured (64-d random projection
+of an 84×84 frame): **1e-7 of drift per pixel already changes ~40 % of hash
+keys and 1e-6 changes all of them.** Evaluation then answers every query with a
+k-neighbour mean, which is near-constant across actions, so the argmax is
+noise. Measured on Ms. Pac-Man after 60 k decisions (train 1 858):
+
+| drift injected into eval observations | `eval/return_mean` | exact-hit rate |
+|---|---|---|
+| none (train and eval on the same device) | **2 076** | 0.13 |
+| 1e-7 (one float32 ULP) | 390 | 0.05 |
+| 1e-6 | 292 | 0.00 |
+| 1e-5 | 348 | 0.00 |
+
+So: `evaluate()` builds the eval env on `self._env_device` (set in
+`BaseTrainer.setup()` from `env_worker_device`) and moves the tensordict onto
+`self.device` for the policy call and back for the env step — the same device
+flow the collector uses. Do **not** "simplify" that back to
+`device=str(self.device)`. Guarded by
+`tests/test_mfec_eval_lookup.py::test_evaluate_builds_eval_env_on_the_env_device_not_the_accelerator`.
+
+The same reasoning applies to any future consumer that has to reproduce the
+collector's observation bytes outside the collector.
+
+**Standalone `src/eval.py` must be given the training run's `trainer.num_envs`
+and `trainer.accelerator`**, because that pair is what `_env_device` is derived
+from and it is not stored in the checkpoint. `configs/eval.yaml` defaults to
+`num_envs: 1, accelerator: cpu`; evaluating a checkpoint trained with
+`num_envs: 4, accelerator: gpu` from those defaults happens to work (both give
+`cpu`), but adding `trainer.accelerator=gpu` without `trainer.num_envs=4`
+re-creates the mismatch. `eval/exact_hit_rate` near 0 on a non-empty QEC is the
+signature.
+
+### Near-exact kNN hits: recompute the distance, never trust `cdist`
+
+`QEC.estimate_all` treats a kNN top-1 that is numerically indistinguishable
+from the query as an exact re-encounter (Eq. 2 case 1) — the last line of
+defence when a hash key has drifted. Two things this must get right:
+
+1. **`torch.cdist` cannot be used for the test.** It takes the
+   `x² + y² − 2xy` shortcut as soon as either side exceeds 25 rows (always,
+   here), which cancels catastrophically at short range: measured **4.2e-4 for
+   a pair whose true distance is 2.8e-6**. Ranking survives that error; a
+   near-zero threshold does not. The old `dists[:, 0] < 1e-5` was *below
+   `cdist`'s own noise floor* and therefore fired essentially at random.
+   `estimate_all` recomputes the winner's distance directly with
+   `linalg.vector_norm(q - top1)`, which is O(miss × d) and exact.
+2. **The tolerance is relative** (`QEC._NEAR_EXACT_RTOL`, 3e-5 × `(1 + ‖q‖)`).
+   The comparison is an L2 distance in embedding space and that space is the
+   encoder's: `‖φ(o)‖ ≈ 2` for a 64-d random projection, 10–50× that for
+   DINOv2/ResNet. An absolute threshold is meaningless across encoders.
+
+   The margin is tighter than it looks, so do not widen this casually. Measured
+   over 2.25 M frame pairs from a random rollout on Ms. Pac-Man (random
+   projection, `state_dim=64`): the closest pair of genuinely *different*
+   frames is **1.1e-3** apart — not the ~0.14 the median suggests — while
+   1e-6 of per-pixel float noise moves an embedding by 7.8e-6. `≈9e-5` sits
+   ~12× under the first and ~11× over the second. Err low: a false merge is a
+   silently wrong Q value, a missed rescue costs one lookup.
+
+   Drift above ~1e-5 per pixel is deliberately **not** covered — no CPU/CUDA
+   kernel pair differs by that much, and a regime that does is a bug to fix at
+   the source, not to absorb here. Past the tolerance the lookup degrades to
+   the k-neighbour mean, which is at least unbiased; measured, that still plays
+   at ~1100 rather than collapsing, because false merges no longer happen.
+
+Guarded by `tests/test_mfec_eval_lookup.py`.
+
+### `eval/exact_hit_rate` — the metric that makes this failure visible
+
+`BaseAlgorithm` has two optional hooks, `reset_eval_metrics()` and
+`eval_metrics()`, which `BaseTrainer.evaluate()` calls around the rollout and
+merges into the `eval/*` dict (default: no-ops returning `{}`). MFEC uses them
+to report `eval/exact_hit_rate` and `eval/memory_hit_rate` from `QEC`'s
+read-path counters. A collapsed `eval/return_mean` with a hit rate near 0 means
+the memory is never being reached — a preprocessing/observation problem, not a
+bad policy. `evaluate()` also reports `eval/episode_length`, which separates
+"plays badly" from "episode ends early".
+
+The eval denominator is every *(state, action)* pair the policy asks about
+(all `|A|` per frame); `train/exact_hit_rate` only counts the single action
+actually taken, so the two differ by roughly `|A|` and are not comparable
+point for point. §4.1's "~50 % for Ms. PAC-MAN" is the train-side quantity.
+
+`train/exact_hit_rate` is now **omitted** on batches that closed no episode
+rather than reported as `0.0`. A Ms. Pac-Man episode is ~600 decisions against
+`frames_per_batch: 1024` over 4 envs, so most batches make no QEC queries at
+all, and the fabricated zeros made the logged series oscillate between 0 and
+the real rate. This matches `_IntervalStats`' convention in `StepTrainer`.
+
 ### Exact-match keys must be invariant to batch shape
 
 `RandomProjectionEncoder.embed` accumulates the projection in **float64**.

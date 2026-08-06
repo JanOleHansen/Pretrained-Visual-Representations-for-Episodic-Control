@@ -478,11 +478,18 @@ class MFECAlgorithm(BaseAlgorithm):
                 self._carry[env_idx] = None
 
         # --- 4. Early-exit if no complete episode this batch ---------------
+        #
+        # train/exact_hit_rate is deliberately *absent* here rather than 0.0.
+        # A Ms. Pac-Man episode is ~600 decisions and frames_per_batch is 1024
+        # over 4 envs, so most batches close no episode and make no QEC
+        # queries; reporting 0.0 for those made the logged series oscillate
+        # between 0 and the real rate and read like a broken memory.  Omitting
+        # the key leaves a gap, matching _IntervalStats' convention in
+        # StepTrainer ("a genuine gap instead of a fabricated point").
         if not collect_states:
             return {
                 "train/epsilon":        float(self.greedy_module.eps),
                 "train/qec_size":       float(np.mean(self.qec._sizes)),
-                "train/exact_hit_rate": 0.0,
             }
 
         states_gpu  = torch.cat(collect_states,  dim=0)    # (N_done, d)
@@ -589,6 +596,38 @@ class MFECAlgorithm(BaseAlgorithm):
             init_random_frames=0,
             max_frames_per_traj=self.max_frames_per_traj,
         )
+
+    #
+    #   Evaluation diagnostics
+    #
+
+    def reset_eval_metrics(self) -> None:
+        self.qec.reset_lookup_stats()
+
+    def eval_metrics(self) -> dict[str, float]:
+        """How often the *evaluation* policy actually found the state in QEC.
+
+        MFEC's score is only as good as its recall: if the eval rollout never
+        resolves a query to a stored (state, action) pair, every Q estimate is
+        a k-neighbour mean, all actions of a state score alike, and the agent
+        plays at random however good the memory is.  That failure is invisible
+        in ``eval/return_mean`` alone — it just looks like a bad policy — so
+        the hit rate is logged next to it.  A rate near 0 means train-time and
+        eval-time observations are not the same bytes.
+
+        Note the denominator differs from ``train/exact_hit_rate``, so the two
+        are not comparable point for point.  Here it is every *(state, action)*
+        pair the policy asks about — all ``|A|`` of them per frame — whereas
+        ``step()`` only queries the single action actually taken.  Blundell et
+        al. (2016) §4.1's "about ... 50% for Ms. PAC-MAN" is the latter.
+        """
+        queries, exact, near = self.qec.lookup_stats()
+        if queries == 0:
+            return {}
+        return {
+            "eval/exact_hit_rate":  exact / queries,
+            "eval/memory_hit_rate": (exact + near) / queries,
+        }
 
     #
     #   Checkpointing
@@ -867,6 +906,30 @@ class QEC:
     # Maximum intermediate (queries × stored) tensor in bytes before chunking.
     _CHUNK_BYTES = 256 * 1024 * 1024
 
+    #: Relative tolerance for treating the nearest stored key as *the same
+    #: state* (Eq. 2, case 1) rather than a neighbour to average over.
+    #:
+    #: It has to be relative: the quantity compared is an L2 distance in
+    #: embedding space, and that space is chosen by the encoder.  A 64-d random
+    #: projection of an 84×84 frame has ``‖φ(o)‖ ≈ 2``; a frozen DINOv2 or
+    #: ResNet embedding is 10–50× that.  The absolute ``1e-5`` this replaces
+    #: was effectively zero for every encoder.
+    #:
+    #: The value is squeezed between two measured quantities.  Over 2.25 M
+    #: frame pairs from a random rollout on Ms. Pac-Man (random projection,
+    #: ``state_dim=64``):
+    #:
+    #:   * closest pair of genuinely *different* frames:  1.1e-3
+    #:   * embedding drift from 1e-6 of per-pixel float noise:  7.8e-6
+    #:
+    #: ``3e-5 · (1 + ‖q‖) ≈ 9e-5`` sits ~12x under the first and ~11x over the
+    #: second.  Erring low is deliberate: with the eval env now built on the
+    #: training env's device (see ``env_worker_device``) the drift this absorbs
+    #: should be zero, so this is defence in depth — and merging two distinct
+    #: states is a silently wrong Q value, while missing a rescue only costs
+    #: one lookup.
+    _NEAR_EXACT_RTOL = 3e-5
+
     def __init__(
         self,
         num_actions: int,
@@ -892,6 +955,37 @@ class QEC:
         self._key_to_slot: list[OrderedDict[bytes, int]] = [
             OrderedDict() for _ in range(num_actions)
         ]
+
+        self.reset_lookup_stats()
+
+    # ------------------------------------------------------------------
+    # Read-path instrumentation
+    # ------------------------------------------------------------------
+
+    def reset_lookup_stats(self) -> None:
+        """Zero the counters :meth:`lookup_stats` reports.
+
+        The near-exact tally stays a device tensor: it is accumulated inside
+        ``estimate_all``, which the collector calls once per env step, and
+        reading a GPU bool-sum back per action would put ``|A|`` forced syncs
+        on the policy's hot path.  It is converted once, in ``lookup_stats``.
+        """
+        self._lookup_queries = 0
+        self._lookup_exact = 0
+        self._lookup_near = torch.zeros((), dtype=torch.long, device=self.device)
+
+    def lookup_stats(self) -> tuple[int, int, int]:
+        """``(queries, exact_hits, near_exact_hits)`` since the last reset.
+
+        One "query" is one *(state, action)* pair asked of
+        :meth:`estimate_all`, i.e. ``|A|`` per frame the policy sees — every
+        candidate action, not only the one taken.  A policy whose hit rate is
+        0 is not exploiting episodic memory at all, however full the buffers
+        are; it is answering every question with a k-neighbour mean.
+
+        Calls that short-circuit on an empty memory are not counted.
+        """
+        return self._lookup_queries, self._lookup_exact, int(self._lookup_near)
 
     # ------------------------------------------------------------------
     # Key generation
@@ -984,6 +1078,9 @@ class QEC:
                 else:
                     miss_b.append(b)
 
+            self._lookup_queries += B
+            self._lookup_exact += len(hit_b)
+
             if hit_b:
                 hit_b_t = torch.tensor(hit_b,    dtype=torch.long, device=self.device)
                 hit_s_t = torch.tensor(hit_slots, dtype=torch.long, device=self.device)
@@ -1000,10 +1097,39 @@ class QEC:
             miss_b_t   = torch.tensor(miss_b, dtype=torch.long, device=self.device)
             miss_q     = queries[miss_b_t]     # (miss_count, d)
             k_fetch    = min(self.k + 1, size_a)
-            dists, idx = self.knn_action(miss_q, a, k_fetch)  # (miss_count, k_fetch)
+            # Distances are used only for the ranking knn_action already did;
+            # see the near-exact note below for why they are not read here.
+            _, idx     = self.knn_action(miss_q, a, k_fetch)  # (miss_count, k_fetch)
 
-            # Near-exact in the kNN result (float safety; should be rare)
-            near_exact = dists[:, 0] < 1e-5
+            # Near-exact in the kNN result: the nearest stored key is
+            # numerically indistinguishable from the query, so this *is* Eq. 2
+            # case 1 and must return the stored value, not a k-neighbour mean.
+            #
+            # This is the last line of defence for the hash key, which is
+            # brittle by construction — `round(state * key_scale)` flips as
+            # soon as a coordinate crosses a .5 boundary, so a drift of 1e-7
+            # per pixel already changes ~40% of keys and 1e-6 changes all of
+            # them.  Falling through to the mean is not graceful degradation:
+            # it hands every action of a state near-identical Q values and the
+            # argmax becomes noise.
+            #
+            # `dists` cannot be used for this test.  torch.cdist takes the
+            # `x^2 + y^2 - 2xy` shortcut once either side exceeds 25 rows (it
+            # always does here), and that cancels catastrophically at short
+            # range: measured 4.2e-4 for a pair whose true distance is 2.8e-6.
+            # Ranking survives the error, a near-zero threshold does not — the
+            # absolute `< 1e-5` this replaces was below cdist's own noise floor
+            # and so fired essentially at random.  Recomputing the single
+            # winner's distance directly is exact and costs O(miss x d).
+            top1_dist = torch.linalg.vector_norm(
+                miss_q - self.states[a, idx[:, 0]], dim=-1
+            )
+            # Tolerance is relative to the query norm so it means the same
+            # thing for a random projection and for a ViT embedding.
+            near_exact = top1_dist <= self._NEAR_EXACT_RTOL * (
+                1.0 + torch.linalg.vector_norm(miss_q, dim=-1)
+            )
+            self._lookup_near += near_exact.sum()
             k_use      = min(self.k, k_fetch)
             knn_vals   = self.values[a, idx[:, :k_use]].float()   # (miss_count, k_use)
             knn_avg    = knn_vals.mean(dim=-1)
@@ -1219,6 +1345,7 @@ class QEC:
         self.capacity    = d["capacity"]
         self.k           = d["k"]
         self.device      = d["device"]
+        self.reset_lookup_stats()   # __init__ is bypassed on unpickle
         self._key_scale  = d.get("key_scale", 1e5)   # default for old checkpoints
         self._sizes      = list(d["_sizes"])
         # Pre-LRU checkpoints carry a "_write_ptrs" key; it is ignored — those

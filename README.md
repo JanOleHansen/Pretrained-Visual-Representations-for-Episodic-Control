@@ -113,6 +113,7 @@ The `BaseAlgorithm` API is small:
 | `get_policy()`            | Greedy policy used by `trainer.evaluate()`.                       |
 | `get_explore_policy()`    | Exploration policy used by the data collector.                    |
 | `get_collector_config()`  | Tells the trainer how to size the `Collector`.                    |
+| `reset_eval_metrics()` / `eval_metrics()` | *Optional* (default no-op / `{}`). Called by `evaluate()` around the rollout; whatever `eval_metrics()` returns is merged into the `eval/*` dict. MFEC reports its episodic-memory hit rate here. |
 
 `step()` is intentionally unconstrained — the algorithm decides what to do with the
 batch. For DQN that means: anneal epsilon, store, skip during warm-up, otherwise
@@ -241,8 +242,12 @@ for batch in self.collector:
 ```
 
 `BaseTrainer` owns:
-- **Device** — resolves `accelerator` + `devices` to `torch.device`.
+- **Device** — resolves `accelerator` + `devices` to `torch.device`, and
+  `_env_device` (via `env_worker_device`) for the env itself: `ParallelEnv`
+  workers are CPU-only, so with `num_envs > 1` the two differ.
 - **Env lifecycle** — creates train/eval envs via `Environment.make_env()`.
+  Both are built on `_env_device` so training and evaluation observations go
+  through the *same* preprocessing kernels — see "Reproducing MFEC on Atari".
 - **Eval** — `evaluate(num_episodes)` runs the greedy policy.
 - **Callbacks** — fires `ON_TRAIN_START`, `ON_STEP_END`, `ON_TRAIN_END` events.
 - **Checkpoints** — orchestrates save/load of algorithm state.
@@ -416,6 +421,33 @@ because QEC values are optimistic. Blundell et al. §4.1 report the ε = 0.005
 policy's score, so that is what `get_policy()` runs. Set `algorithm.eval_eps=0.0`
 for a deterministic eval. If you ever see `eval/return_min == eval/return_mean ==
 eval/return_max` with `return_std` pinned at 0, this is what happened.
+
+**Evaluation preprocesses observations on the training env's device.** With
+`trainer.num_envs > 1` the training envs live in `ParallelEnv` workers, which
+are CPU-only (a CUDA context does not survive the spawn) — so the whole
+`ToTensorImage → GrayScale → Resize` stack runs on CPU even under
+`accelerator: gpu`. `BaseTrainer.evaluate()` therefore builds its eval env on
+`self._env_device` (from `env_worker_device`), not on the accelerator, and
+moves the tensordict onto the policy device for the forward pass only.
+
+This is not a micro-optimisation. Bilinear-antialias `Resize` is not
+bit-identical on CPU and CUDA, and MFEC keys its memory on
+`round(embedding * key_scale)`: **1e-7 of drift per pixel already changes ~40 %
+of hash keys, 1e-6 changes all of them.** Every lookup then degrades to a
+k-neighbour mean, which is near-constant across actions, so the argmax becomes
+noise. Measured on Ms. Pac-Man after 60 k decisions (training at 1 858):
+no drift → `eval/return_mean` 2 076; 1e-7 → 390; 1e-6 → 292. Building the eval
+env on the accelerator produced exactly that collapse — a training curve
+climbing past 3 000 next to a flat `eval/return_mean` around 350.
+
+**`eval/exact_hit_rate` is the metric to check first** when `eval/return_mean`
+disagrees with `train/episode_reward`. It reports how often the evaluation
+policy actually found the query state in the QEC; near 0 means the memory is
+not being reached at all (an observation problem), rather than holding a bad
+policy. `eval/episode_length` is logged alongside so a low return can be told
+apart from an episode that ends early. Note the eval rate counts every
+*(state, action)* pair queried while `train/exact_hit_rate` counts only the
+action actually taken, so the two differ by roughly `|A|`.
 
 **Optimistic initialisation is tie-broken randomly.** The QEC reports `+inf`
 for any action with `<= k` stored entries so untried actions are always

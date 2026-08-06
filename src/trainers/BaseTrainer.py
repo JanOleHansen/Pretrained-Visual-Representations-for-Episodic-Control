@@ -12,6 +12,7 @@ from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 from src.algorithms.base import BaseAlgorithm
 from src.environments.environment import Environment
+from src.environments.factory import env_worker_device
 from src.utils.device import resolve_device
 
 
@@ -80,11 +81,19 @@ class BaseTrainer(ABC):
         )
         self.algorithm.device = self.device
 
+        #: Device the *environment* (and therefore its transform stack) runs
+        #: on.  Differs from ``self.device`` whenever ``num_envs > 1`` puts the
+        #: envs in ``ParallelEnv`` workers, which are CPU-only.  ``setup()``
+        #: recomputes it from the real ``num_envs``; the accelerator is the
+        #: right answer for the single-env case.
+        self._env_device: str = str(self.device)
+
         self._step: int = 0
 
     def setup(self) -> None:
         """Create environment and set up the algorithm."""
         num_envs = int(self.trainer_cfg.get("num_envs", 1))
+        self._env_device = env_worker_device(num_envs, str(self.device))
 
         def make_env():
             return self.environment.make_env(
@@ -127,40 +136,63 @@ class BaseTrainer(ABC):
         """Run evaluation episodes using the greedy policy.
 
         Creates a fresh single-env for eval (separate from the train env).
+
+        The eval env is built on ``self._env_device`` — the device the
+        *training* env runs on — not on the accelerator.  With ``num_envs > 1``
+        those differ: the training observations are produced by CPU-side
+        transforms inside ``ParallelEnv`` workers, and ``GrayScale`` /
+        bilinear-antialias ``Resize`` do not return bit-identical floats on CPU
+        and CUDA.  Building the eval env on the accelerator therefore feeds the
+        policy observations that differ from the training ones in the last few
+        bits — invisible to a DQN network, fatal to MFEC/NEC, whose episodic
+        memory is a hash of the embedding (see ``env_worker_device``).  The
+        tensordict is moved onto ``self.device`` for the policy call and back
+        for the env step, exactly as the collector does.
         """
         eval_env = self.eval_environment.make_env(
             num_envs=1,
-            device=str(self.device),
+            device=self._env_device,
         )
         policy = self.algorithm.get_policy()
+        self.algorithm.reset_eval_metrics()
 
         returns: list[float] = []
+        lengths: list[int] = []
         with torch.no_grad(), set_exploration_type(ExplorationType.MODE):
             for _ in range(num_episodes):
                 td = eval_env.reset()
                 episode_return = 0.0
+                episode_length = 0
                 done = False
                 while not done:
-                    td = policy(td)
+                    td = policy(td.to(self.device)).to(self._env_device)
                     td = eval_env.step(td)
                     episode_return += td["next", "reward"].sum().item()
+                    episode_length += 1
                     done = (
                         td["next", "done"].any().item()
                         or td["next", "terminated"].any().item()
                     )
                     td = td["next"]
                 returns.append(episode_return)
+                lengths.append(episode_length)
 
         eval_env.close()
         t = torch.tensor(returns, dtype=torch.float32)
-        return {
+        metrics = {
             "eval/return_mean": t.mean().item(),
             # Unbiased std needs n >= 2; with num_eval_episodes=1 torch returns
             # NaN, which loggers happily plot as a hole in the chart.
             "eval/return_std": t.std().item() if t.numel() > 1 else 0.0,
             "eval/return_min": t.min().item(),
             "eval/return_max": t.max().item(),
+            # Separates "the policy plays badly" from "the episode ended early":
+            # a return that collapses while the length holds is a scoring
+            # problem, both collapsing together is a dying-agent problem.
+            "eval/episode_length": float(sum(lengths)) / len(lengths),
         }
+        metrics.update(self.algorithm.eval_metrics())
+        return metrics
 
     def save_checkpoint(self, path: str | Path) -> None:
         """Save algorithm state + trainer step."""
