@@ -254,11 +254,20 @@ class MFECAlgorithm(BaseAlgorithm):
             in_keys=["state_embedding"],
         )
 
+        # `device=` is NOT optional here, and passing `spec` does not cover it:
+        # EGreedyModule builds its `eps` buffer from the `device` kwarg alone
+        # (torchrl exploration.py) and `forward` raises if `action.device` and
+        # `eps.device` disagree.  Omitting it left eps on CPU for both modules.
+        # Training hid the bug — Collector(device=...) calls `.to()` on the
+        # explore policy and moved `greedy_module.eps` as a side effect — but
+        # `_policy` never reaches the collector, so `eval_greedy_module` stayed
+        # on CPU and the first evaluate() on GPU died on a cuda action.
         self.greedy_module = EGreedyModule(
             spec=action_spec,
             eps_init=self.eps_start,
             eps_end=self.eps_end,
             annealing_num_steps=self.annealing_frames,
+            device=self._buffer_device,
         )
 
         # Constant eps for evaluation — NOT annealed, never `.step()`ed.
@@ -269,6 +278,7 @@ class MFECAlgorithm(BaseAlgorithm):
             eps_init=self.eval_eps,
             eps_end=self.eval_eps,
             annealing_num_steps=1,
+            device=self._buffer_device,
         )
 
         # Eval (get_policy) needs the embedding step too, so all policies are
