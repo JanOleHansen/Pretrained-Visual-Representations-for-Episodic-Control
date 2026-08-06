@@ -23,6 +23,14 @@ eps_start: 0.005
 eps_end: 0.005
 annealing_frames: 1
 
+# Evaluation exploration rate.  §4.1's eps = 0.005 is the policy the paper
+# *reports*, not just the one it trains — it never evaluates a pure argmax.
+# Keeping this at 0.005 also makes num_eval_episodes mean something: with
+# repeat_action_probability=0.0 the ALE is deterministic, so eps=0 replays one
+# identical trajectory every episode and eval/return_std is identically 0.
+# Set 0.0 only if you deliberately want a deterministic (and lower) eval score.
+eval_eps: 0.005
+
 # Divisible by every num_envs we use (1/2/4/8/16) so the collector does not
 # silently round frames_per_batch up to a multiple of the env count.
 frames_per_batch: 1_024

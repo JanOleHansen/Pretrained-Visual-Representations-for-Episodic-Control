@@ -143,11 +143,19 @@ def test_state_roundtrip_restores_embeddings(stub_tv, tmp_path):
 
 @pytest.fixture
 def real_arch(monkeypatch):
-    """Real resnet18 architecture, random weights, no download."""
+    """Real resnet18 architecture, random weights, no download.
+
+    The original ``get_model`` must be captured *before* the patch is applied:
+    calling ``tvm.get_model`` from inside the replacement re-enters the patched
+    function and recurses until the stack blows (which is what this fixture did
+    until it was caught — every test in this section errored out).
+    """
     import torchvision.models as tvm
 
+    original_get_model = tvm.get_model
+
     def fake_get_model(name, *_args, **_kwargs):
-        return tvm.get_model(name, weights=None)
+        return original_get_model(name, weights=None)
     monkeypatch.setattr("torchvision.models.get_model", fake_get_model)
 
 

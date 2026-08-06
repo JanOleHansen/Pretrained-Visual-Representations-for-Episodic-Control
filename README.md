@@ -407,6 +407,16 @@ the DQN-style env configs and have **not** been given the same treatment; they
 pick up the corrected `gamma`/`eps` defaults from `mfec_atari.yaml` but still
 clip rewards, stack 4 frames and run with sticky actions.
 
+**Evaluation keeps ε = 0.005 (`algorithm.eval_eps`).** MFEC needs
+`repeat_action_probability=0.0`, which makes ALE deterministic — so a
+pure-argmax eval policy replays the *same* episode every time, `eval/return_std`
+is identically 0, and `num_eval_episodes` buys one sample at N times the cost.
+It also measures a different (and worse) policy than the one being trained,
+because QEC values are optimistic. Blundell et al. §4.1 report the ε = 0.005
+policy's score, so that is what `get_policy()` runs. Set `algorithm.eval_eps=0.0`
+for a deterministic eval. If you ever see `eval/return_min == eval/return_mean ==
+eval/return_max` with `return_std` pinned at 0, this is what happened.
+
 **Optimistic initialisation is tie-broken randomly.** The QEC reports `+inf`
 for any action with `<= k` stored entries so untried actions are always
 preferred. `QECPolicy.forward` turns those into a large finite value *plus

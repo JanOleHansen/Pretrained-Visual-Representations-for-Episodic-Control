@@ -655,6 +655,44 @@ Embedding is chunked by a **byte budget** (`_EMBED_CHUNK_BYTES`), not by
 for a random-projection matmul, but for a ViT it leaves the GPU idle and pays
 that many times the launch overhead.
 
+### Evaluation must keep ε — a deterministic eval policy is a bug
+
+`get_policy()` ends in `_EvalEGreedyModule` (constant `eval_eps`, default 0.005
+= Blundell et al. §4.1), **not** a bare argmax. Two independent reasons:
+
+1. **`num_eval_episodes` silently collapses to one sample.** MFEC requires
+   `repeat_action_probability=0.0` (Eq. 1 is max-over-returns — footnote 1), so
+   ALE is deterministic, and Ms. Pac-Man's opening is insensitive to
+   `NoopResetEnv`. A deterministic policy therefore replays the same trajectory
+   every episode: `eval/return_std` is identically 0 and
+   `eval/return_min == eval/return_mean == eval/return_max`. That signature in a
+   run's charts means this bug is back.
+2. **Pure argmax is not the policy being trained.** QEC values are optimistic
+   (Eq. 1 never decreases), so exploiting them with no ε walks into states whose
+   stored value came from one lucky ε-greedy trajectory. The paper reports the
+   ε = 0.005 policy's score; it never evaluates a pure argmax.
+
+Measured on Ms. Pac-Man against one identical QEC:
+
+| policy | exploration type | mean | std |
+|---|---|---|---|
+| `get_policy()` (old, bare argmax) | MODE | 380.0 | **0.000** (5/5 identical) |
+| `get_explore_policy()` | RANDOM | 448.0 | 248.4 |
+| `get_explore_policy()` | MODE | 380.0 | **0.000** |
+
+**The third row is the trap.** torchrl's `EGreedyModule.forward` is gated on
+`exploration_type() in (ExplorationType.RANDOM, None)`, and
+`BaseTrainer.evaluate()` runs under `ExplorationType.MODE` — so dropping a stock
+`EGreedyModule` into the eval chain does *nothing*. `_EvalEGreedyModule`
+subclasses it and forces `ExplorationType.RANDOM` inside `forward`.
+
+Do not "fix" this by changing `BaseTrainer.evaluate()`'s `set_exploration_type`:
+MODE is correct for DQN/A2C, whose eval policies genuinely are deterministic.
+Exploration is an algorithm concern, so the opt-out lives in the algorithm.
+`eval_eps: 0.0` restores the old deterministic behaviour. `NECAlgorithm` returns
+a bare greedy chain from `get_policy()` and has the same latent issue; it has not
+been changed. Guarded by `tests/test_mfec_eval_policy.py`.
+
 ### Optimistic init must be tie-broken RANDOMLY
 
 `QEC.estimate_all` returns `+inf` for actions whose buffer holds `<= k`

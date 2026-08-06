@@ -155,7 +155,9 @@ class BaseTrainer(ABC):
         t = torch.tensor(returns, dtype=torch.float32)
         return {
             "eval/return_mean": t.mean().item(),
-            "eval/return_std": t.std().item(),
+            # Unbiased std needs n >= 2; with num_eval_episodes=1 torch returns
+            # NaN, which loggers happily plot as a hole in the chart.
+            "eval/return_std": t.std().item() if t.numel() > 1 else 0.0,
             "eval/return_min": t.min().item(),
             "eval/return_max": t.max().item(),
         }

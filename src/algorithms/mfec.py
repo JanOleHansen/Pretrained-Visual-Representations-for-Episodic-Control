@@ -93,6 +93,7 @@ import torch.nn as nn
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.envs import EnvBase
+from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import EGreedyModule, QValueActor
 
 from src.algorithms.base import BaseAlgorithm, CollectorConfig, TrainingState
@@ -127,6 +128,10 @@ class MFECAlgorithm(BaseAlgorithm):
             eps_start: float = 1.0,
             eps_end: float = 0.05,
             annealing_frames: int = 1_000_000,
+            # Exploration rate used by get_policy() (evaluation).  Blundell et
+            # al. (2016) §4.1 report the score of the eps=0.005 policy — they
+            # never evaluate a pure argmax.  Set 0.0 for deterministic eval.
+            eval_eps: float = 0.005,
             frames_per_batch: int = 1_000,
             max_frames_per_traj: int = -1,
             # Quantisation precision for the exact-match hash key.
@@ -159,6 +164,7 @@ class MFECAlgorithm(BaseAlgorithm):
         self.eps_start = eps_start
         self.eps_end = eps_end
         self.annealing_frames = annealing_frames
+        self.eval_eps = eval_eps
         self.frames_per_batch = frames_per_batch
         self.max_frames_per_traj = max_frames_per_traj
         self.key_scale = key_scale
@@ -255,9 +261,21 @@ class MFECAlgorithm(BaseAlgorithm):
             annealing_num_steps=self.annealing_frames,
         )
 
-        # Eval (get_policy) needs the embedding step too, so both policies are
+        # Constant eps for evaluation — NOT annealed, never `.step()`ed.
+        # eval_eps=0.0 makes this a no-op (`rand() < 0` is never true), which
+        # restores the old pure-argmax behaviour.
+        self.eval_greedy_module = _EvalEGreedyModule(
+            spec=action_spec,
+            eps_init=self.eval_eps,
+            eps_end=self.eval_eps,
+            annealing_num_steps=1,
+        )
+
+        # Eval (get_policy) needs the embedding step too, so all policies are
         # built on the same chain.
-        self._policy = _SharedPolicy(self._embed_module, self.q_actor)
+        self._policy = _SharedPolicy(
+            self._embed_module, self.q_actor, self.eval_greedy_module
+        )
         self._explore_policy = _SharedPolicy(
             self._embed_module, self.q_actor, self.greedy_module
         )
@@ -532,6 +550,10 @@ class MFECAlgorithm(BaseAlgorithm):
     def get_policy(self) -> TensorDictModule:
         # Must be the full chain: q_actor alone reads "state_embedding", which
         # only _embed_module writes.
+        #
+        # Ends in _EvalEGreedyModule (constant eval_eps, paper §4.1), NOT a bare
+        # argmax — see that class for why a deterministic eval policy makes
+        # eval/return_std identically 0 and understates the agent.
         return self._policy
 
     def get_explore_policy(self) -> TensorDictModule:
@@ -731,6 +753,45 @@ class QECPolicy(nn.Module):
         if leading:
             return q_values.reshape(*leading, self.num_actions)
         return q_values.squeeze(0) if q_values.shape[0] == 1 else q_values
+
+
+class _EvalEGreedyModule(EGreedyModule):
+    """ε-greedy that applies ε regardless of the ambient ``ExplorationType``.
+
+    ``BaseTrainer.evaluate()`` wraps its rollout in
+    ``set_exploration_type(ExplorationType.MODE)``, and torchrl's
+    ``EGreedyModule.forward`` is gated on
+    ``exploration_type() in (ExplorationType.RANDOM, None)`` — so a stock
+    ``EGreedyModule`` placed in the eval chain is silently a **no-op**.  Simply
+    adding one to ``_policy`` therefore does not make evaluation stochastic;
+    verified by measurement (see below).
+
+    Why MFEC needs ε at evaluation at all
+    -------------------------------------
+    Blundell et al. (2016) §4.1 report the score of the ε = 0.005 policy; the
+    paper never evaluates a pure argmax.  That is not incidental.  With
+    ``repeat_action_probability=0.0`` (which MFEC requires — footnote 1) ALE is
+    deterministic, and Ms. Pac-Man's opening is insensitive to ``NoopResetEnv``,
+    so a deterministic policy replays **the same trajectory every episode**:
+    ``eval/return_std`` is identically 0 and ``num_eval_episodes`` silently
+    collapses to a single sample at N times the cost.
+
+    Worse, the pure-argmax policy is not the policy being trained.  QEC values
+    are max-over-returns and therefore optimistic — Eq. (1) never decreases —
+    so exploiting them without any ε lands the agent in states whose stored
+    value came from one lucky ε-greedy trajectory it can no longer reproduce.
+    Measured on Ms. Pac-Man with an identical QEC:
+
+        get_policy()          / MODE     mean=380.0  std=0.000   (5/5 identical)
+        get_explore_policy()  / RANDOM   mean=448.0  std=248.4
+        get_explore_policy()  / MODE     mean=380.0  std=0.000   <- eps ignored
+
+    The third row is why this subclass exists.
+    """
+
+    def forward(self, tensordict):
+        with set_exploration_type(ExplorationType.RANDOM):
+            return super().forward(tensordict)
 
 
 class _SharedPolicy(TensorDictSequential):
