@@ -102,3 +102,74 @@ def test_eval_eps_is_constant_not_annealed():
         "eval epsilon moved when the training epsilon annealed — they must be "
         "separate modules."
     )
+
+
+# ---------------------------------------------------------------------------
+# The batched-proof-env case: what actually crashed a real run
+# ---------------------------------------------------------------------------
+
+class _MockParallelEnv:
+    """Mimics ParallelEnv(E, fn): the specs carry the env batch dim.
+
+    `_MockAtariEnv` above is unbatched, which is why it never caught this —
+    `setup()` is handed the TRAINING env, and with num_envs>1 its action_spec
+    has shape [E] while `BaseTrainer.evaluate()` builds a single env whose
+    action is a scalar of shape [].
+    """
+
+    def __init__(self, num_envs: int = 8) -> None:
+        self.num_envs = num_envs
+        self.observation_spec = Composite(
+            pixels=Bounded(
+                low=0, high=255, shape=(num_envs, *OBS_SHAPE), dtype=torch.uint8
+            ),
+            shape=torch.Size([num_envs]),
+        )
+        self.action_spec = Categorical(n=NUM_ACTIONS, shape=torch.Size([num_envs]))
+        self.batch_size = torch.Size([num_envs])
+
+
+def _make_parallel(num_envs: int = 8) -> NECAlgorithm:
+    alg = NECAlgorithm(
+        device=torch.device("cpu"),
+        embedding_network=NatureEmbedding,
+        obs_key="pixels",
+        embedding_dim=64,
+        dnd_capacity=500,
+        k=2,
+        eval_eps=0.001,
+    )
+    alg.setup(lambda: _MockParallelEnv(num_envs))
+    return alg
+
+
+def test_eval_policy_accepts_the_single_env_tensordict_evaluate_builds():
+    """Regression: ValueError('Action spec shape does not match the action shape').
+
+    setup() sees an [8]-batched training env; evaluate() feeds an unbatched
+    tensordict. EGreedyModule only auto-expands an *unbatched* spec, so a
+    batched one raises at the first evaluation — 4 minutes into a real run,
+    after the first eval_every_n_steps boundary.
+    """
+    alg = _make_parallel(8)
+    td = TensorDict(
+        {"pixels": torch.randint(0, 256, OBS_SHAPE, dtype=torch.uint8)},
+        batch_size=[],
+    )
+    with torch.no_grad(), set_exploration_type(ExplorationType.MODE):
+        out = alg.get_policy()(td)
+    assert out["action"].shape == torch.Size([]), out["action"].shape
+
+
+def test_explore_policy_still_accepts_the_batched_collector_tensordict():
+    """The unbatched spec must remain correct for the OTHER caller too:
+    the collector drives num_envs rows at a time."""
+    E = 8
+    alg = _make_parallel(E)
+    td = TensorDict(
+        {"pixels": torch.randint(0, 256, (E, *OBS_SHAPE), dtype=torch.uint8)},
+        batch_size=[E],
+    )
+    with torch.no_grad(), set_exploration_type(ExplorationType.RANDOM):
+        out = alg.get_explore_policy()(td)
+    assert out["action"].shape == torch.Size([E]), out["action"].shape

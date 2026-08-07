@@ -1127,8 +1127,27 @@ class NECAlgorithm(BaseAlgorithm):
             spec=action_spec,
             in_keys=[self.obs_key],
         )
+
+        # Both e-greedy modules need an *unbatched* action spec.  proof_env is
+        # the TRAINING env, so with num_envs=8 its action_spec carries that
+        # batch dim (shape [8]) — but BaseTrainer.evaluate() builds a single
+        # env via make_env(num_envs=1), which factory.make_env returns bare
+        # (no ParallelEnv), so the eval action is a scalar of shape [].
+        # EGreedyModule.forward only auto-expands a spec when it is unbatched
+        # (`not len(spec.shape)`); an [8] spec meeting a [] action raises
+        # "Action spec shape does not match the action shape" at the first
+        # evaluate().  An unbatched spec is correct for both callers: it
+        # expands to [8] under the collector and compares equal at eval.
+        #
+        # Identical to the fix MFEC needed (commit a33fee3). NEC hit it only
+        # once get_policy() gained an e-greedy tail — a bare QValueActor never
+        # checks the spec, so the latent mismatch was invisible.
+        action_spec_unbatched = action_spec
+        for _ in range(len(env_bs)):
+            action_spec_unbatched = action_spec_unbatched[0]
+
         self.greedy_module = EGreedyModule(
-            spec=action_spec,
+            spec=action_spec_unbatched,
             eps_init=self.eps_start,
             eps_end=self.eps_end,
             annealing_num_steps=self.annealing_frames,
@@ -1141,7 +1160,7 @@ class NECAlgorithm(BaseAlgorithm):
         # runs under ExplorationType.MODE, which gates a stock one off
         # entirely — it would look wired up and silently do nothing.
         self.eval_greedy_module = EvalEGreedyModule(
-            spec=action_spec,
+            spec=action_spec_unbatched,
             eps_init=self.eval_eps,
             eps_end=self.eval_eps,
             annealing_num_steps=1,
