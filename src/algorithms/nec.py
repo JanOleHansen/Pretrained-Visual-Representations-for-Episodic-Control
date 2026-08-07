@@ -1389,8 +1389,8 @@ class NECAlgorithm(BaseAlgorithm):
         # hypothetical: the replay buffer is NOT checkpointed (see
         # `_load_training_state`), so the first batches after every resume
         # skip every single update.
-        losses: list[float] = []
-        q_vals: list[float] = []
+        losses: list[torch.Tensor] = []
+        q_vals: list[torch.Tensor] = []
         for _ in range(self.num_updates):
             result = self._gradient_step()
             if result is None:
@@ -1411,11 +1411,12 @@ class NECAlgorithm(BaseAlgorithm):
             "train/dnd_delisted": float(delisted),
         }
         if losses:
-            metrics["train/q_loss"]   = float(np.mean(losses))
-            metrics["train/q_values"] = float(np.mean(q_vals))
+            # Two host syncs per collector batch instead of two per update.
+            metrics["train/q_loss"]   = float(torch.stack(losses).mean())
+            metrics["train/q_values"] = float(torch.stack(q_vals).mean())
         return metrics
 
-    def _gradient_step(self) -> tuple[float, float] | None:
+    def _gradient_step(self) -> tuple[torch.Tensor, torch.Tensor] | None:
         """One minibatch gradient update on the embedding network.
 
         Samples (obs, action, n_step_return) from the replay buffer, re-embeds
@@ -1441,11 +1442,13 @@ class NECAlgorithm(BaseAlgorithm):
 
         Returns
         -------
-        ``(loss, mean_q)`` for an update that actually ran, or ``None`` when
-        this step was skipped — replay buffer below ``batch_size``, or every
-        sampled action's DND table still at/below ``k`` entries.  ``None``
-        rather than ``(0.0, 0.0)``: a skipped step is not a zero-loss step,
-        and ``step()`` must not average it into ``train/q_loss``.
+        ``(loss, mean_q)`` as 0-dim tensors on ``self.device`` for an update
+        that actually ran, or ``None`` when this step was skipped — replay
+        buffer below ``batch_size``, or every sampled action's DND table still
+        at/below ``k`` entries.  ``None`` rather than ``(0.0, 0.0)``: a skipped
+        step is not a zero-loss step, and ``step()`` must not average it into
+        ``train/q_loss``.  Tensors rather than floats so the caller can defer
+        the host sync to once per collector batch.
         """
         if len(self.replay_buffer) < self.batch_size:
             return None
@@ -1478,16 +1481,36 @@ class NECAlgorithm(BaseAlgorithm):
         # backward().  See the scatter block below.
         dnd_pending: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
+        # Group the minibatch by action with ONE host sync.
+        #
+        # This used to be `mask = (actions == a); n_a = int(mask.sum())` inside
+        # the loop, i.e. one GPU->CPU synchronisation *per action per update* —
+        # 3,600 per collector batch at num_actions=9, num_updates=400. Each one
+        # drains the CUDA pipeline behind whatever is queued (a knn_action that
+        # reads the whole 64 MB key table, plus the CNN backward), so the CPU
+        # can never run ahead and the per-update cost collapses to pure
+        # round-trip latency. Same argsort/bincount/offsets idiom step() uses
+        # for write_batch.
+        order   = torch.argsort(actions, stable=True)
+        counts  = torch.bincount(actions, minlength=self._num_actions)
+        offsets = torch.zeros(
+            self._num_actions + 1, dtype=torch.long, device=actions.device
+        )
+        offsets[1:] = counts.cumsum(0)
+        offsets_cpu = offsets.cpu().tolist()      # <- the only sync in this loop
+
+        h_sorted = h[order]
+        t_sorted = targets[order]
+
         for a in range(self._num_actions):
-            mask = (actions == a)
-            n_a  = int(mask.sum())
-            if n_a == 0:
+            seg_s, seg_e = offsets_cpu[a], offsets_cpu[a + 1]
+            if seg_s == seg_e:
                 continue
             if self.dnd._sizes[a] <= self.k:
                 continue  # too sparse to compute a kernel-weighted Q
 
-            h_a = h[mask]   # (n_a, embedding_dim)
-            t_a = targets[mask]
+            h_a = h_sorted[seg_s:seg_e]   # (n_a, embedding_dim)
+            t_a = t_sorted[seg_s:seg_e]
 
             k_use = min(self.k, self.dnd._sizes[a])
 
@@ -1549,8 +1572,10 @@ class NECAlgorithm(BaseAlgorithm):
                 key_lr=self.dnd_key_lr, value_lr=self.dnd_value_lr,
             )
 
-        mean_q = float(q_hat.detach().mean())
-        return float(loss.detach()), mean_q
+        # Returned as 0-dim TENSORS, not floats: `float(...)` here would force
+        # two more host syncs per update (800 per collector batch). step()
+        # stacks them and reduces once.
+        return loss.detach(), q_hat.detach().mean()
 
     def _sizes_summary(self) -> list[int]:
         return list(self.dnd._sizes)
