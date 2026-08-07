@@ -97,6 +97,7 @@ from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import EGreedyModule, QValueActor
 
 from src.algorithms.base import BaseAlgorithm, CollectorConfig, TrainingState
+from src.algorithms.eval_policy import EvalEGreedyModule
 from src.encoders.factory import make_encoder
 
 
@@ -818,43 +819,10 @@ class QECPolicy(nn.Module):
         return q_values.squeeze(0) if q_values.shape[0] == 1 else q_values
 
 
-class _EvalEGreedyModule(EGreedyModule):
-    """ε-greedy that applies ε regardless of the ambient ``ExplorationType``.
-
-    ``BaseTrainer.evaluate()`` wraps its rollout in
-    ``set_exploration_type(ExplorationType.MODE)``, and torchrl's
-    ``EGreedyModule.forward`` is gated on
-    ``exploration_type() in (ExplorationType.RANDOM, None)`` — so a stock
-    ``EGreedyModule`` placed in the eval chain is silently a **no-op**.  Simply
-    adding one to ``_policy`` therefore does not make evaluation stochastic;
-    verified by measurement (see below).
-
-    Why MFEC needs ε at evaluation at all
-    -------------------------------------
-    Blundell et al. (2016) §4.1 report the score of the ε = 0.005 policy; the
-    paper never evaluates a pure argmax.  That is not incidental.  With
-    ``repeat_action_probability=0.0`` (which MFEC requires — footnote 1) ALE is
-    deterministic, and Ms. Pac-Man's opening is insensitive to ``NoopResetEnv``,
-    so a deterministic policy replays **the same trajectory every episode**:
-    ``eval/return_std`` is identically 0 and ``num_eval_episodes`` silently
-    collapses to a single sample at N times the cost.
-
-    Worse, the pure-argmax policy is not the policy being trained.  QEC values
-    are max-over-returns and therefore optimistic — Eq. (1) never decreases —
-    so exploiting them without any ε lands the agent in states whose stored
-    value came from one lucky ε-greedy trajectory it can no longer reproduce.
-    Measured on Ms. Pac-Man with an identical QEC:
-
-        get_policy()          / MODE     mean=380.0  std=0.000   (5/5 identical)
-        get_explore_policy()  / RANDOM   mean=448.0  std=248.4
-        get_explore_policy()  / MODE     mean=380.0  std=0.000   <- eps ignored
-
-    The third row is why this subclass exists.
-    """
-
-    def forward(self, tensordict):
-        with set_exploration_type(ExplorationType.RANDOM):
-            return super().forward(tensordict)
+# _EvalEGreedyModule moved to src/algorithms/eval_policy.py so NEC can use it
+# too (it has the identical determinism problem).  Re-exported under the old
+# private name so existing imports — tests/test_mfec_eval_policy.py — keep working.
+_EvalEGreedyModule = EvalEGreedyModule
 
 
 class _SharedPolicy(TensorDictSequential):

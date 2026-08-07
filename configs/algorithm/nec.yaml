@@ -47,6 +47,12 @@ eps_start: 1.0
 eps_end: 0.01
 annealing_frames: 4_000_000
 
+# Evaluation exploration rate (get_policy()). NOT annealed. A pure argmax makes
+# eval fully deterministic — every episode replays the same trajectory and
+# eval/return_std is identically 0, so num_eval_episodes buys nothing at N x the
+# cost. See src/algorithms/eval_policy.py. Set 0.0 for deterministic eval.
+eval_eps: 0.001
+
 # Data collection
 frames_per_batch: 1_600
 init_random_frames: 50_000

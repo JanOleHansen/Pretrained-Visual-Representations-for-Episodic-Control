@@ -152,6 +152,7 @@ from torchrl.envs import EnvBase
 from torchrl.modules import EGreedyModule, QValueActor
 
 from src.algorithms.base import BaseAlgorithm, CollectorConfig, TrainingState
+from src.algorithms.eval_policy import EvalEGreedyModule
 from src.networks import NatureEmbedding
 
 
@@ -1043,6 +1044,15 @@ class NECAlgorithm(BaseAlgorithm):
         eps_start:        float = 1.0,
         eps_end:          float = 0.01,
         annealing_frames: int   = 4_000_000,
+        # Exploration rate used by get_policy() (evaluation).  A pure argmax
+        # makes eval deterministic: with repeat_action_probability=0.0 the ALE
+        # is deterministic and NoopResetEnv does not perturb Ms. Pac-Man's
+        # opening, so every eval episode replays the same trajectory and
+        # eval/return_std is identically 0 — num_eval_episodes then costs N x
+        # for a single sample.  See src/algorithms/eval_policy.py.  Matches the
+        # annealed floor, i.e. the policy actually being trained.  0.0 restores
+        # the old deterministic behaviour.
+        eval_eps:         float = 0.001,
         # --- Data collection -----------------------------------------------
         frames_per_batch:    int = 1_600,
         init_random_frames:  int = 50_000,
@@ -1067,6 +1077,7 @@ class NECAlgorithm(BaseAlgorithm):
         self.max_grad_norm   = max_grad_norm
         self.eps_start       = eps_start
         self.eps_end         = eps_end
+        self.eval_eps        = eval_eps
         self.annealing_frames = annealing_frames
         self.frames_per_batch    = frames_per_batch
         self.init_random_frames  = init_random_frames
@@ -1122,6 +1133,19 @@ class NECAlgorithm(BaseAlgorithm):
             device=buf_dev,
         )
         self._explore_policy = _SharedPolicy(self.q_actor, self.greedy_module)
+
+        # Evaluation policy: constant eps, NOT annealed and never `.step()`ed.
+        # EvalEGreedyModule (not a stock EGreedyModule) because evaluate()
+        # runs under ExplorationType.MODE, which gates a stock one off
+        # entirely — it would look wired up and silently do nothing.
+        self.eval_greedy_module = EvalEGreedyModule(
+            spec=action_spec,
+            eps_init=self.eval_eps,
+            eps_end=self.eval_eps,
+            annealing_num_steps=1,
+            device=buf_dev,
+        )
+        self._policy = _SharedPolicy(self.q_actor, self.eval_greedy_module)
 
         # 4. Replay buffer — stores (obs, action, n_step_return)
         self.replay_buffer = self._make_replay_buffer()
@@ -1585,7 +1609,10 @@ class NECAlgorithm(BaseAlgorithm):
     # ------------------------------------------------------------------
 
     def get_policy(self) -> TensorDictModule:
-        return self.q_actor
+        # Ends in EvalEGreedyModule (constant eval_eps), NOT a bare argmax —
+        # see that class for why a deterministic eval policy makes
+        # eval/return_std identically 0.
+        return self._policy
 
     def get_explore_policy(self) -> TensorDictModule:
         return self._explore_policy
