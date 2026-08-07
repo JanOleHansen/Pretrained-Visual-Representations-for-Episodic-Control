@@ -1002,9 +1002,11 @@ class NECAlgorithm(BaseAlgorithm):
     * ``replay_buffer`` is a no-arg factory returning a ``ReplayBuffer``.
     * The optimizer covers the CNN embedding network only.  DND values are
       updated by the in-place blend rule, not by gradient descent.
-    * Per-env carry-over logic (the ``_carry`` list) is taken directly from
-      ``MFECAlgorithm.step()`` and extended to also buffer raw observations so
-      they can be re-embedded with the *current* network on each step call.
+    * Per-env carry-over (the ``_carry`` list) started as
+      ``MFECAlgorithm.step()``'s, but NEC's is a **bounded sliding window**:
+      a step's N-step return needs only ``r_t..r_{t+n-1}`` and the bootstrap
+      state ``s_{t+n}``, not the episode end, so only the last ``n_step`` raw
+      frames are retained.  See ``step()``.
     * N-step returns are computed per-episode (never across episode boundaries).
     """
 
@@ -1200,6 +1202,51 @@ class NECAlgorithm(BaseAlgorithm):
             parts.append(nn.functional.normalize(h, dim=-1).to(out_device))
         return torch.cat(parts, dim=0)
 
+    def _flush_pending_to_dnd(
+        self, pending: list[tuple]
+    ) -> tuple[int, int]:
+        """Write one finished episode's ``(h, action, return)`` triples.
+
+        The sliding window in ``step()`` finalises a step's return as soon as
+        it matures (n_step later), but the triples are held here until the
+        episode actually ends, so DND writes stay episode-end as the paper
+        specifies.  Grouped by action with a single host sync, mirroring
+        ``_gradient_step``.
+
+        Returns ``(n_hits, n_novel)`` summed over actions.
+        """
+        if not pending:
+            return 0, 0
+
+        dev  = self._buffer_device
+        h    = torch.cat([p[0] for p in pending], dim=0)
+        acts = torch.cat([p[1] for p in pending], dim=0)
+        vals = torch.tensor(
+            np.concatenate([p[2] for p in pending]),
+            dtype=torch.float32, device=dev,
+        )
+
+        order   = torch.argsort(acts, stable=True)
+        counts  = torch.bincount(acts, minlength=self._num_actions)
+        offsets = torch.zeros(self._num_actions + 1, dtype=torch.long, device=dev)
+        offsets[1:] = counts.cumsum(0)
+        offsets_cpu = offsets.cpu().tolist()
+
+        h_sorted = h[order]
+        v_sorted = vals[order]
+
+        total_hits = total_writes = 0
+        for a in range(self._num_actions):
+            seg_s, seg_e = offsets_cpu[a], offsets_cpu[a + 1]
+            if seg_s == seg_e:
+                continue
+            n_hit, n_new = self.dnd.write_batch(
+                a, h_sorted[seg_s:seg_e], v_sorted[seg_s:seg_e], self.dnd_lr
+            )
+            total_hits   += n_hit
+            total_writes += n_new
+        return total_hits, total_writes
+
     # ------------------------------------------------------------------
     # Training step
     # ------------------------------------------------------------------
@@ -1210,10 +1257,24 @@ class NECAlgorithm(BaseAlgorithm):
 
         The (E, T) per-env structure from mfec.py is preserved exactly:
         - Returns are computed only over COMPLETE episodes.
-        - Partial trailing episodes are buffered in ``_carry`` and prepended
-          to the corresponding env's data in the next call.
-        - Raw observations are stored (not embeddings) so the carry can be
+        - Returns are finalised on a SLIDING WINDOW, not at episode end.
+          Step t is finalised as soon as t + n_step is in hand, because
+          Q^(N)_t needs only r_t..r_{t+n-1} and the bootstrap state s_{t+n}.
+          Only the last n_step steps must wait for the episode to end.
+          ``_carry`` therefore retains at most n_step raw frames per env
+          (~11 MB) instead of a whole episode (3 GB at max_steps=27_000, i.e.
+          24 GB across 8 envs in a 32 GB container).
+        - The finalised ``(h, action, return)`` triples are buffered in
+          ``_carry["pending"]`` at ~264 B/step and written to the DND at
+          EPISODE END, as the paper specifies — the window changes when
+          returns are *computed*, not when they are written.
+        - Raw observations are stored (not embeddings) so the window can be
           re-embedded with the CURRENT network on each step() call.
+        - Consequence: the bootstrap Q and the embedding for step t are taken
+          ~n_step steps after t rather than at episode end, so both are
+          fresher than before. Same formula, different (better-conditioned)
+          inputs — returns are NOT bit-identical to the pre-window code.
+          Guarded by ``tests/test_nec_sliding_window.py``.
         - N-step returns are computed per-episode via lfilter + DND bootstrap.
         - Episodes ended by TRUNCATION (``done`` without ``terminated``, e.g.
           a StepCounter cutoff) bootstrap their return tail from the DND at
@@ -1264,118 +1325,116 @@ class NECAlgorithm(BaseAlgorithm):
         total_writes = 0
 
         for env_idx in range(E):
-            # Host-side deliberately.  This costs one GPU->CPU->GPU round trip
-            # per frame (~360 MB per 1600-frame batch, ~70 ms) — measured to be
-            # noise next to the tens of seconds of kNN below — and in exchange
-            # the carry, which can hold a 4500-frame episode (508 MB per env),
-            # never occupies accelerator memory while it waits for its episode
-            # to finish.  Embedding in place instead would spike transient GPU
-            # memory by up to num_envs x carry length at the moment an episode
-            # completes.
+            # Raw frames stay host-side: they are the bulk of the window and
+            # only need to reach the accelerator one _EMBED_CHUNK at a time.
             obs_e     = obs_2d[env_idx].cpu()                   # (T, *obs_shape)
             rewards_e = rewards_2d[env_idx]                     # (T,) f64 numpy
             dones_e   = dones_2d[env_idx]                       # (T,) bool numpy
             actions_e = actions_2d[env_idx]                     # (T,) long
 
             carry = self._carry[env_idx]
-            # The carry never contains a done, so episode ends always lie in
-            # the CURRENT batch at index (end - carry_len) — used below to
-            # look up terminated/next-obs for the truncation bootstrap.
+            # The retained window never contains a done (every done is drained
+            # below in the same call), so episode ends always lie in the
+            # CURRENT batch at index (d - carry_len) — used to look up
+            # terminated/next-obs for the truncation bootstrap.
             carry_len = 0 if carry is None else len(carry["dones"])
+            pending: list[tuple] = [] if carry is None else carry["pending"]
             if carry is not None:
                 obs_e     = torch.cat([carry["obs"], obs_e], dim=0)
                 rewards_e = np.concatenate([carry["rewards"], rewards_e])
                 dones_e   = np.concatenate([carry["dones"],   dones_e])
                 actions_e = torch.cat([carry["actions"], actions_e], dim=0)
 
-            ends = np.flatnonzero(dones_e)
+            # Embed the whole window once with the CURRENT network.
+            h_e = self._embed(obs_e.reshape(len(obs_e), *obs_shape), dev)
 
-            if len(ends) == 0:
-                self._carry[env_idx] = {
-                    "obs":     obs_e,                  # intentionally CPU — raw pixels, re-embedded each step
-                    "rewards": rewards_e,
-                    "dones":   dones_e,
-                    "actions": actions_e.to(dev),
-                }
-                continue
+            cursor = 0          # start of the not-yet-finalised region
+            while True:
+                rel = np.flatnonzero(dones_e[cursor:])
 
-            last = int(ends[-1])
+                if len(rel):
+                    # --- Episode ends here: finalise its tail and flush ------
+                    d       = cursor + int(rel[0])
+                    raw_end = d - carry_len        # position in the current batch
 
-            # Embed the complete portion with the current network
-            h_complete = self._embed(
-                obs_e[:last + 1].reshape(last + 1, *obs_shape), dev
-            )                                                      # (T_c, d)
+                    h_final = None
+                    if not term_2d[env_idx, raw_end]:
+                        # Truncated (StepCounter / collector cutoff), not a real
+                        # terminal: bootstrap the return tail from the state
+                        # after the cutoff instead of assuming zero future
+                        # reward.  True terminals keep h_final=None.
+                        h_final = self._embed(
+                            next_obs_2d[env_idx, raw_end].reshape(1, *obs_shape), dev
+                        )
 
-            # Process each complete episode individually
-            ep_start = 0
-            for ep_end in ends:
-                ep_end  = int(ep_end)
-                raw_end = ep_end - carry_len   # position within the current batch
-
-                h_final = None
-                if not term_2d[env_idx, raw_end]:
-                    # Truncated (StepCounter / collector cutoff), not a real
-                    # terminal: bootstrap the return tail from the state
-                    # after the cutoff instead of assuming zero future
-                    # reward.  True terminals keep h_final=None.
-                    h_final = self._embed(
-                        next_obs_2d[env_idx, raw_end].reshape(1, *obs_shape), dev
+                    seg = slice(cursor, d + 1)
+                    # Passing only the tail is exact: return-to-go looks
+                    # FORWARD only, and every earlier step of this episode was
+                    # already finalised with its own n-step bootstrap.
+                    nsr = _compute_n_step_returns(
+                        rewards_e[seg], h_e[seg], self.gamma, self.n_step,
+                        self.dnd, final_state=h_final,
                     )
+                    pending.append((h_e[seg], actions_e[seg], nsr))
+                    collect_obs.append(obs_e[seg])
+                    collect_actions.append(actions_e[seg].cpu())
+                    collect_returns.append(nsr)
 
-                r_ep = rewards_e[ep_start: ep_end + 1]             # (L,) f64
-                h_ep = h_complete[ep_start: ep_end + 1]            # (L, d)
-                a_ep = actions_e[ep_start: ep_end + 1]             # (L,) long
-
-                # N-step returns for this episode
-                nsr = _compute_n_step_returns(
-                    r_ep, h_ep, self.gamma, self.n_step, self.dnd,
-                    final_state=h_final,
-                )  # (L,) f64
-
-                # Write N-step returns into the DND (blend/insert per action)
-                nsr_t = torch.tensor(nsr, dtype=torch.float32, device=dev)
-                sorted_idx     = torch.argsort(a_ep, stable=True)
-                sorted_states  = h_ep[sorted_idx]
-                sorted_values  = nsr_t[sorted_idx]
-                sorted_actions = a_ep[sorted_idx]
-
-                counts  = torch.bincount(sorted_actions, minlength=self._num_actions)
-                offsets = torch.zeros(self._num_actions + 1, dtype=torch.long, device=dev)
-                offsets[1:] = counts.cumsum(0)
-                offsets_cpu = offsets.cpu().tolist()
-
-                for a in range(self._num_actions):
-                    seg_s, seg_e = offsets_cpu[a], offsets_cpu[a + 1]
-                    if seg_s == seg_e:
-                        continue
-                    h_i, n_h = self.dnd.write_batch(
-                        a,
-                        sorted_states[seg_s:seg_e],
-                        sorted_values[seg_s:seg_e],
-                        self.dnd_lr,
-                    )
+                    # DND writes happen at EPISODE END, as the paper specifies
+                    # — the sliding window changes when returns are *computed*,
+                    # not when they are written.
+                    h_i, n_h = self._flush_pending_to_dnd(pending)
                     total_hits   += h_i
                     total_writes += n_h
+                    pending = []
 
-                # Collect for replay buffer storage
-                collect_obs.append(obs_e[ep_start: ep_end + 1].cpu())
-                collect_actions.append(a_ep.cpu())
-                collect_returns.append(nsr)
+                    cursor = d + 1
+                    continue
 
-                ep_start = ep_end + 1
+                # --- No episode end in the window: finalise matured steps ----
+                # Step i is finalisable once i + n_step is in hand: its return
+                # needs rewards r_i..r_{i+n-1} and the bootstrap state s_{i+n},
+                # NOT the episode end.  Only the last n_step steps must wait.
+                avail    = len(obs_e) - cursor
+                n_mature = avail - self.n_step
+                if n_mature > 0:
+                    seg = slice(cursor, len(obs_e))
+                    # _compute_n_step_returns bootstraps exactly states[n_step:],
+                    # i.e. the n_mature entries we keep; the trailing MC-tail
+                    # entries it also returns are for steps whose episode has
+                    # not ended, so they are discarded.
+                    nsr = _compute_n_step_returns(
+                        rewards_e[seg], h_e[seg], self.gamma, self.n_step,
+                        self.dnd, final_state=None,
+                    )[:n_mature]
 
-            # Buffer trailing partial episode
-            if last < len(obs_e) - 1:
-                self._carry[env_idx] = {
-                    "obs":     obs_e[last + 1:],              # intentionally CPU — raw pixels, re-embedded each step
-                    "rewards": rewards_e[last + 1:],
-                    "dones":   dones_e[last + 1:],
-                    "actions": actions_e[last + 1:].to(dev),
-                }
-            else:
+                    mat = slice(cursor, cursor + n_mature)
+                    pending.append((h_e[mat], actions_e[mat], nsr))
+                    collect_obs.append(obs_e[mat])
+                    collect_actions.append(actions_e[mat].cpu())
+                    collect_returns.append(nsr)
+                    cursor += n_mature
+                break
+
+            # --- Retain only the immature tail --------------------------------
+            # At most n_step raw frames survive to the next call (plus whatever
+            # one batch adds), instead of a whole episode.  With
+            # StepCounter.max_steps=27_000 that is the difference between
+            # ~11 MB and ~3 GB per env.  `pending` holds the finalised
+            # (h, action, return) triples of the in-flight episode at ~264 B
+            # per step — 7 MB for a full 27_000-step episode.
+            if cursor >= len(obs_e) and not pending:
                 self._carry[env_idx] = None
+            else:
+                self._carry[env_idx] = {
+                    "obs":     obs_e[cursor:],   # CPU — raw pixels, re-embedded each call
+                    "rewards": rewards_e[cursor:],
+                    "dones":   dones_e[cursor:],
+                    "actions": actions_e[cursor:].to(dev),
+                    "pending": pending,
+                }
 
-        # --- Store complete episodes in replay buffer ----------------------
+        # --- Store finalised transitions in the replay buffer ---------------
         for ep_obs, ep_act, ep_ret in zip(collect_obs, collect_actions, collect_returns):
             T_ep = len(ep_obs)
             episode_td = TensorDict(

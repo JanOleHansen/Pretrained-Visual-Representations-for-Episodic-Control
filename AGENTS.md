@@ -1116,16 +1116,42 @@ consequence of porting MFEC's exact-hash design onto a *moving* embedding.
 Making the rule fire would mean matching within a radius rather than exactly
 — a design change needing empirical validation, deliberately **not** done.
 
-### 2. N-step returns (per-env, complete-episodes-only)
+### 2. N-step returns (per-env, sliding window)
 
 NEC uses bootstrapped N-step returns:
 
     Q^(N)(s_t, a_t) = Σ_{j=0}^{N-1} γ^j r_{t+j} + γ^N max_{a'} Q(s_{t+N}, a')
 
-The per-env carry-over logic is identical to MFEC's (the `(E, T)` shape
-pattern, partial-episode buffering in `_carry`, `lfilter` for MC returns).
-The NEC-specific addition is a DND bootstrap correction applied after the
-full MC pass:
+**Returns are finalised on a sliding window, not at episode end.** That
+formula needs only `r_t..r_{t+n-1}` and the bootstrap state `s_{t+n}` — the
+episode end is irrelevant except for the last `n_step` steps. So `step()`
+finalises step *t* as soon as `t + n_step` arrives and retains at most
+`n_step` raw frames per env.
+
+This is a memory fix, and a large one: with `StepCounter.max_steps=27_000`
+the old whole-episode carry was 3.05 GB per env — **24.4 GB across 8 envs, in
+a 32 GB container** — versus ~11 MB now (measured flat at exactly `n_step`
+frames over a 2,000-step done-free stream).
+
+Two invariants the implementation must keep, both pinned by
+`tests/test_nec_sliding_window.py`:
+
+- **DND writes stay at episode end** (paper §3.3). Finalised
+  `(h, action, return)` triples are buffered in `_carry["pending"]` at ~264 B
+  per step and flushed by `_flush_pending_to_dnd()` when the done arrives.
+  The window changes when returns are *computed*, not when they are written.
+- **Chunking must not change the returns.** Feeding one episode whole vs in
+  slivers of 1/2/3/5/7/11 steps must give identical returns; the test asserts
+  that against a closed form (the fixture fills every DND table with a single
+  constant so `max_a Q` is known exactly).
+
+Note the returns are *not* bit-identical to the pre-window implementation:
+step *t*'s bootstrap Q and embedding are now taken `n_step` steps after *t*
+rather than at episode end, so both are fresher. Same formula, better-
+conditioned inputs.
+
+The bootstrap correction itself is applied after a full MC pass over the
+window slice:
 
 ```python
 # mc: full Monte Carlo returns via lfilter
@@ -1135,11 +1161,10 @@ n_step_G[:T - n_step] = where(valid, mc[:T - n_step] + correction, mc[:T - n_ste
 ```
 
 Bootstrapping uses the CURRENT DND state (written by previous episodes in
-the same batch, or prior batches).  The carry stores RAW observations (not
+the same batch, or prior batches).  The window stores RAW observations (not
 pre-computed embeddings) so they are re-embedded with the current network
 at the start of each step() call, via `NECAlgorithm._embed()` — the single
-place the L2 normalisation lives, chunked at `_EMBED_CHUNK` frames so a
-4500-step episode does not go through the CNN in one pass.
+place the L2 normalisation lives, chunked at `_EMBED_CHUNK` frames.
 
 `q_max` comes from `_max_finite_q()`, **not** a plain `.max(dim=-1)`.
 `DND.estimate_all` returns +inf for actions holding `<= k` entries, so a
