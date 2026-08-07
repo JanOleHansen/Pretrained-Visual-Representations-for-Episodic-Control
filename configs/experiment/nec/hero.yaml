@@ -14,7 +14,9 @@
 defaults:
   - override /algorithm: nec_atari
   - override /environment: hero_nec_train
-  - override /environment@eval_environment: hero_eval
+  # hero_nec_eval, not hero_eval: the shared one caps episodes at 4,500 agent
+  # steps (5 min of game time) and is also used by experiment/mfec/hero.yaml.
+  - override /environment@eval_environment: hero_nec_eval
   - _self_
 
 trainer:

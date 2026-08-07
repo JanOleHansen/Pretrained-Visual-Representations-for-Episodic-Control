@@ -4,7 +4,12 @@ _target_: src.algorithms.mfec.MFECAlgorithm
 # §4.2 differ (k=50, gamma=0.99) — do not mix them up.
 encoder_name: random_projection   # "random_projection" | "vae"
 vae_checkpoint: null              # required when encoder_name=vae
-seed: null                        # encoder init seed; null = nondeterministic
+# Encoder init seed — the only thing that fixes the random projection matrix.
+# Tied to trainer.seed so one knob controls the whole run: leaving it null
+# draws phi from OS entropy, so two runs with the same trainer.seed still use a
+# different embedding space and are not comparable. Only affects
+# encoder_name=random_projection; vae/dinov2/resnet load fixed weights.
+seed: ${trainer.seed}
 obs_key: pixels
 buffer_size: 1_000_000            # §4.1: "limited to one million entries" per action
 k: 11                             # §4.1: "The k-nearest-neighbour lookups used k = 11"

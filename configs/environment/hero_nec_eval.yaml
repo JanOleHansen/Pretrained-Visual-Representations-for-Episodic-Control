@@ -1,0 +1,37 @@
+name: ALE/Hero-v5
+gym_backend: gymnasium
+gym_kwargs:
+  frame_skip: 4
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# NEC eval variant of hero_eval.yaml — identical except for the episode cap.
+#
+# It exists only so the cap can be raised for NEC without touching hero_eval,
+# which experiment/mfec/hero.yaml also uses. Pairs with hero_nec_train.yaml.
+#
+# Like hero_eval it drops EndOfLifeTransform so episodes end on game-over rather
+# than life loss, carries no SignTransform so episode rewards are the true game
+# score (the NEC train env has none either — see hero_nec_train.yaml), and drops
+# VecNorm because its running stats are not checkpointed and a fresh eval env
+# would distort the observations the policy was trained on.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.GrayScale
+  - _target_: torchrl.envs.Resize
+    w: 84
+    h: 84
+  - _target_: torchrl.envs.CatFrames
+    N: 4
+    dim: -3
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    # 27,000 decisions x 4 emulator frames = the standard 108,000-frame (30 min)
+    # ALE episode cap, matching hero_nec_train.yaml and the MFEC configs. The
+    # 4,500 in hero_eval.yaml caps a competent agent's score after 5 minutes.
+    max_steps: 27_000
+  - _target_: torchrl.envs.DoubleToFloat

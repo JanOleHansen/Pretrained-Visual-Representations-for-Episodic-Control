@@ -60,9 +60,14 @@ class _RecordingEnvironment:
             gym_kwargs={"categorical_action_encoding": True},
         )
         self.requests: list[tuple[int, str]] = []
+        self.seeds: list[int | None] = []
 
-    def make_env(self, num_envs: int = 1, device: str = "cpu"):
+    def make_env(self, num_envs: int = 1, device: str = "cpu", seed=None):
+        # Signature must track Environment.make_env — the trainer calls this
+        # with keywords and a stale double turns a real regression into a
+        # TypeError that looks like a test bug.
         self.requests.append((num_envs, str(device)))
+        self.seeds.append(seed)
         return self._env.make_env(num_envs=1, device="cpu")
 
 

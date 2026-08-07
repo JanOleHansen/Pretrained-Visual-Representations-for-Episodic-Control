@@ -99,7 +99,7 @@ Algorithm    ->  owns: network, replay buffer, loss, optimiser, exploration,
                └── get_collector_config() — frames_per_batch + init_random_frames
 
 Environment  ->  factory: env name + transforms list
-               └── make_env(num_envs, device) -> TransformedEnv
+               └── make_env(num_envs, device, seed) -> TransformedEnv
 ```
 
 ### Algorithm
@@ -228,6 +228,42 @@ checkpoint. Set `trainer.eval_every_n_steps` (see "Trainer" below) to also
 run it periodically *during* training and get `eval/return_mean` logged
 alongside `train/*` in the same run — no separate eval pass needed.
 
+### Environment seeding
+
+`Environment.make_env(num_envs, device, seed)` takes a **master seed for the
+env group** and derives one stream per worker from it. The trainer supplies it;
+you never pass it by hand. `seed=None` reverts to entropy seeding.
+
+Why this is not just `seed_everything`: `ParallelEnv` uses
+`mp_start_method="spawn"`, so each worker is a fresh interpreter whose
+`torch`/`numpy`/`random` RNGs start from OS entropy. Two things need seeding
+there, and only one is reachable from the parent:
+
+| what | seeded by | reachable from parent? |
+|---|---|---|
+| the emulator | `env.set_seed(seed)` | yes |
+| the worker's **global** RNGs | `seed_everything(seed)` *inside* the worker | no — `Transform` has no `_set_seed` hook |
+
+The second is the load-bearing one. With `repeat_action_probability=0.0` an ALE
+reset is fully deterministic, so `NoopResetEnv`'s `torch.randint` draw is the
+*only* thing that distinguishes one episode's start state from another's — and
+it happens in the worker. `make_env` therefore builds **one `env_fn` per
+worker** (a list, not a shared callable) and each seeds its own process.
+
+Consequences worth knowing:
+
+- **The eval env is keyed on the step count**, not a constant
+  (`derive_seed(seed, 1, step)`). A fixed seed would make every evaluation
+  replay the same episodes, collapsing `eval/return_mean` to one sample.
+- **A `num_envs=1` env never re-seeds the parent process.** `evaluate()` builds
+  one per eval interval; re-seeding there would reset the trainer's exploration
+  stream on every evaluation and make training exploration periodic.
+- **`derive_seed` hashes rather than adding an offset.** `base + i` aliases
+  across runs — with seeds `42..46` and 4 workers, `(44, worker 1)` and
+  `(45, worker 0)` both give 45, so two "independent" seeds replay each other.
+
+Guarded by `tests/test_env_seeding.py`.
+
 ### Trainer
 
 `StepTrainer` creates a `torchrl.collectors.Collector` from the algorithm's
@@ -248,6 +284,12 @@ for batch in self.collector:
 - **Env lifecycle** — creates train/eval envs via `Environment.make_env()`.
   Both are built on `_env_device` so training and evaluation observations go
   through the *same* preprocessing kernels — see "Reproducing MFEC on Atari".
+- **Seeding** — every env gets a stream derived from `trainer.seed` via
+  `derive_seed` (`src/utils/seeding.py`): training worker *i* from
+  `derive_seed(seed, 0, i)`, the eval env from `derive_seed(seed, 1, step)`.
+  `seed_everything` alone is not enough — `ParallelEnv` spawns its workers, so
+  a worker's global RNGs (which `NoopResetEnv` draws from) are seeded inside
+  the worker by `make_env(..., seed=...)`. See "Environment seeding" below.
 - **Eval** — `evaluate(num_episodes)` runs the greedy policy.
 - **Callbacks** — fires `ON_TRAIN_START`, `ON_STEP_END`, `ON_TRAIN_END` events.
 - **Checkpoints** — orchestrates save/load of algorithm state.

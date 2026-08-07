@@ -360,12 +360,15 @@ src/
   environments/
     environment.py          — Environment wrapper (holds factory kwargs, exposes make_env)
     factory.py              — make_env: gymnasium + transforms list + gym_kwargs/gym_backend
+                              + `seed` (one derived stream per ParallelEnv worker; see
+                              "Environment seeding" below)
   trainers/
     BaseTrainer.py          — BaseTrainer ABC, TrainerEvent, Callback protocol, fire_callbacks
     StepTrainer.py          — StepTrainer (Collector-driven loop)
   callbacks/                — ProgressCallback, CheckpointCallback, EvalCallback,
                               WandBLogger, TensorBoardLogger
-  utils/                    — device resolution, seeding, callback builders
+  utils/                    — device resolution, seeding (seed_everything + derive_seed),
+                              callback builders
 configs/
   algorithm/dqn.yaml        — DQN HPs (CartPole defaults); _partial_ replay_buffer + network
   algorithm/dqn_atari.yaml  — DQN HPs (Atari/NatureDQN defaults; pixel obs)
@@ -373,7 +376,8 @@ configs/
   algorithm/a2c.yaml        — A2C HPs (HalfCheetah/MuJoCo defaults); _partial_ actor/value
   algorithm/mfec_atari.yaml — MFEC HPs (Blundell et al. 2016 §4.1 Atari defaults: buffer_size=1M,
                               k=11, state_dim=64, gamma=1.0, constant eps=0.005;
-                              encoder_name=random_projection, vae_checkpoint=null, seed=null).
+                              encoder_name=random_projection, vae_checkpoint=null,
+                              seed=${trainer.seed} — see "Environment seeding").
                               NOTE §4.2's Labyrinth settings differ (k=50, gamma=0.99)
   algorithm/nec.yaml        — NEC HPs (base defaults); defaults-lists the
                               embedding_network config group + _partial_ replay_buffer
@@ -451,6 +455,8 @@ configs/
   paths/default.yaml
   train.yaml, eval.yaml, train_vae.yaml
 tests/
+  test_env_seeding.py       — ParallelEnv workers get reproducible, non-colliding streams;
+                              a num_envs=1 env must not re-seed the parent process
   test_smoke.py             — DQN-on-CartPole, DQN-on-Pong, DDPG-on-HalfCheetah, A2C-on-HalfCheetah, MFEC-on-Pong, NEC-on-Pong smoke tests
   test_mfec_encoder_refactor.py — encoder-abstraction transparency: setup() wiring, embed()
                               shape/determinism, forward(), deepcopy sharing, checkpoint round-trip
@@ -571,6 +577,47 @@ least-recently-updated-first order, so it doubles as the LRU queue:
 after an Eq. (1) max-update. A kNN **read** deliberately does not refresh
 recency. A FIFO ring buffer would evict the oldest *insertions*, which on
 Atari are exactly the early-level states re-visited every episode.
+
+### Environment seeding
+
+**`seed_everything(cfg.trainer.seed)` in `src/train.py` seeds the parent
+process only, and that is not enough.** `ParallelEnv` uses
+`mp_start_method="spawn"`, so every env worker is a fresh interpreter whose
+`torch`/`numpy`/`random` RNGs come from OS entropy. Before this was fixed,
+nothing called `set_seed` anywhere, and two runs after an identical
+`seed_everything(42)` produced different per-worker start states — measured.
+`experiment=mfec/mspacman_5seed` with `seed: 42,43,44,45,46` was therefore
+**not** five controlled seeds; only the random-projection matrix varied, and in
+`mfec/mspacman.yaml` (which left `algorithm.seed: null`) not even that.
+
+Why it is fatal rather than cosmetic: with `repeat_action_probability=0.0` an
+ALE reset is fully deterministic, so `NoopResetEnv`'s `torch.randint` draw is
+**the only** source of episode-start diversity — and it runs inside the worker,
+where `Transform` has no `_set_seed` hook for a parent-side `set_seed` to reach.
+
+The fix, in `src/environments/factory.py`:
+
+- `make_env(..., seed=<master>)` builds **one `env_fn` per worker** (a list, not
+  one shared callable) — that partial is the only code that runs inside the
+  spawned process.
+- Each worker calls `seed_everything(derive_seed(master, i))` *before*
+  constructing anything, then `env.set_seed(...)` for the emulator.
+- `seed_process` is `num_envs > 1` only. A `num_envs=1` env is built in the
+  parent, and `BaseTrainer.evaluate()` builds one **per eval interval** — so
+  re-seeding there would reset the trainer's exploration stream every 200 k
+  steps and make training exploration periodic.
+- `BaseTrainer` derives two streams: `_SEED_STREAM_TRAIN` for the collector's
+  envs and `_SEED_STREAM_EVAL` **keyed on `self._step`** for the eval env, so
+  successive evaluations do not replay identical episodes.
+
+`derive_seed` (`src/utils/seeding.py`) hashes with blake2b rather than doing
+`base + i`, for two reasons: `base + i` aliases across runs (seeds `42..46`,
+4 workers → `(44, worker 1)` and `(45, worker 0)` both give 45, so two
+"independent" runs replay each other), and Python's `hash()` is salted per
+interpreter, which is exactly the property that breaks in a spawned worker.
+
+Guarded by `tests/test_env_seeding.py`, including a negative control: on the
+pre-fix path (`seed=None`) two identical constructions must *not* reproduce.
 
 ### Eval must preprocess observations on the training env's device
 

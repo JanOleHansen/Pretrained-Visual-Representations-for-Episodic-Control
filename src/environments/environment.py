@@ -39,5 +39,18 @@ class Environment:
             "gym_backend": gym_backend,
         }
 
-    def make_env(self, num_envs: int = 1, device: str = "cpu") -> EnvBase:
-        return make_env(**self._factory_kwargs, num_envs=num_envs, device=device)
+    def make_env(
+        self,
+        num_envs: int = 1,
+        device: str = "cpu",
+        seed: int | None = None,
+    ) -> EnvBase:
+        """Build an env.
+
+        Args:
+            seed: master seed for this env group; each worker gets its own
+                derived stream. ``None`` leaves the env entropy-seeded.
+        """
+        return make_env(
+            **self._factory_kwargs, num_envs=num_envs, device=device, seed=seed
+        )

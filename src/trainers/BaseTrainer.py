@@ -14,6 +14,12 @@ from src.algorithms.base import BaseAlgorithm
 from src.environments.environment import Environment
 from src.environments.factory import env_worker_device
 from src.utils.device import resolve_device
+from src.utils.seeding import derive_seed
+
+#: Sub-stream ids for :func:`derive_seed`. Fixed constants — changing one
+#: changes which trajectories a given ``trainer.seed`` produces.
+_SEED_STREAM_TRAIN = 0
+_SEED_STREAM_EVAL = 1
 
 
 class TrainerEvent(Enum):
@@ -88,6 +94,14 @@ class BaseTrainer(ABC):
         #: right answer for the single-env case.
         self._env_device: str = str(self.device)
 
+        #: Master seed for every RNG stream this run owns. ``seed_everything``
+        #: in ``src/train.py`` covers *this* process only; the env workers are
+        #: spawned interpreters and the eval env is rebuilt per evaluation, so
+        #: both get their own stream derived from this (see ``derive_seed``).
+        #: ``.get`` rather than attribute access because trainer configs built
+        #: by hand in tests omit it; ``configs/train.yaml`` always sets it.
+        self._seed: int = int(self.trainer_cfg.get("seed", 0))
+
         self._step: int = 0
 
     def setup(self) -> None:
@@ -99,6 +113,7 @@ class BaseTrainer(ABC):
             return self.environment.make_env(
                 num_envs=num_envs,
                 device=str(self.device),
+                seed=derive_seed(self._seed, _SEED_STREAM_TRAIN),
             )
 
         self.train_env = make_env()
@@ -149,9 +164,15 @@ class BaseTrainer(ABC):
         tensordict is moved onto ``self.device`` for the policy call and back
         for the env step, exactly as the collector does.
         """
+        # Seeded from the step count, not a constant: the ALE reset is
+        # deterministic, so a fixed seed would make every evaluation replay the
+        # same episodes and turn eval/return_mean into a single sample. Keyed
+        # on a separate stream from the training workers so the eval env never
+        # lands on a start state a training worker is already replaying.
         eval_env = self.eval_environment.make_env(
             num_envs=1,
             device=self._env_device,
+            seed=derive_seed(self._seed, _SEED_STREAM_EVAL, self._step),
         )
         policy = self.algorithm.get_policy()
         self.algorithm.reset_eval_metrics()

@@ -15,6 +15,8 @@ from contextlib import nullcontext
 from functools import partial
 from typing import Sequence
 
+from src.utils.seeding import derive_seed, seed_everything
+
 
 def env_worker_device(num_envs: int, device: str) -> str:
     """Device the env — and therefore its transform stack — actually runs on.
@@ -44,6 +46,7 @@ def make_env(
     transforms: list | None = None,
     gym_kwargs: dict | None = None,
     gym_backend: str | None = None,
+    seed: int | None = None,
     **_: object,
 ):
     """Build a (possibly vectorised) ``TransformedEnv`` for a gymnasium env.
@@ -60,23 +63,58 @@ def make_env(
             ``{"frame_skip": 4, "from_pixels": True}``).
         gym_backend: optional gym backend name for ``set_gym_backend``
             (e.g. ``"gymnasium"``); if ``None`` torchrl picks the default.
+        seed: master seed for this env group. Each of the ``num_envs`` workers
+            gets its own stream derived from it, so workers still explore
+            differently but do so reproducibly. ``None`` keeps the old
+            entropy-seeded behaviour.
+
+    Seeding note
+    ------------
+    ``ParallelEnv`` is built with **one ``env_fn`` per worker** rather than one
+    shared callable, because that is the only hook that runs *inside* the
+    spawned process. Two things need seeding there and only one of them is
+    reachable from the parent:
+
+    * the emulator itself — ``env.set_seed()`` would cover this;
+    * the worker's **global** ``torch``/``numpy``/``random`` RNGs, which
+      transforms draw from. ``NoopResetEnv`` calls ``torch.randint`` to pick
+      its action count, and ``Transform`` has no ``_set_seed`` hook, so a
+      parent-side ``set_seed`` never reaches it.
+
+    That second one is the load-bearing one here: an ALE reset is fully
+    deterministic (measured), so with ``repeat_action_probability=0`` the
+    no-op count is the *only* thing that distinguishes one episode's start
+    state from another's. Leave it entropy-seeded and the run is
+    unreproducible no matter what else is seeded.
     """
     worker_device = env_worker_device(num_envs, device)
 
-    env_fn = partial(
-        _make_gymnasium_env,
-        name=name,
-        transforms=transforms,
-        device=worker_device,
-        gym_kwargs=gym_kwargs,
-        gym_backend=gym_backend,
-    )
+    def env_fn(worker_seed: int | None):
+        return partial(
+            _make_gymnasium_env,
+            name=name,
+            transforms=transforms,
+            device=worker_device,
+            gym_kwargs=gym_kwargs,
+            gym_backend=gym_backend,
+            seed=worker_seed,
+            # Only a spawned worker owns its interpreter. Re-seeding the
+            # global RNGs in the parent would clobber the trainer's own
+            # stream — and `BaseTrainer.evaluate()` builds a single env every
+            # eval interval, so it would reset exploration to the same state
+            # over and over, making training exploration periodic.
+            seed_process=num_envs > 1,
+        )
 
     if num_envs > 1:
         from torchrl.envs import ParallelEnv
 
-        return ParallelEnv(num_envs, env_fn, mp_start_method="spawn")
-    return env_fn()
+        env_fns = [
+            env_fn(None if seed is None else derive_seed(seed, i))
+            for i in range(num_envs)
+        ]
+        return ParallelEnv(num_envs, env_fns, mp_start_method="spawn")
+    return env_fn(seed)()
 
 
 def _instantiate_transform(cfg: dict):
@@ -94,9 +132,17 @@ def _make_gymnasium_env(
     device: str,
     gym_kwargs: dict | None = None,
     gym_backend: str | None = None,
+    seed: int | None = None,
+    seed_process: bool = False,
 ):
     from torchrl.envs import GymEnv, TransformedEnv
     from torchrl.envs.transforms import Compose
+
+    # Runs in the ParallelEnv worker when seed_process is set. Do this before
+    # anything is constructed, so transforms that draw at __init__ time are
+    # covered too.
+    if seed is not None and seed_process:
+        seed_everything(seed)
 
     backend_ctx = nullcontext()
     if gym_backend is not None:
@@ -106,8 +152,13 @@ def _make_gymnasium_env(
     with backend_ctx:
         base_env = GymEnv(name, device=device, **(gym_kwargs or {}))
 
-    if not transforms:
-        return base_env
+    if transforms:
+        transform_objects = [_instantiate_transform(t) for t in transforms]
+        env = TransformedEnv(base_env, Compose(*transform_objects))
+    else:
+        env = base_env
 
-    transform_objects = [_instantiate_transform(t) for t in transforms]
-    return TransformedEnv(base_env, Compose(*transform_objects))
+    if seed is not None:
+        env.set_seed(seed)
+
+    return env
