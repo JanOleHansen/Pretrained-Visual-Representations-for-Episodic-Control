@@ -35,6 +35,25 @@ OBS_SHAPE = (4, 84, 84)
 EMBED_DIM = 64
 
 
+def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """``torch.equal`` that also holds for NaN.
+
+    ``DND`` allocates its tables with ``torch.empty``, so every slot beyond
+    ``_sizes[a]`` holds uninitialised memory — and whenever that garbage
+    happens to be a NaN bit pattern, ``torch.equal`` returns False no matter
+    what, because NaN != NaN. The "were these bytes left alone?" assertions
+    below were therefore passing on luck: they flip to failing as soon as
+    something earlier in the session changes what the allocator hands back
+    (running the multiprocessing-based env tests first is enough to do it).
+
+    Comparing the raw bits answers the question actually being asked.
+    """
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    bits = torch.int64 if a.element_size() == 8 else torch.int32
+    return torch.equal(a.view(bits), b.view(bits))
+
+
 def _make_algorithm(*, key_lr: float, value_lr: float) -> NECAlgorithm:
     """NEC wired directly (no env), seeded with 3 distinct frames per action."""
     torch.manual_seed(0)
@@ -136,10 +155,10 @@ def test_untouched_slots_are_bit_identical():
 
     for a in range(alg._num_actions):
         dead = slice(alg.dnd._sizes[a], alg.dnd.capacity)
-        assert torch.equal(alg.dnd.keys[a, dead], keys_before[a, dead]), (
+        assert _bitwise_equal(alg.dnd.keys[a, dead], keys_before[a, dead]), (
             f"action {a}: slots beyond _sizes were modified"
         )
-        assert torch.equal(alg.dnd.values[a, dead], values_before[a, dead]), (
+        assert _bitwise_equal(alg.dnd.values[a, dead], values_before[a, dead]), (
             f"action {a}: values beyond _sizes were modified"
         )
 
@@ -199,5 +218,5 @@ def test_zero_learning_rates_leave_the_dnd_untouched():
 
     assert alg._gradient_step() is not None
 
-    assert torch.equal(keys_before, alg.dnd.keys)
-    assert torch.equal(values_before, alg.dnd.values)
+    assert _bitwise_equal(keys_before, alg.dnd.keys)
+    assert _bitwise_equal(values_before, alg.dnd.values)
