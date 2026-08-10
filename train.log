@@ -37,3 +37,10 @@ ModuleNotFoundError("No module named 'faiss.swigfaiss_avx2'")
 [2026-08-10 06:26:17,293][dinov2][INFO] - using MLP layer as FFN
 [2026-08-10 06:31:31,077][dinov2][INFO] - using MLP layer as FFN
 [2026-08-10 06:33:58,084][dinov2][INFO] - using MLP layer as FFN
+[2026-08-10 07:39:02,766][dinov2][INFO] - using MLP layer as FFN
+[2026-08-10 12:25:09,993][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-10 12:25:09,993][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-10 12:25:09,995][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-10 12:25:09,995][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-10 15:55:44,976][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-10 15:55:44,977][asyncio][WARNING] - socket.send() raised exception.
