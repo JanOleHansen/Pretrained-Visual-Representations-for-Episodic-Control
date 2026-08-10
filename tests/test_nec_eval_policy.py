@@ -173,3 +173,58 @@ def test_explore_policy_still_accepts_the_batched_collector_tensordict():
     with torch.no_grad(), set_exploration_type(ExplorationType.RANDOM):
         out = alg.get_explore_policy()(td)
     assert out["action"].shape == torch.Size([E]), out["action"].shape
+
+
+# ---------------------------------------------------------------------------
+# eval_eps must be large enough to actually decorrelate episodes
+# ---------------------------------------------------------------------------
+
+def test_default_eval_eps_makes_a_repeated_episode_essentially_impossible():
+    """A 2.25M-step run reported eval/return_min ~= eval/return_max because
+    eval_eps was 0.001.
+
+    ALE is deterministic here (repeat_action_probability=0.0) and NoopResetEnv
+    does not perturb Ms. Pac-Man's opening, so an episode of length L replays
+    pure argmax with probability (1 - eval_eps)^L. At 0.001 with L=600 that is
+    55% — more than half of all eval episodes are the SAME trajectory, so
+    num_eval_episodes=5 costs 5x for ~1 effective sample and the reported score
+    is one fragile deterministic rollout.
+
+    This asserts the *property* (episodes decorrelate) rather than the literal
+    constant, so it keeps holding if the value is retuned.
+    """
+    import inspect
+
+    default = inspect.signature(NECAlgorithm.__init__).parameters["eval_eps"].default
+    typical_episode_len = 600            # measured on Ms. Pac-Man at ~250k steps
+    p_identical = (1.0 - default) ** typical_episode_len
+    assert p_identical < 0.01, (
+        f"eval_eps={default} leaves a {p_identical:.1%} chance that an eval "
+        f"episode of {typical_episode_len} steps is bit-identical to pure "
+        "argmax. Evaluation then reports one deterministic rollout and "
+        "eval/return_std collapses toward 0."
+    )
+
+
+def test_eval_deviates_from_greedy_at_about_the_configured_rate():
+    """Empirical counterpart: over a realistic episode length the eval policy
+    must actually depart from the argmax action, at roughly eval_eps."""
+    eps = 0.05
+    alg = _make(eps)
+    greedy = _make(0.0)
+    greedy.dnd = alg.dnd
+    greedy.embedding_net = alg.embedding_net
+
+    obs = torch.randint(0, 256, OBS_SHAPE, dtype=torch.uint8)
+    with torch.no_grad(), set_exploration_type(ExplorationType.MODE):
+        base = int(greedy.get_policy()(TensorDict({"pixels": obs}, batch_size=[]))["action"])
+        n, L = 0, 2000
+        for _ in range(L):
+            a = int(alg.get_policy()(TensorDict({"pixels": obs}, batch_size=[]))["action"])
+            n += (a != base)
+
+    expected = eps * (1.0 - 1.0 / NUM_ACTIONS)      # a random draw can re-pick greedy
+    assert 0.5 * expected < n / L < 2.0 * expected, (
+        f"deviation rate {n/L:.4f} over {L} calls is not ~{expected:.4f}; "
+        "epsilon is not being applied at the configured rate"
+    )

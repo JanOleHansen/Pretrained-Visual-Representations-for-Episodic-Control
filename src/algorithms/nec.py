@@ -1104,15 +1104,25 @@ class NECAlgorithm(BaseAlgorithm):
         eps_start:        float = 1.0,
         eps_end:          float = 0.01,
         annealing_frames: int   = 4_000_000,
-        # Exploration rate used by get_policy() (evaluation).  A pure argmax
-        # makes eval deterministic: with repeat_action_probability=0.0 the ALE
-        # is deterministic and NoopResetEnv does not perturb Ms. Pac-Man's
-        # opening, so every eval episode replays the same trajectory and
-        # eval/return_std is identically 0 — num_eval_episodes then costs N x
-        # for a single sample.  See src/algorithms/eval_policy.py.  Matches the
-        # annealed floor, i.e. the policy actually being trained.  0.0 restores
-        # the old deterministic behaviour.
-        eval_eps:         float = 0.001,
+        # Exploration rate used by get_policy() (evaluation).  NOT the
+        # annealed training floor — this has to be big enough to actually
+        # decorrelate episodes.  With repeat_action_probability=0.0 the ALE is
+        # deterministic and NoopResetEnv does not perturb Ms. Pac-Man's
+        # opening, so an episode of length L is bit-identical to pure argmax
+        # with probability (1 - eval_eps)^L:
+        #
+        #     eval_eps   L=600   random actions/episode
+        #     0.001      54.9%     0.6      <- was this; eval/return_min ~= max
+        #     0.005       4.9%     3.0
+        #     0.05        0.0%    30.0      <- Mnih et al. 2015 eval protocol
+        #
+        # At 0.001 more than half of all eval episodes replay the SAME
+        # trajectory, so num_eval_episodes=5 costs 5x for ~1 effective sample
+        # and the reported score is one fragile deterministic rollout.  0.05 is
+        # the standard Atari evaluation rate (Mnih et al. 2015), whose
+        # preprocessing Pritzel et al. §4 explicitly adopt; the paper itself
+        # never states an evaluation epsilon.  0.0 restores pure argmax.
+        eval_eps:         float = 0.05,
         # --- Data collection -----------------------------------------------
         frames_per_batch:    int = 1_600,
         init_random_frames:  int = 50_000,

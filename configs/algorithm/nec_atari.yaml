@@ -71,11 +71,16 @@ eps_start: 1.0
 eps_end: 0.01
 annealing_frames: 4_000_000
 
-# Evaluation exploration rate (get_policy()). NOT annealed. A pure argmax makes
-# eval fully deterministic — every episode replays the same trajectory and
-# eval/return_std is identically 0, so num_eval_episodes buys nothing at N x the
-# cost. See src/algorithms/eval_policy.py. Set 0.0 for deterministic eval.
-eval_eps: 0.001
+# Evaluation exploration rate (get_policy()). NOT annealed, and deliberately
+# LARGER than the training floor. ALE is deterministic here
+# (repeat_action_probability=0.0) and NoopResetEnv does not perturb the opening,
+# so an episode of length L replays pure argmax with probability
+# (1 - eval_eps)^L: at 0.001 and L=600 that is 55% of episodes identical, which
+# makes eval/return_min ~= eval/return_max and num_eval_episodes worthless.
+# 0.05 is the Mnih et al. (2015) evaluation rate, whose preprocessing Pritzel
+# et al. §4 adopt; the NEC paper states no evaluation epsilon of its own.
+# Set 0.0 for pure argmax.
+eval_eps: 0.05
 
 # Data collection.  frames_per_batch counts AGENT STEPS, and every Atari config
 # here runs action-repeat 4, so 1600 agent steps == 6400 raw ALE frames.
