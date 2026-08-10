@@ -24,7 +24,8 @@ obs_key: pixels
 embedding_dim: 64
 dnd_capacity: 500_000
 k: 50
-kernel_delta: 1.0e-3   # δ in kernel k(h,h_i) = 1/(‖h−h_i‖²+δ)
+kernel_delta: 1.0e-5   # δ in kernel k(h,h_i) = 1/(‖h−h_i‖²+δ);
+                       # scaled for L2-normalised keys, see nec_atari.yaml
 dnd_lr: 0.1            # α for blending existing entries on write
 # Gradient learning rates for the stored DND keys/values (paper Fig. 2:
 # "gradients flow through the entire architecture"). Not published — §4 sweeps
@@ -37,7 +38,9 @@ dnd_value_lr: 1.0e-5
 n_step: 100
 
 # Optimisation
-lr: 1.0e-4
+lr: 1.0e-5             # RMSProp, reference values (see nec_atari.yaml)
+rmsprop_alpha: 0.9
+rmsprop_eps: 0.01
 gamma: 0.99
 batch_size: 32
 max_grad_norm: 10.0

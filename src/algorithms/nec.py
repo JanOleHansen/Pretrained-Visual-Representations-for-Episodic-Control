@@ -1193,7 +1193,33 @@ class NECAlgorithm(BaseAlgorithm):
         embedding_dim: int = 64,
         dnd_capacity:  int = 500_000,   # entries per action
         k:             int = 50,        # nearest neighbours for kNN lookup
-        kernel_delta:  float = 1e-3,    # δ in inverse-distance kernel
+        # δ in the inverse-distance kernel.  The paper says 1e-3, but δ is
+        # dimensionally a SQUARED DISTANCE, so it is only meaningful relative
+        # to the embedding scale — and this implementation L2-normalises,
+        # which the paper and the reference implementation
+        # (github.com/EndingCredits/Neural-Episodic-Control) do not.
+        #
+        # Measured on 6000 real Ms. Pac-Man frames, mean squared distance to
+        # the k=50 retrieved neighbours, and δ as a fraction of it:
+        #
+        #   reference: no normalisation, trunc_normal(0, 0.1) init
+        #                                      d² = 1.7e+1   δ/d² = 0.00003
+        #   ours:      L2-normalised, default torch init
+        #                                      d² = 5.8e-3   δ/d² = 0.17
+        #
+        # At δ/d² = 0.17 the paper's division-by-zero *guard* is instead the
+        # dominant term: every one of the k weights is ~1/δ regardless of the
+        # true distance, so Q(s,a) degenerates to the mean of action a's
+        # table — a per-action constant — and argmax returns one fixed action
+        # for every state.  An exact re-encounter, the entire point of
+        # episodic control, collected only 5.6% of the kernel mass against a
+        # uniform floor of 1/k = 2.0%; at 1e-5 it collects 45%.
+        #
+        # 1e-5 is the smallest safe value: `_topk_l2_unit`'s `2 - 2·sim` fast
+        # path has a measured float32 error of 4.5e-7 in d², so δ must stay
+        # well above that or near-exact matches become numerical noise.  1e-5
+        # keeps a 22x margin.
+        kernel_delta:  float = 1e-5,
         dnd_lr:        float = 0.1,     # α for blending existing DND entries
         # Gradient (not blend) learning rates for the stored keys/values.
         # Paper Fig. 2 — "gradients flow through the entire architecture" — so
@@ -1205,7 +1231,32 @@ class NECAlgorithm(BaseAlgorithm):
         # --- N-step return -------------------------------------------------
         n_step: int = 100,
         # --- Optimisation --------------------------------------------------
-        lr:            float = 1e-4,
+        # RMSProp settings.  §4 says only "we used the RMSProp algorithm";
+        # every number below is from the reference implementation
+        # (github.com/EndingCredits/Neural-Episodic-Control, NECAgent.py),
+        # which uses `RMSPropOptimizer(1e-5, decay=0.9, epsilon=0.01)` — the
+        # DeepMind trio.  This used to be `torch.optim.RMSprop(params, lr=1e-4)`,
+        # i.e. lr 10x higher on top of PyTorch's defaults alpha=0.99 and
+        # eps=1e-8 — a stabiliser 1e6x smaller than the reference's.
+        #
+        # That combination is not a cosmetic difference.  RMSProp's step is
+        # lr·g/(sqrt(v) + eps); with eps=1e-8 it degenerates towards
+        # lr·sign(g) no matter how small the gradient is, so the CNN moves at
+        # a near-constant rate every one of the `num_updates` steps per batch.
+        # A DND key is written once and then read for thousands of batches, so
+        # what matters is how far the embedding drifts per batch relative to
+        # how far apart distinct states are.  Measured over one 400-update
+        # batch on real Ms. Pac-Man frames (drift / state-spread):
+        #
+        #   lr=1e-4, alpha=0.99, eps=1e-8  (was)   8.7x
+        #   lr=1e-5, alpha=0.9,  eps=0.01  (ref)   3.1x
+        #
+        # At 8.7x every stored key is stale before the next batch even reads
+        # it, which is directly observable: the nearest stored key sat FURTHER
+        # from a query (0.13–0.18) than an unrelated current frame did (0.094).
+        lr:            float = 1e-5,
+        rmsprop_alpha: float = 0.9,
+        rmsprop_eps:   float = 0.01,
         gamma:         float = 0.99,
         batch_size:    int   = 32,
         max_grad_norm: float = 10.0,
@@ -1251,6 +1302,8 @@ class NECAlgorithm(BaseAlgorithm):
         self.dnd_value_lr    = dnd_value_lr
         self.n_step          = n_step
         self.lr              = lr
+        self.rmsprop_alpha   = rmsprop_alpha
+        self.rmsprop_eps     = rmsprop_eps
         self.gamma           = gamma
         self.batch_size      = batch_size
         self.max_grad_norm   = max_grad_norm
@@ -1382,6 +1435,8 @@ class NECAlgorithm(BaseAlgorithm):
         self.optimizer = torch.optim.RMSprop(
             self.embedding_net.parameters(),
             lr=self.lr,
+            alpha=self.rmsprop_alpha,
+            eps=self.rmsprop_eps,
         )
 
         # 6. Per-env carry buffers for partial episodes across batch boundaries
@@ -1850,7 +1905,16 @@ class NECAlgorithm(BaseAlgorithm):
 
         q_hat  = torch.cat(q_hat_parts)
         tgt    = torch.cat(target_parts)
-        loss   = ((q_hat - tgt) ** 2).mean()
+        # SUM, not mean — the reference implementation uses
+        # `tf.reduce_sum(tf.square(td_err))`.  This is not free to change
+        # independently of the optimiser: for RMSProp, scaling the loss by a
+        # constant c is equivalent to dividing `eps` by c, so the reduction and
+        # (lr, alpha, eps) only transfer together.  Keeping `mean` while
+        # adopting the reference's eps=0.01 would damp every step by up to
+        # `batch_size`.  `train/q_loss` still reports the MEAN so the metric
+        # stays comparable across batch sizes.
+        sq_err = (q_hat - tgt) ** 2
+        loss   = sq_err.sum()
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -1878,7 +1942,7 @@ class NECAlgorithm(BaseAlgorithm):
         # Returned as 0-dim TENSORS, not floats: `float(...)` here would force
         # two more host syncs per update (800 per collector batch). step()
         # stacks them and reduces once.
-        return loss.detach(), q_hat.detach().mean()
+        return sq_err.detach().mean(), q_hat.detach().mean()
 
     def _sizes_summary(self) -> list[int]:
         return list(self.dnd._sizes)
@@ -2024,6 +2088,8 @@ class NECAlgorithm(BaseAlgorithm):
         self.optimizer = torch.optim.RMSprop(
             self.embedding_net.parameters(),
             lr=self.lr,
+            alpha=self.rmsprop_alpha,
+            eps=self.rmsprop_eps,
         )
         self.optimizer.load_state_dict(state.optimizer_state_dict)
         self._collected_frames = int(state.extra["collected_frames"])

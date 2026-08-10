@@ -42,7 +42,16 @@ embedding_dim: 64        # (swept, unreported) — §4 lists "dimensionality of
 dnd_capacity: 500_000    # (paper §4) "store up to 5 × 10^5 memories per action"
 k: 50                    # (paper §4) "we set the number of nearest neighbours
                          # p = 50 in all our experiments"
-kernel_delta: 1.0e-3     # (paper §4, Eq. 5) "we set δ = 10^-3"
+# δ is a SQUARED DISTANCE, so it only means anything relative to the embedding
+# scale — and this repo L2-normalises, which neither the paper nor the reference
+# implementation does. Measured on real Ms. Pac-Man frames, δ as a fraction of
+# the mean squared distance to the k=50 neighbours: reference 0.00003, ours
+# 0.17. At 0.17 the paper's divide-by-zero guard IS the kernel: all k weights
+# are ~1/δ, Q(s,a) collapses to a per-action constant, and argmax returns one
+# fixed action for every state. An exact re-encounter got 5.6% of the kernel
+# mass (uniform floor 1/k = 2.0%); at 1e-5 it gets 45%. 1e-5 is the floor:
+# _topk_l2_unit's 2-2*sim fast path has ~4.5e-7 float32 error in d^2.
+kernel_delta: 1.0e-5
 dnd_lr: 0.1              # (swept, unreported) — §4's "fast-update learning-rate α"
 # Gradient learning rates for the stored DND keys/values. Paper Fig. 2:
 # "Gradients flow through the entire architecture" — the regression loss
@@ -56,10 +65,20 @@ n_step: 100              # (paper §4) "for the N-step Q estimates we picked a
                          # horizon of N = 100"
 
 # Optimisation
-# NECAlgorithm uses RMSProp, per paper §4 ("we used the RMSProp algorithm for
-# gradient descent training"). It was Adam until the paper was re-checked, so
-# `lr` below was tuned against Adam — revisit it.
-lr: 1.0e-4               # (swept, unreported) — §4's "SGD learning-rate"
+# RMSProp per paper §4 ("we used the RMSProp algorithm for gradient descent
+# training"); §4 publishes no numbers. These are the reference implementation's
+# (github.com/EndingCredits/Neural-Episodic-Control, NECAgent.py):
+#   RMSPropOptimizer(1e-5, decay=0.9, epsilon=0.01)   <- the DeepMind trio
+# This was lr=1e-4 on PyTorch's defaults (alpha=0.99, eps=1e-8), i.e. a
+# stabiliser 1e6x smaller. RMSProp's step is lr*g/(sqrt(v)+eps), so eps=1e-8
+# degenerates towards lr*sign(g) and the CNN moves at a near-constant rate on
+# every one of the 400 updates per batch. A DND key is written once and read
+# for thousands of batches, so what matters is drift-per-batch vs how far apart
+# distinct states are. Measured over one 400-update batch: 8.7x (old) vs 3.1x
+# (these values). At 8.7x every key is stale before it is next read.
+lr: 1.0e-5
+rmsprop_alpha: 0.9
+rmsprop_eps: 0.01
 gamma: 0.99              # (paper §4) "all algorithms were trained using
                          # discount rate γ = 0.99"
 batch_size: 32           # (paper §4) "with a minibatch of size 32"

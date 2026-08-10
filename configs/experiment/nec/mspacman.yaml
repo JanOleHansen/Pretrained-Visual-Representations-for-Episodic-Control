@@ -36,8 +36,11 @@ algorithm:
   # The paper swept epsilon and never published the schedule (§4 lists the
   # "epsilon-greedy exploration-rate" among the swept-but-unreported values,
   # alongside the SGD learning rate, alpha, and the embedding dimensionality).
-  # eps_end=1e-3 follows the NEC Atari setting reported in the episodic-control
-  # literature. The anneal deliberately outlasts the random warm-up: NEC only
+  # The paper only says "we use ε-greedy policy during training with a low ε"
+  # (§3.2); the reference implementation uses a CONSTANT ε = 0.1 with no anneal
+  # at all. 0.05 sits between the two and matches eval_eps, so train/* and
+  # eval/* describe the same policy. The anneal deliberately outlasts the
+  # random warm-up: NEC only
   # writes to the DND at episode end, and while an action's table holds <= k
   # entries its Q is +inf (mapped to 1e9), so argmax degenerates to action 0.
   # Annealing over 50k agent steps (200k raw frames) keeps real exploration
@@ -47,9 +50,16 @@ algorithm:
   init_random_frames: 12_500
 
 trainer:
-  # 1_000_000 agent steps == 40M raw ALE frames, matching the paper's x-axis
-  # and the MFEC Ms. Pac-Man run. For the directly-comparable Table 3 number
-  # (NEC Ms. Pac-Man = 4142.8 at 10M frames) use total_frames=2_500_100.
+  # total_frames counts AGENT STEPS. The paper's x-axis counts RAW ALE FRAMES,
+  # and action repeat is 4, so paper_frames = 4 x total_frames.
+  #
+  #   total_frames    paper x-axis   NEC Ms. Pac-Man (Fig. 6 / Table 3)
+  #     250_000          1M frames     ~1500-2000
+  #   1_000_000          4M frames     ~2500-3000   <- this run
+  #   2_500_000         10M frames      4142.8      (Table 3, directly comparable)
+  #
+  # (An earlier comment here claimed 1_000_000 agent steps == 40M raw frames.
+  # That is wrong by 10x: it is 4M. The 2_500_100 figure for 10M was correct.)
   total_frames: 1_000_000
   seed: 42
   accelerator: gpu

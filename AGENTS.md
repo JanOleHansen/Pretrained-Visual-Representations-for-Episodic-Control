@@ -1184,6 +1184,103 @@ keys for 1236 distinct frames — the encoder adds no collapse of its own). A
 blend rate of 0.1–0.5 on Ms. Pac-Man is the expected reading. Use
 `eval/dnd_top_weight` to detect an embedding that has stopped discriminating.
 
+### 5a. Audit against the paper (Pritzel et al. 2017)
+
+Everything §4 actually publishes, checked against the composed config:
+
+| Paper §4 / §3 | Value | Ours | |
+|---|---|---|---|
+| "store up to 5 x 10^5 memories per action" | 5e5 | `dnd_capacity: 500_000` | ok |
+| "nearest neighbours p = 50 in all our experiments" | 50 | `k: 50` | ok |
+| "horizon of N = 100" | 100 | `n_step: 100` | ok |
+| "replay buffer stores the only last 10^5 states" | 1e5 | `LazyTensorStorage(100_000)` | ok |
+| "one replay update for every 16 observed frames" | — | `num_updates: 400` per 1600 agent steps = 1 per 4 agent steps = 1 per 16 raw frames | ok |
+| "minibatch of size 32" | 32 | `batch_size: 32` | ok |
+| "discount rate γ = 0.99" | 0.99 | `gamma: 0.99` | ok |
+| "repeating each action four times" | 4 | `gym_kwargs.frame_skip: 4` | ok |
+| "RMSProp algorithm" | — | `torch.optim.RMSprop` | ok |
+| "NEC and MFEC do not require reward clipping" | — | no `SignTransform` in `mspacman_nec_train` | ok |
+| "evaluate MFEC and NEC every 200.000 frames" | 200k raw | `eval_every_n_steps: 50_000` agent steps | ok |
+| Eq. 3 N-step, bootstrap = `max_a Q(s_{t+N},a)` over **all** memories | — | `_compute_n_step_returns` + `_max_finite_q` | ok |
+| §3.3 "earliest such values can be added is N steps after" | — | the sliding window in `step()` | ok |
+| Eq. 4 `Q_i <- Q_i + α(Q^(N) - Q_i)` | — | `write_batch` blend | ok |
+| §3.4 backprop updates "the keys and values of each action-specific memory ... using a lower learning rate than α" | < α = 0.1 | `dnd_key_lr: 1e-4`, `dnd_value_lr: 1e-5` | ok |
+| Fig. 2 "Gradients flow through the entire architecture" | — | `DND.apply_gradient` | ok |
+| **"We set δ = 10^-3"** | **1e-3** | **`kernel_delta: 1e-5`** | **deviation** |
+
+The δ deviation is deliberate and is the only published number we do not use.
+δ is a squared distance, so it is only meaningful relative to the embedding
+scale, and this repo L2-normalises the embedding — which neither the paper nor
+the reference does. Measured, δ as a fraction of the mean squared distance to
+the 50 retrieved neighbours: paper/reference geometry 3e-5, ours **0.17**. See
+§5b. The paper-faithful alternative is to drop the normalisation and match the
+reference's `trunc_normal(0, 0.1)` init instead; that was not done because the
+kNN fast path (`_topk_l2_unit`) requires unit-norm keys.
+
+Swept-and-unreported by §4, so no paper value exists to match: the SGD learning
+rate, α (`dnd_lr`), the embedding dimensionality, and the ε-greedy rate.
+
+Deviations that are **not** numerical:
+
+* **Eviction.** §3.3: "We overwrite the item that has least recently shown up
+  as a neighbour" (LRU). Ours is FIFO. Never binds at this budget — 5e5 per
+  action against ~110k inserts per action over a 1M-agent-step run.
+* **Approximate NN.** §3.1 uses kd-trees; ours is an exact scan. Same answer,
+  much slower — see the fps table in §5b.
+* **Warm-up.** `init_random_frames: 12_500` has no counterpart in the paper or
+  the reference; both act ε-greedily from step 0.
+* **Optimistic init.** Neither the paper nor the reference returns `+inf` for an
+  under-populated action (the reference returns 0.0); we return `1e9`.
+* **`max_grad_norm: 10.0`** is in neither.
+
+### 5b. Diff against the reference implementation
+
+`github.com/EndingCredits/Neural-Episodic-Control` is the implementation the module docstring cites. It is TensorFlow and
+its encoder is fixed, but every *numerical* choice below was checked against it
+directly (`NECAgent.py`, `knn_dictionary.py`, `networks.py`, `main.py`).
+Differences that were **fixed**:
+
+| | reference | ours (before) | why it mattered |
+|---|---|---|---|
+| optimiser | `RMSPropOptimizer(1e-5, decay=0.9, epsilon=0.01)` | `torch.optim.RMSprop(lr=1e-4)` -> alpha=0.99, **eps=1e-8** | eps 1e6x smaller makes the step tend to `lr*sign(g)`. Embedding drift per 400-update batch, relative to how far apart distinct states are: **8.7x** vs 3.1x. A key is written once and read for thousands of batches, so at 8.7x every key is stale before it is next read — measured: nearest stored key sat *further* from a query (0.13–0.18) than an unrelated current frame (0.094). |
+| loss reduction | `reduce_sum` | `.mean()` | Only meaningful together with the optimiser: for RMSProp, scaling the loss by `c` is equivalent to dividing `eps` by `c`. `mean` + the reference's `eps=0.01` damps every step by up to `batch_size`. Now `sum`; `train/q_loss` still logs the mean. |
+| `kernel_delta` vs embedding scale | no L2 norm, `trunc_normal(0, 0.1)` init -> d^2 ~ 17, **δ/d^2 ~ 3e-5** | L2 norm, torch default init -> d^2 ~ 5.8e-3, **δ/d^2 = 0.17** | δ is a squared distance and only means anything relative to the embedding scale. At 0.17 the divide-by-zero *guard* is the dominant term: all k weights ~1/δ, `Q(s,a)` collapses to a per-action constant, argmax returns one fixed action for every state (measured: Q varied 44x more across actions than states). Exact re-encounter got 5.6 % of kernel mass (uniform floor 2.0 %); at δ=1e-5 it gets 45 %. |
+| updates per step | `learn_step=4` -> 1 update / 4 agent steps = **400** per 1600 | runs logged `train/updates=100` | 4x too few. Independently confirms `num_updates: 400`. |
+
+Differences **left in place** — deliberate, but the first is the one to A/B first:
+
+* **Gradients into `DND.keys`/`.values`.** The reference explicitly does not do
+  this (its README lists it as a deviation). We do, per paper Fig. 2. Setting
+  `dnd_key_lr=0 dnd_value_lr=0` is a bit-exact no-op by construction, so it is
+  a free A/B.
+* **Optimistic init.** Reference returns `Q = 0.0` for an action whose dict
+  holds `<= k` entries; we return `+inf -> 1e9`, so argmax chases whichever
+  action is under-populated. Reference also gates *training* on **all** actions
+  being queryable.
+* **`embedding_dim`** 64 vs the reference's 128.
+* **Exploration.** Reference default is a *constant* `epsilon=0.1` (no anneal);
+  we anneal 1.0 -> `eps_end` over `annealing_frames`.
+
+#### fps: exact kNN vs the reference's ANNOY index
+
+We do an exact scan of the whole table; the reference uses an ANNOY tree. Our
+cost is therefore linear in DND size, so **throughput degrades as training
+proceeds** (CPU, 9 actions, k=50, per 1600-frame batch):
+
+| entries/action | `estimate_all` | `knn_action` | per batch | fps |
+|---|---|---|---|---|
+| 25,000 | 21.6 ms | 1.27 ms | 8.9 s | 180 |
+| 100,000 | 94.4 ms | 5.30 ms | 38.0 s | 42 |
+| 500,000 | 408 ms | 24.8 ms | 171 s | 9 |
+
+`_gradient_step`'s `num_updates x num_actions` `knn_action` calls dominate, so
+raising `num_updates` 100 -> 400 also multiplies this cost by 4. If throughput
+is the binding constraint, cut `dnd_capacity` (the paper's 5e5 never fills at
+1M frames anyway) or add an approximate index. Two smaller costs, both absent
+from the reference: `EGreedyModule.step(1600)` loops in Python (~23 s/1M
+frames), and the exact-match hash bookkeeping `_make_keys` (~6 s/1M frames) —
+which the reference disabled outright as "cleaner (and faster without)".
+
 ### 6. NEC evaluation diagnostics (`eval/*`)
 
 `NECAlgorithm` implements `reset_eval_metrics()` / `eval_metrics()`, the same
