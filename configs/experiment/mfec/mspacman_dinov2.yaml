@@ -42,4 +42,7 @@ trainer:
   num_envs: 16
   log_every_n_steps: 10_000
   eval_every_n_steps: 50_000
-  num_eval_episodes: 10
+  # eval_eps=0.0 (see configs/algorithm/mfec_atari.yaml) makes every eval
+  # episode identical on a deterministic ALE, so N>1 buys N copies of one
+  # number at N times the cost.
+  num_eval_episodes: 1

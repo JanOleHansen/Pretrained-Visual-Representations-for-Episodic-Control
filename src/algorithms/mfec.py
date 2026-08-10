@@ -12,10 +12,38 @@ Key ideas
   (state, action) pair.
 * **Fixed random encoder**: raw pixel frames are reduced to a low-dimensional
   vector by a fixed, random projection matrix — no gradient updates needed.
-* **Optimistic initialisation**: if a (state, action) pair has never been
-  seen, the Q-estimate is +∞ so the agent is nudged to explore it first.
+* **Optimistic initialisation**: +∞ is returned while an action's *whole*
+  buffer holds ``<= k`` entries, because a k-neighbour mean is undefined
+  before that.  This is NOT per-(state, action) optimism: the buffers pass
+  ``k`` during the first episode, after which every query is answered by
+  either an exact hit or a kNN mean and nothing is optimistic ever again.
+  See "Two estimators, one argmax" below for what that costs.
 * **Max-aggregation**: if a state is revisited, we keep the *highest* return
   ever observed, which prevents a bad episode from erasing earlier knowledge.
+
+Two estimators, one argmax (measured)
+-------------------------------------
+Eq. (2) answers a query in one of two ways — the stored value on an exact
+match, a k-neighbour mean otherwise — and ``argmax`` then compares the two as
+if they were commensurable.  They are not.  Measured on Ms. Pac-Man
+(random projection, ``state_dim=64``, 51 k frames, 957 held-out (s, a) pairs):
+
+    exact stored value   bias vs true return-to-go   +60    corr 1.00
+    kNN mean estimate    bias vs true return-to-go  -411    corr 0.63
+    exact - kNN on the *same* (s, a)                +540 (median +546)
+
+The exact branch is a max over realised returns (upward biased); the kNN
+branch is a mean over neighbours (downward biased).  So an action the agent
+has already taken from a state beats one it has not by ~540 points of pure
+estimator bias, independent of which action is actually better.  Consequence,
+also measured: the policy picks an exact-hit action **99.8%** of the time
+although only ~1.8 of the 9 actions carry an exact entry.
+
+This is Eq. (2) as written in the paper, not an implementation defect, but it
+is why MFEC cannot recover once ε knocks it off its memorised trajectory, and
+why ``eval_eps`` defaults to 0.0 here (see :class:`MFECAlgorithm`).
+``eval/exact_minus_knn_value`` logs the gap so it can be compared across
+encoders — a representation with better kNN structure should shrink it.
 
 Algorithm pseudocode (matches the paper)
 -----------------------------------------
@@ -112,6 +140,39 @@ class MFECAlgorithm(BaseAlgorithm):
     The trainer calls setup() once, then step() repeatedly with collected
     batches.  This algorithm performs no gradient updates; the only
     "learning" is inserting experiences into the QEC memory tables.
+
+    ``eval_eps`` must be 0
+    ----------------------
+    ``eval_eps`` used to default to the paper's 0.005 so that
+    ``num_eval_episodes`` produced more than one distinct sample — the ALE is
+    deterministic here (``repeat_action_probability=0.0``) and ``NoopResetEnv``
+    does not change Ms. Pac-Man's score, so a greedy rollout is the same
+    episode every time.  That reasoning is sound but the cure is worse than the
+    disease.  Measured on one QEC (Ms. Pac-Man, 51 k frames, 6 episodes each):
+
+        eval_eps=0.000   [1440, 1440, 1440, 1440, 1440, 1440]  mean 1440
+        eval_eps=0.005   [ 490, 1440,  870,  550, 1440, 1440]  mean 1038
+
+    A 1000-decision episode takes ~5 forced random actions at ε=0.005, and MFEC
+    cannot absorb even one: off its memorised trajectory ~7 of 9 actions have
+    no exact entry and lose the argmax to the ~540-point estimator bias
+    described in the module docstring, so the episode never recovers.  So with
+    ε on:
+
+    * ``eval/return_mean`` **understates the policy by ~30%** (1038 vs 1440);
+    * ``eval/return_max`` is the only statistic that reports the real score;
+    * ``eval/return_min`` is the worst of N ε-derailments — an extreme order
+      statistic of a heavy left tail.  It sits near the floor *by
+      construction* and can never improve however good the memory gets, which
+      is exactly how it looks on a real 1 M-frame run (min pinned at ~200
+      while max climbed past 4000);
+    * ``eval/return_std`` measures ε-sensitivity, not policy variability.
+
+    At ``eval_eps=0.0`` every eval episode is identical, so set
+    ``num_eval_episodes: 1`` — ``eval/return_{min,mean,max}`` collapse onto one
+    honest curve and evaluation costs N times less.  Nothing is lost: the
+    ε=0.005 score the paper reports is what the *collector* already produces,
+    and it is logged as ``train/episode_reward``.
     """
 
     def __init__(
@@ -129,10 +190,13 @@ class MFECAlgorithm(BaseAlgorithm):
             eps_start: float = 1.0,
             eps_end: float = 0.05,
             annealing_frames: int = 1_000_000,
-            # Exploration rate used by get_policy() (evaluation).  Blundell et
-            # al. (2016) §4.1 report the score of the eps=0.005 policy — they
-            # never evaluate a pure argmax.  Set 0.0 for deterministic eval.
-            eval_eps: float = 0.005,
+            # Exploration rate used by get_policy() (evaluation).  0.0 = pure
+            # argmax, and that is deliberate — see "eval_eps must be 0" in the
+            # class docstring.  Raise it only if you specifically want to
+            # measure ε-robustness rather than the policy's own score; the
+            # eps=0.005 number Blundell et al. (2016) §4.1 report is already
+            # logged, as train/episode_reward.
+            eval_eps: float = 0.0,
             frames_per_batch: int = 1_000,
             max_frames_per_traj: int = -1,
             # Quantisation precision for the exact-match hash key.
@@ -583,9 +647,12 @@ class MFECAlgorithm(BaseAlgorithm):
         # Must be the full chain: q_actor alone reads "state_embedding", which
         # only _embed_module writes.
         #
-        # Ends in _EvalEGreedyModule (constant eval_eps, paper §4.1), NOT a bare
-        # argmax — see that class for why a deterministic eval policy makes
-        # eval/return_std identically 0 and understates the agent.
+        # Ends in _EvalEGreedyModule (constant eval_eps).  At the default
+        # eval_eps=0.0 that module is a no-op and this is a pure argmax, which
+        # is what MFEC should be evaluated with — see "eval_eps must be 0" on
+        # MFECAlgorithm.  The module stays in the chain so raising eval_eps
+        # actually takes effect (a stock EGreedyModule would not; torchrl gates
+        # it on ExplorationType and evaluate() runs under MODE).
         return self._policy
 
     def get_explore_policy(self) -> TensorDictModule:
@@ -625,10 +692,21 @@ class MFECAlgorithm(BaseAlgorithm):
         queries, exact, near = self.qec.lookup_stats()
         if queries == 0:
             return {}
-        return {
+        metrics = {
             "eval/exact_hit_rate":  exact / queries,
             "eval/memory_hit_rate": (exact + near) / queries,
         }
+
+        # How much better an action the agent has already taken from this state
+        # scores than one it has not, purely because Eq. (2) estimates the two
+        # with different statistics (max-over-returns vs mean-over-neighbours).
+        # Big gap -> the argmax is decided by which branch answered, not by
+        # which action is better, and the policy is locked into replaying its
+        # own trajectory.  This is the number a better encoder should move.
+        e_sum, e_n, k_sum, k_n = self.qec.value_stats()
+        if e_n and k_n:
+            metrics["eval/exact_minus_knn_value"] = e_sum / e_n - k_sum / k_n
+        return metrics
 
     #
     #   Checkpointing
@@ -742,10 +820,16 @@ class QECPolicy(nn.Module):
     Optimistic initialisation
     -------------------------
     ``QEC.estimate_all`` returns ``+inf`` for any action whose buffer holds
-    ``<= k`` entries, so untried actions are always preferred (Blundell et al.
-    2016 §2).  ``forward`` maps those sentinels onto a large finite value —
-    ``QValueActor`` cannot argmax over ``inf`` — **plus independent uniform
-    jitter per (state, action)**.
+    ``<= k`` entries.  Note the scope: that is the *whole action buffer*, not
+    the queried (state, action) pair, so optimism is a warm-up device for the
+    first episode only — every buffer passes ``k = 11`` well inside episode 1
+    and nothing is optimistic afterwards.  Untried actions at a *known* state
+    are not preferred; they are systematically penalised, by the ~540-point
+    estimator gap measured in the module docstring.
+
+    ``forward`` maps the sentinels onto a large finite value — ``QValueActor``
+    cannot argmax over ``inf`` — **plus independent uniform jitter per
+    (state, action)**.
 
     The jitter is load-bearing, not cosmetic.  Mapping every ``+inf`` onto a
     single constant makes all untried actions exact ties, and ``argmax``
@@ -941,6 +1025,30 @@ class QEC:
         self._lookup_queries = 0
         self._lookup_exact = 0
         self._lookup_near = torch.zeros((), dtype=torch.long, device=self.device)
+        # Running sums of the two estimators Eq. (2) mixes, kept on-device for
+        # the same reason as _lookup_near.  Their difference in means is the
+        # systematic advantage a *tried* action holds over an untried one.
+        self._exact_value_sum = torch.zeros((), dtype=torch.float64, device=self.device)
+        self._knn_value_sum = torch.zeros((), dtype=torch.float64, device=self.device)
+        self._knn_count = torch.zeros((), dtype=torch.long, device=self.device)
+
+    def value_stats(self) -> tuple[float, int, float, int]:
+        """``(exact_sum, exact_n, knn_sum, knn_n)`` over the estimates returned.
+
+        Lets a caller report ``mean(exact) - mean(kNN)``: the gap between the
+        two branches of Eq. (2).  It is not a bug that the gap is positive —
+        the exact branch is a max over realised returns and the kNN branch a
+        mean over neighbours — but its *size* bounds how readily the policy
+        will ever choose an action it has not already taken from a state, so a
+        large gap means the memory is a trajectory replay rather than a value
+        function.  See the module docstring for measured numbers.
+        """
+        return (
+            float(self._exact_value_sum),
+            self._lookup_exact,
+            float(self._knn_value_sum),
+            int(self._knn_count),
+        )
 
     def lookup_stats(self) -> tuple[int, int, int]:
         """``(queries, exact_hits, near_exact_hits)`` since the last reset.
@@ -1052,7 +1160,9 @@ class QEC:
             if hit_b:
                 hit_b_t = torch.tensor(hit_b,    dtype=torch.long, device=self.device)
                 hit_s_t = torch.tensor(hit_slots, dtype=torch.long, device=self.device)
-                result[a, hit_b_t] = self.values[a, hit_s_t].float()
+                exact_hit_vals = self.values[a, hit_s_t]
+                result[a, hit_b_t] = exact_hit_vals.float()
+                self._exact_value_sum += exact_hit_vals.sum()
 
             if not miss_b:
                 continue   # all queries hit — no kNN needed for this action
@@ -1103,6 +1213,13 @@ class QEC:
             knn_avg    = knn_vals.mean(dim=-1)
             exact_vals = self.values[a, idx[:, 0]].float()
             result[a, miss_b_t] = torch.where(near_exact, exact_vals, knn_avg)
+
+            # Only the queries actually answered by a mean count towards the
+            # kNN side of the gap; a near-exact rescue is an Eq. 2 case-1
+            # answer wearing a kNN's clothes.
+            knn_only = ~near_exact
+            self._knn_value_sum += knn_avg.double()[knn_only].sum()
+            self._knn_count += knn_only.sum()
 
         return result.T.to(dev_q)   # (B, A)
 

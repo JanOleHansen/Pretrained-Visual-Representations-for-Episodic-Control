@@ -113,7 +113,7 @@ The `BaseAlgorithm` API is small:
 | `get_policy()`            | Greedy policy used by `trainer.evaluate()`.                       |
 | `get_explore_policy()`    | Exploration policy used by the data collector.                    |
 | `get_collector_config()`  | Tells the trainer how to size the `Collector`.                    |
-| `reset_eval_metrics()` / `eval_metrics()` | *Optional* (default no-op / `{}`). Called by `evaluate()` around the rollout; whatever `eval_metrics()` returns is merged into the `eval/*` dict. MFEC reports its episodic-memory hit rate here. |
+| `reset_eval_metrics()` / `eval_metrics()` | *Optional* (default no-op / `{}`). Called by `evaluate()` around the rollout; whatever `eval_metrics()` returns is merged into the `eval/*` dict. MFEC reports its episodic-memory hit rate here; NEC reports `eval/epsilon` and the shape of its DND kernel (see below). |
 
 `step()` is intentionally unconstrained — the algorithm decides what to do with the
 batch. For DQN that means: anneal epsilon, store, skip during warm-up, otherwise
@@ -454,15 +454,26 @@ the DQN-style env configs and have **not** been given the same treatment; they
 pick up the corrected `gamma`/`eps` defaults from `mfec_atari.yaml` but still
 clip rewards, stack 4 frames and run with sticky actions.
 
-**Evaluation keeps ε = 0.005 (`algorithm.eval_eps`).** MFEC needs
-`repeat_action_probability=0.0`, which makes ALE deterministic — so a
-pure-argmax eval policy replays the *same* episode every time, `eval/return_std`
-is identically 0, and `num_eval_episodes` buys one sample at N times the cost.
-It also measures a different (and worse) policy than the one being trained,
-because QEC values are optimistic. Blundell et al. §4.1 report the ε = 0.005
-policy's score, so that is what `get_policy()` runs. Set `algorithm.eval_eps=0.0`
-for a deterministic eval. If you ever see `eval/return_min == eval/return_mean ==
-eval/return_max` with `return_std` pinned at 0, this is what happened.
+**Evaluation is greedy: `algorithm.eval_eps: 0.0`, `trainer.num_eval_episodes: 1`.**
+This reverses an earlier default of ε = 0.005 (Blundell et al. §4.1), which was
+there so that `num_eval_episodes` produced more than one distinct sample — MFEC
+needs `repeat_action_probability=0.0`, so ALE is deterministic and a greedy
+rollout repeats itself. Measured cost of doing it that way, against one QEC
+(Ms. Pac-Man, 6 episodes each):
+
+| `eval_eps` | returns | mean | min |
+|---|---|---|---|
+| **0.000** | `[1440, 1440, 1440, 1440, 1440, 1440]` | **1440** | 1440 |
+| 0.005 | `[490, 1440, 870, 550, 1440, 1440]` | 1038 | 490 |
+
+A 1000-decision episode takes ~5 forced random actions at ε = 0.005 and MFEC
+cannot absorb even one, so ε at evaluation understates the policy by ~30 %,
+leaves `eval/return_max` as the only honest statistic, and pins
+`eval/return_min` near the floor **permanently** — it becomes the worst of N
+ε-derailments rather than anything about the memory. Nothing is lost by
+evaluating greedily: the ε = 0.005 score the paper reports is the *collector's*,
+already logged as `train/episode_reward`. `eval/return_std == 0` is therefore
+now expected, not a symptom. See `AGENTS.md` for the full argument.
 
 **Evaluation preprocesses observations on the training env's device.** With
 `trainer.num_envs > 1` the training envs live in `ParallelEnv` workers, which
@@ -491,9 +502,24 @@ apart from an episode that ends early. Note the eval rate counts every
 *(state, action)* pair queried while `train/exact_hit_rate` counts only the
 action actually taken, so the two differ by roughly `|A|`.
 
+**`eval/exact_minus_knn_value` measures how locked-in the policy is.** Eq. (2)
+answers a query with a stored value on an exact match (a max over realised
+returns) and a k-neighbour mean otherwise, then `argmax` compares the two. They
+are not on the same scale: measured on Ms. Pac-Man over 957 held-out `(s, a)`
+pairs, the exact branch is biased **+60** against the true return-to-go
+(corr 1.00) while the kNN branch is biased **−411** (corr 0.63) — a **+540** gap
+for the *same* `(s, a)`. An action the agent has already taken therefore beats
+one it has not on estimator bias alone, and the policy picks an exact-hit action
+**99.8 %** of the time although only ~1.8 of 9 actions carry one. That is Eq. (2)
+as the paper writes it and has not been changed, but it is why MFEC cannot
+recover from an off-trajectory action. The metric is the natural dependent
+variable for the encoder ablation: a better representation should shrink it.
+
 **Optimistic initialisation is tie-broken randomly.** The QEC reports `+inf`
-for any action with `<= k` stored entries so untried actions are always
-preferred. `QECPolicy.forward` turns those into a large finite value *plus
+for any action **whose whole buffer** holds `<= k` entries — a warm-up device
+that stops firing inside the first episode, *not* per-`(state, action)`
+optimism, and no help against the gap above.
+`QECPolicy.forward` turns those into a large finite value *plus
 independent random jitter*, because argmax breaks exact ties by lowest index:
 with one shared constant the agent played a single fixed action for whole
 episodes (action 0 for 499/500 states on an empty QEC, then action 1 once
@@ -630,6 +656,30 @@ a `freeze_backbone: bool = False` toggle. Composition, construction, forward
 shape and the freeze flag are tested against a stub backbone (no downloads);
 real weight loading, the preprocessing choices, and whether NEC learns with
 it are **untested**. No training run has used it.
+
+## Reading a NEC run
+
+When `eval/return_mean` disagrees with `train/episode_reward`, check these
+before touching a hyperparameter. NEC has no exact-match shortcut on its read
+path (unlike MFEC), so it reports the *shape* of the DND kernel instead of a
+hit rate.
+
+| Metric | What a bad value means |
+|---|---|
+| `eval/epsilon` | Compare with `train/epsilon`. `eval_eps` (in `nec_atari.yaml`) and `eps_end` (per-experiment) are independent knobs, so a run can train one policy and score another. `setup()` warns when they differ by more than 10x. |
+| `eval/dnd_top_weight` | Share of kernel mass on the nearest neighbour. At `1/k` (0.02 at k=50) the kernel is a flat mean over all `k` neighbours — every action of a state scores alike and the argmax is noise, however full the tables are. |
+| `eval/dnd_nn_dist` | Mean L2 to the nearest stored key. Embeddings are unit-norm so this is bounded by 2; drifting upward means stored keys go stale faster than `dnd_key_lr` refreshes them. |
+| `eval/dnd_optimistic_rate` | Fraction of *(state, action)* pairs still answered with the `+inf` sentinel. Above 0 late in a run means a starved action is capturing the argmax. |
+| `train/dnd_blend_rate` | **Not** expected near 0 on Atari. Duplicate frames (the opening freeze, the pause after each death) are 17.6 % of a Ms. Pac-Man rollout, and they blend legitimately. 0.1–0.5 is normal here. |
+| `train/updates` | Should equal `num_updates` (400 for action-repeat-4 Atari: one update per 16 raw frames, per paper §4). A lower flat line means the run was launched with an override and is under-trained per frame. |
+
+A gap where `eval/return_mean` is well below `train/episode_reward` **at the
+same `eval/episode_length`** is a scoring-rate gap, not a survival gap, and
+points at the policy being evaluated rather than at the environment. The two
+Ms. Pac-Man env configs and `BaseTrainer.evaluate`'s rollout loop are verified
+byte-identical to a plain `env.rollout`, and `NoopResetEnv` alone produces
+exactly zero return variance on this game — so non-zero `eval/return_std` is
+proof that evaluation ran with a real ε.
 
 ## Adding a new algorithm
 

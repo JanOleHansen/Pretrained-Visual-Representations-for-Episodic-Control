@@ -119,10 +119,24 @@ One further caveat, caught in review:
    successive ``step()`` calls, so a state re-encountered in a later batch
    essentially never re-hashes to its stored key. Blends therefore only
    happen between duplicate frames embedded within one ``step()`` call, and
-   the DND behaves close to an insert-only FIFO log. ``train/dnd_blend_rate``
-   measures this directly — expect it near 0. Making the blend rule fire
-   would mean matching within a radius rather than exactly, which is a
-   design change, not a bug fix, and is deliberately NOT done here.
+   the DND behaves close to an insert-only FIFO log. Making the blend rule
+   fire across batches would mean matching within a radius rather than
+   exactly, which is a design change, not a bug fix, and is deliberately NOT
+   done here.
+
+   ``train/dnd_blend_rate`` measures the residual. An earlier version of this
+   note said "expect it near 0"; that is **wrong for Ms. Pac-Man** and reading
+   a healthy run as broken is the cost. Atari has long stretches of
+   bit-identical frames — the opening "ready" freeze and the pause after each
+   death — and those duplicate observations produce duplicate embeddings
+   *within* the same ``step()`` call, which is exactly the case the rule does
+   fire on. Measured on a 1500-step Ms. Pac-Man rollout: 264/1500 = 17.6% of
+   observations are byte-identical to an earlier frame, and the quantised
+   embeddings collapse at precisely the same rate (1236 distinct keys for 1236
+   distinct frames — no additional collapse from the encoder). A blend rate of
+   0.1-0.5 on this game is therefore the expected reading, not evidence of an
+   embedding that has stopped discriminating. Watch ``eval/dnd_top_weight``
+   for that instead (see ``NECAlgorithm.eval_metrics``).
 
 Where the paper's hyperparameters actually come from
 ----------------------------------------------------
@@ -139,6 +153,7 @@ for those four.
 
 from __future__ import annotations
 
+import warnings
 from typing import Callable
 
 import numpy as np
@@ -275,6 +290,77 @@ class DND:
         # hash is therefore stale; drained by flush_moved_slots().
         self._moved_slots: list[list[torch.Tensor]] = [[] for _ in range(num_actions)]
 
+        self.reset_lookup_stats()
+
+    # ------------------------------------------------------------------
+    # Read-path instrumentation
+    # ------------------------------------------------------------------
+
+    def reset_lookup_stats(self) -> None:
+        """Zero the counters :meth:`lookup_stats` reports and start recording.
+
+        Accumulation is **off by default** and only switched on here, because
+        ``estimate_all`` is the ε-greedy hot path — one call per env step per
+        collector batch.  ``NECAlgorithm.reset_eval_metrics`` turns it on for
+        the duration of an evaluation rollout and ``eval_metrics`` turns it
+        back off.
+
+        The running sums stay device tensors and are converted exactly once,
+        in :meth:`lookup_stats`.  Reading them back per call would put a forced
+        GPU sync on the policy's hot path — the same reason
+        ``QEC.reset_lookup_stats`` in mfec.py keeps its near-exact tally on
+        device.
+        """
+        self._record_lookups = False
+        self._lookup_queries = 0
+        self._lookup_optimistic = 0
+        self._lookup_nn_dist = torch.zeros((), dtype=torch.float64, device=self.device)
+        self._lookup_top_weight = torch.zeros((), dtype=torch.float64, device=self.device)
+
+    def lookup_stats(self) -> dict[str, float]:
+        """Kernel-lookup diagnostics since the last :meth:`reset_lookup_stats`.
+
+        One "query" is one *(state, action)* pair asked of
+        :meth:`estimate_all`, i.e. ``|A|`` per frame the policy sees — every
+        candidate action, not only the one taken.  Same denominator as
+        ``MFECAlgorithm.eval_metrics``, and deliberately not the same as any
+        ``train/*`` counter.
+
+        Returns
+        -------
+        ``{}`` when nothing was recorded, otherwise
+
+        ``queries``
+            total (state, action) pairs looked up.
+        ``optimistic_rate``
+            fraction answered with the ``+inf`` sentinel (action's table still
+            at/below ``k``).  Above ~0 late in a run means some action is
+            still starved and ``argmax`` is chasing the sentinel.
+        ``nn_dist``
+            mean L2 distance from the query embedding to its *nearest* stored
+            key, over non-sentinel queries.  Every embedding is unit-norm, so
+            this lives in ``[0, 2]``; a value that drifts up over training is
+            the memory going stale relative to the CNN.
+        ``top_weight``
+            mean share of the kernel mass carried by that nearest neighbour,
+            i.e. ``max_i w_i / Σ_i w_i``.  This is the number that separates
+            "the memory holds a bad policy" from "the memory is not being used
+            at all": at ``1/k`` = 0.02 the kernel is a flat average over all
+            ``k`` neighbours, every action of a state scores alike, and the
+            argmax is noise however full the tables are.
+        """
+        if not self._lookup_queries:
+            return {}
+        graded = self._lookup_queries - self._lookup_optimistic
+        out = {
+            "queries":         float(self._lookup_queries),
+            "optimistic_rate": self._lookup_optimistic / self._lookup_queries,
+        }
+        if graded > 0:
+            out["nn_dist"]    = float(self._lookup_nn_dist) / graded
+            out["top_weight"] = float(self._lookup_top_weight) / graded
+        return out
+
     # ------------------------------------------------------------------
     # Key generation (identical to QEC._make_keys)
     # ------------------------------------------------------------------
@@ -348,6 +434,11 @@ class DND:
         # (QEC gets this early-out per action via `continue`; the batched
         # kNN here can only take it for the whole table at once.)
         if self.keys is None or max_size <= self.k:
+            # Counted, not skipped: "every query was a sentinel" is exactly
+            # what optimistic_rate exists to report.
+            if self._record_lookups:
+                self._lookup_queries    += B * A
+                self._lookup_optimistic += B * A
             return torch.full((B, A), float("inf"), dtype=torch.float32, device=dev_q)
 
         if queries.device != self.device:
@@ -368,6 +459,19 @@ class DND:
         result = torch.where(
             sparse_mask, torch.full_like(knn_q, float("inf")), knn_q
         )
+
+        if self._record_lookups:
+            # `dists` comes from a `largest=False` top-k, so column 0 is the
+            # nearest neighbour and carries the largest kernel weight.  Both
+            # sums stay on device (see reset_lookup_stats).
+            graded = (~sparse_mask).expand(A, B)
+            n_graded = int(graded.sum())
+            self._lookup_queries    += A * B
+            self._lookup_optimistic += A * B - n_graded
+            if n_graded:
+                share = weights[..., 0] / weights.sum(-1)          # (A, B)
+                self._lookup_nn_dist    += dists[..., 0][graded].double().sum()
+                self._lookup_top_weight += share[graded].double().sum()
 
         return result.T.to(dev_q)  # (B, A)
 
@@ -853,6 +957,11 @@ class DND:
         # Rebuilt empty: the dicts below are regenerated from the restored
         # keys, so nothing is pending delisting at load time.
         self._moved_slots = [[] for _ in range(self.num_actions)]
+        # __setstate__ bypasses __init__, so the read-path counters (and the
+        # `_record_lookups` flag estimate_all branches on) have to be created
+        # here too or the first lookup after a resume raises AttributeError.
+        # They are per-rollout diagnostics and deliberately not checkpointed.
+        self.reset_lookup_stats()
 
         if d["action_keys"] is None:
             self.keys = None
@@ -1235,6 +1344,30 @@ class NECAlgorithm(BaseAlgorithm):
             device=buf_dev,
         )
         self._policy = _SharedPolicy(self.q_actor, self.eval_greedy_module)
+
+        # `eval_eps` and `eps_end` are independent knobs that nothing couples,
+        # and they live in different config files (nec_atari.yaml vs the
+        # per-experiment override), so they can silently drift apart across a
+        # pair of commits.  When they do, the run trains one policy and scores
+        # a different one: eval/return_mean comes in well below
+        # train/episode_reward at the SAME episode length, and eval/return_min
+        # sticks at random-play level, while every learning curve looks
+        # healthy.  Nothing else in the logs makes that recoverable, hence a
+        # warning at setup and `eval/epsilon` in eval_metrics().
+        #
+        # An order of magnitude is the threshold because the intended gap is
+        # small: eval ε is meant to sit at or slightly above the training
+        # floor purely to decorrelate episodes on a deterministic ALE.
+        if self.eval_eps > 10 * self.eps_end or self.eps_end > 10 * self.eval_eps:
+            warnings.warn(
+                f"NEC exploration mismatch: training anneals to eps_end="
+                f"{self.eps_end:g} but evaluation runs at eval_eps="
+                f"{self.eval_eps:g}. eval/* metrics then describe a different "
+                f"policy than train/* and are not comparable to each other or "
+                f"to published scores.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         # 4. Replay buffer — stores (obs, action, n_step_return)
         self.replay_buffer = self._make_replay_buffer()
@@ -1769,6 +1902,60 @@ class NECAlgorithm(BaseAlgorithm):
             init_random_frames=self.init_random_frames,
             max_frames_per_traj=self.max_frames_per_traj,
         )
+
+    # ------------------------------------------------------------------
+    # Evaluation diagnostics
+    # ------------------------------------------------------------------
+
+    def reset_eval_metrics(self) -> None:
+        self.dnd.reset_lookup_stats()
+        self.dnd._record_lookups = True
+
+    def eval_metrics(self) -> dict[str, float]:
+        """What the DND actually did during the evaluation rollout.
+
+        ``eval/return_mean`` on its own cannot distinguish the three ways NEC
+        evaluates badly, and they need opposite fixes:
+
+        1. **The memory holds a bad policy.** Returns are low, the kernel is
+           peaked, the neighbours are close. Train longer / tune the DND.
+        2. **The memory is not being used.** ``dnd_top_weight`` sits near
+           ``1/k`` (0.02 at the paper's k=50), so Q is a flat mean over 50
+           stored values, every action of a state scores alike, and the argmax
+           is noise. Returns then look like a bad policy but the policy is not
+           the problem.
+        3. **The evaluation policy is not the policy that was trained.** This
+           is why ``eval/epsilon`` is reported here, right next to the
+           returns. ``eval_eps`` and the annealed training floor ``eps_end``
+           are two independent knobs that nothing couples, and a run whose
+           eval ε is an order of magnitude above its training ε posts a
+           depressed ``eval/return_mean`` and a ``eval/return_min`` pinned at
+           random-play level while ``train/episode_reward`` climbs normally.
+           There is no other logged quantity from which that is recoverable
+           after the fact.
+
+        ``eval/dnd_nn_dist`` supports (2): embeddings are unit-norm, so a
+        nearest-neighbour distance that drifts upward over training means the
+        stored keys are going stale relative to the CNN faster than
+        ``dnd_key_lr`` refreshes the ones the kNN happens to touch.
+
+        Returns ``{}`` when the rollout recorded no lookups, matching
+        ``MFECAlgorithm.eval_metrics`` — an absent metric leaves a gap in the
+        chart rather than a fabricated zero.
+        """
+        stats = self.dnd.lookup_stats()
+        self.dnd._record_lookups = False
+        if not stats:
+            return {}
+
+        metrics = {
+            "eval/epsilon":             float(self.eval_greedy_module.eps),
+            "eval/dnd_optimistic_rate": stats["optimistic_rate"],
+        }
+        if "nn_dist" in stats:
+            metrics["eval/dnd_nn_dist"]    = stats["nn_dist"]
+            metrics["eval/dnd_top_weight"] = stats["top_weight"]
+        return metrics
 
     # ------------------------------------------------------------------
     # Checkpointing
