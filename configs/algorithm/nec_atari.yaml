@@ -39,7 +39,19 @@ obs_key: pixels
 # DND parameters
 embedding_dim: 64        # (swept, unreported) — §4 lists "dimensionality of
                          # the embeddings" among the swept hyperparameters
-dnd_capacity: 500_000    # (paper §4) "store up to 5 × 10^5 memories per action"
+# (paper §4) "store up to 5 × 10^5 memories per action" — but that number is
+# sized for the paper's 40M-frame runs, and capacity only does anything once a
+# table is FULL. Measured insert rate on Ms. Pac-Man: train/dnd_size reaches
+# 25,000 per action at 270k agent steps, i.e. ~0.093 entries/action/step, so a
+# 1M-agent-step run ends at ~93k per action — 5e5 never fills, nothing is ever
+# evicted, and the DND keeps keys written by the randomly-initialised encoder
+# next to keys from the current one. The paper's own ratio is ~1.85 turnovers
+# (10M agent steps -> ~930k inserts/action against 5e5), and 50k reproduces that
+# at 1M steps. It also bounds the exact-kNN cost, which is linear in table size
+# and is the dominant throughput term (see AGENTS.md 5b).
+#
+# Raise it for longer runs: capacity ~= 0.093 * total_frames / 1.85.
+dnd_capacity: 50_000
 k: 50                    # (paper §4) "we set the number of nearest neighbours
                          # p = 50 in all our experiments"
 # (paper §4, Eq. 5) "we set δ = 10^-3". δ is a SQUARED DISTANCE, so it is only
@@ -64,25 +76,41 @@ n_step: 100              # (paper §4) "for the N-step Q estimates we picked a
 
 # Optimisation
 # RMSProp per paper §4 ("we used the RMSProp algorithm"); §4 publishes no
-# numbers. These are torch's defaults and are what the only run that reached
-# ~3000 on Ms. Pac-Man used. The reference implementation uses the DeepMind trio
-# RMSPropOptimizer(1e-5, decay=0.9, epsilon=0.01) — measured to cut embedding
-# drift per batch from 8.7x to 3.1x the inter-state distance, but not shown to
-# improve the score. To try it:
-#   algorithm.lr=1e-5 algorithm.rmsprop_alpha=0.9 algorithm.rmsprop_eps=0.01
-lr: 1.0e-4
-rmsprop_alpha: 0.99
-rmsprop_eps: 1.0e-8
+# numbers, so these are the DeepMind trio the reference implementation uses:
+# RMSPropOptimizer(1e-5, decay=0.9, epsilon=0.01).
+#
+# THESE FOUR VALUES MOVE TOGETHER (lr, alpha, eps, max_grad_norm) — see below.
+#
+# They replace torch's defaults (1e-4 / 0.99 / 1e-8 + clip 10), under which the
+# DND was not usable as a memory. Measured encoder drift per collector batch,
+# in units of the mean distance between distinct states:
+#
+#     num_updates    old (1e-4/.99/1e-8/clip10)    this (1e-5/.90/.01)
+#        25                  4.95x                       1.13x
+#       100                  4.97x                       1.66x
+#       400                  4.92x                       1.07x
+#
+# ~5x the inter-state distance exceeds the diameter of the unit sphere the
+# embeddings live on, so keys written one batch pointed nowhere by the next.
+# That is what drove eval/dnd_top_weight toward 1/k, collapsed
+# train/dnd_blend_rate, and made train/q_loss rise rather than converge.
+# Note the old drift is FLAT in num_updates (it saturates within ~25 updates),
+# so lowering num_updates does not address it — only these settings do.
+lr: 1.0e-5
+rmsprop_alpha: 0.9
+rmsprop_eps: 0.01
 gamma: 0.99              # (paper §4) "all algorithms were trained using
                          # discount rate γ = 0.99"
 batch_size: 32           # (paper §4) "with a minibatch of size 32"
-# Neither the paper nor the reference clips, and measured, this binds on 100% of
-# updates (median raw grad norm ~1.7e3 vs the threshold of 10) — so it is the
-# de-facto step-size control, not a safety net. Kept because it is load-bearing
-# with torch's RMSProp eps=1e-8, which barely damps anything: removing both at
-# once diverges (q_loss 1.5e3 -> 1.9e4 in three batches). Drop it only together
-# with rmsprop_eps=0.01. Use null to disable.
-max_grad_norm: 10.0
+# Gradient clipping, DISABLED — neither the paper nor the reference clips.
+# At the previous threshold of 10 it bound on 100% of updates (median raw grad
+# norm ~1.7e3), making it the de-facto step size: every step became the same
+# magnitude regardless of gradient, which with rmsprop_eps=1e-8 moved every
+# parameter by ~lr every update. That is the mechanism behind the saturating
+# 4.9x drift above. It was only load-bearing because eps=1e-8 damps nothing
+# (removing both at once diverges: q_loss 1.5e3 -> 1.9e4 in three batches);
+# eps=0.01 damps the step on its own. Re-enable only with a matching eps.
+max_grad_norm: null
 
 # Exploration — (swept, unreported); §4 lists the "ε-greedy exploration-rate"
 # among the swept values.

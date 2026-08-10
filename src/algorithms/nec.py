@@ -475,18 +475,44 @@ class DND:
 
         return result.T.to(dev_q)  # (B, A)
 
-    def _pairwise(self, q: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
-        """Batched (A, b, n) L2 distances between ``q`` (A, b, d) and ``keys``.
+    def _block_topk(
+        self,
+        q:     torch.Tensor,   # (A, b, d)
+        keys:  torch.Tensor,   # (A, n, d)
+        valid: torch.Tensor,   # (A, 1, n) or (A, b, n) bool — live slots
+        k:     int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Top-k nearest *live* keys per query, as ``(dists, indices)``.
 
-        Same unit-norm identity as :func:`_topk_l2_unit`, but this path keeps
-        the full distance matrix because ``knn_all_actions`` has to mask dead
-        slots to +inf before the top-k.  ``baddbmm`` computes ``2 - 2 q·k`` in
-        one fused call.
+        Same unit-norm identity as :func:`_topk_l2_unit`, applied to the
+        batched-across-actions layout ``knn_all_actions`` needs.
+
+        The ranking is done on the **similarity** matrix and ``2 − 2·sim`` is
+        evaluated only for the ``k`` winners.  ``‖q−k‖² = 2 − 2·q·k`` is
+        monotone decreasing in ``q·k``, so this selects exactly the same
+        neighbours in exactly the same order as ranking on distance — it is a
+        reassociation, not an approximation.
+
+        It matters because the ``(A, b, n)`` matrix is by far the largest
+        allocation on this path (266 MB at A=9, b=74, n=1e5), and the previous
+        version walked it **four extra times**: ``2 - 2*sim`` into a fresh
+        tensor, then ``clamp_min_``, then ``sqrt_``, then ``masked_fill`` into
+        yet another 266 MB tensor.  Ranking on ``sim`` costs one in-place mask
+        instead, and the transcendental ``sqrt`` runs over ``(A, b, k)``
+        rather than ``(A, b, n)`` — a factor of ``n/k`` = 2000 fewer elements.
+
+        Padding slots are masked to ``-inf`` similarity, which maps to ``+inf``
+        distance, exactly reproducing the ``masked_fill(+inf)`` it replaces.
         """
         if not self.unit_norm_keys:
-            return torch.cdist(q, keys)
+            cd = torch.cdist(q, keys).masked_fill_(~valid, float("inf"))
+            return cd.topk(k, dim=-1, largest=False)
+
         sim = torch.bmm(q, keys.transpose(1, 2))
-        return (2.0 - 2.0 * sim).clamp_min_(0.0).sqrt_()
+        sim.masked_fill_(~valid, float("-inf"))
+        top_sim, idx = sim.topk(k, dim=-1, largest=True)
+        dist = (2.0 - 2.0 * top_sim).clamp_min_(0.0).sqrt_()
+        return dist, idx
 
     # ------------------------------------------------------------------
     # kNN across ALL actions for a shared query set (batched)
@@ -584,19 +610,18 @@ class DND:
 
             if k_chunk >= max_size:
                 # Common path: whole table in one shot, no merge.
-                cd = self._pairwise(q_exp, self.keys[:, :max_size, :])
-                cd = cd.masked_fill(~valid, float("inf"))
-                bd, bi = cd.topk(k_eff, dim=-1, largest=False)
+                bd, bi = self._block_topk(
+                    q_exp, self.keys[:, :max_size, :], valid, k_eff
+                )
             else:
                 bd = torch.full((A, b, k_eff), float("inf"), device=self.device)
                 bi = torch.zeros((A, b, k_eff), dtype=torch.long, device=self.device)
                 for cs in range(0, max_size, k_chunk):
                     ce = min(cs + k_chunk, max_size)
-                    cd = self._pairwise(q_exp, self.keys[:, cs:ce, :])
-                    cd = cd.masked_fill(~valid[..., cs:ce], float("inf"))
-
                     ck = min(k_eff, ce - cs)
-                    chd, chi = cd.topk(ck, dim=-1, largest=False)
+                    chd, chi = self._block_topk(
+                        q_exp, self.keys[:, cs:ce, :], valid[..., cs:ce], ck
+                    )
                     chi = chi + cs
 
                     merged_d = torch.cat([bd, chd], dim=-1)
@@ -843,7 +868,7 @@ class DND:
                 novel_rows.append(i)
                 novel_vals.append(vals[i])
 
-        # --- Blend existing entries (paper §2.3 tabular Q-learning update) --
+        # --- Blend existing entries (paper §3.3, Eq. 4) ---------------------
         if slot_updates:
             slots_t = torch.tensor(list(slot_updates.keys()),
                                    dtype=torch.long, device=self.device)
@@ -1032,7 +1057,8 @@ class DNDPolicy(nn.Module):
         leading   = obs.shape[:-3]                             # dims before (C,H,W)
         obs_flat  = obs.reshape(-1, *obs.shape[-3:]).float()   # (B, C, H, W)
         h         = self.embedding_net(obs_flat)               # (B, d)
-        h         = nn.functional.normalize(h, dim=-1)        # unit-norm per paper §2
+        # Unit-norm: a REPO DEVIATION, not the paper. See _embed().
+        h         = nn.functional.normalize(h, dim=-1)
         q_values  = self.dnd.estimate_all(h)                   # (B, A)
         q_values  = torch.where(
             torch.isinf(q_values),
@@ -1215,37 +1241,60 @@ class NECAlgorithm(BaseAlgorithm):
         # --- N-step return -------------------------------------------------
         n_step: int = 100,
         # --- Optimisation --------------------------------------------------
-        # RMSProp (paper §4: "we used the RMSProp algorithm"; no numbers given).
-        # These defaults are torch's, and are what the only run that reached
-        # ~3000 on Ms. Pac-Man actually used.  The reference implementation
-        # (github.com/EndingCredits/Neural-Episodic-Control) instead uses the
-        # DeepMind trio `RMSPropOptimizer(1e-5, decay=0.9, epsilon=0.01)`, i.e.
-        # alpha=0.9 and a stabiliser 1e6x larger.  That measurably reduces how
-        # far the embedding drifts per 400-update batch relative to how far
-        # apart distinct states are (8.7x -> 3.1x), which matters because a DND
-        # key is written once and read for thousands of batches — but it has
-        # NOT been shown to improve the score end-to-end, so it is exposed as a
-        # knob rather than made the default:
-        #     algorithm.lr=1e-5 algorithm.rmsprop_alpha=0.9 algorithm.rmsprop_eps=0.01
-        lr:            float = 1e-4,
-        rmsprop_alpha: float = 0.99,
-        rmsprop_eps:   float = 1e-8,
+        # RMSProp (paper §4: "we used the RMSProp algorithm"; no numbers given),
+        # with the DeepMind trio the reference implementation uses:
+        # `RMSPropOptimizer(1e-5, decay=0.9, epsilon=0.01)`
+        # (github.com/EndingCredits/Neural-Episodic-Control, NECAgent.py).
+        #
+        # These four values (lr, alpha, eps, max_grad_norm=None) move TOGETHER
+        # and must not be changed one at a time — see max_grad_norm below.
+        #
+        # They replace torch's defaults (1e-4 / 0.99 / 1e-8 + clip 10), which
+        # made the DND unusable as a memory. NEC's premise (§6) is that "keys
+        # stored in the DND remain relatively stable"; measured on this repo's
+        # encoder, they were not. Encoder drift per collector batch, in units
+        # of the mean distance between distinct states:
+        #
+        #     num_updates      old (1e-4/.99/1e-8/clip10)   this (1e-5/.90/.01)
+        #        25                    4.95x                      1.13x
+        #       100                    4.97x                      1.66x
+        #       400                    4.92x                      1.07x
+        #
+        # Two things to read off that table. First, ~5x the inter-state
+        # distance exceeds the diameter of the unit sphere the embeddings live
+        # on (two random 64-d unit vectors sit at 1.41; mean inter-state
+        # distance here is ~0.28), so a key written last batch pointed
+        # essentially nowhere by the next one — the kNN retrieved neighbours
+        # whose stored returns belonged to unrelated states. That is what made
+        # `eval/dnd_top_weight` decay toward 1/k (a flat average over all k
+        # neighbours), `train/dnd_blend_rate` collapse, and `train/q_loss`
+        # rise instead of converge.
+        #
+        # Second, the old drift is FLAT in num_updates — it saturates within
+        # ~25 updates — so lowering num_updates does not fix it and never did.
+        # Only these settings do.
+        lr:            float = 1e-5,
+        rmsprop_alpha: float = 0.9,
+        rmsprop_eps:   float = 0.01,
         gamma:         float = 0.99,
         batch_size:    int   = 32,
-        # Gradient clipping. Neither the paper nor the reference implementation
-        # clips, and measurement shows this bound on **100% of updates** here
-        # (median raw grad norm ~1.7e3 against a threshold of 10), which makes
-        # it the de-facto step-size control rather than a rare safety net.
+        # Gradient clipping, DISABLED — neither the paper nor the reference
+        # clips.
         #
-        # It is kept anyway, because it is load-bearing in THIS configuration:
-        # torch's RMSProp eps=1e-8 barely damps anything, so clipping is the
-        # only thing bounding the step. Removing it while keeping eps=1e-8
-        # removes both stabilisers at once and the loss diverges (measured:
-        # train/q_loss 1.5e3 -> 1.9e4 within three batches). Dropping the clip
-        # only makes sense together with the reference's eps=0.01, which damps
-        # the step on its own — that pairing is the experiment named on `lr`.
-        # `None` disables clipping.
-        max_grad_norm: float | None = 10.0,
+        # It cannot be re-enabled on its own. At the previous threshold of 10
+        # it bound on **100% of updates** (median raw grad norm ~1.7e3), which
+        # made it the de-facto step size rather than a safety net: every step
+        # became the same magnitude regardless of the gradient, so RMSProp with
+        # eps=1e-8 moved every parameter by ~lr on every update. That is the
+        # mechanism behind the saturating 4.9x drift above.
+        #
+        # Clipping was load-bearing only because eps=1e-8 damps nothing:
+        # removing the clip while keeping eps=1e-8 removes both stabilisers at
+        # once and the loss diverges (measured: train/q_loss 1.5e3 -> 1.9e4 in
+        # three batches). The reference's eps=0.01 damps the step on its own,
+        # which is why the two changes ship together. Set a float to re-enable,
+        # but only alongside a re-examination of rmsprop_eps.
+        max_grad_norm: float | None = None,
         # --- Exploration ---------------------------------------------------
         eps_start:        float = 1.0,
         eps_end:          float = 0.01,
@@ -1442,9 +1491,29 @@ class NECAlgorithm(BaseAlgorithm):
         """Embed ``(N, *obs_shape)`` observations, L2-normalised, in chunks.
 
         Every DND read and write goes through here, so the unit-norm
-        projection lives in exactly one place (``tests/test_nec_kernel_scale.py``
-        explains why it must never be skipped: without it the inverse-distance
-        kernel is dominated by ``kernel_delta`` and collapses).
+        projection lives in exactly one place.
+
+        The L2 normalisation is a **deviation from the paper and from the
+        reference implementation** — neither normalises, and the paper never
+        mentions it (§3.1/§3.2 describe ``h`` as a plain CNN output; earlier
+        revisions of this file miscited "paper §2" for it, which says nothing
+        of the kind).  It is kept on measured grounds, not textual ones:
+        ``NatureEmbedding``'s unconstrained ``nn.Linear`` head emits vectors of
+        norm ~0.16 at init, which puts the mean squared distance to the k=50
+        neighbours at ~6.5e-4 — i.e. ``kernel_delta`` = 1e-3 is **155% of it**
+        and dominates the denominator, flattening w_i to a uniform average.
+        Measured share of kernel mass held by the nearest neighbour:
+
+            raw (paper/reference geometry)   0.032   <- vs 1/k = 0.020, flat
+            L2-normalised (this repo)        0.353
+
+        So on this encoder, normalising is what makes the kernel discriminate
+        at all.  ``tests/test_nec_kernel_scale.py`` guards the property and
+        records the Pong run that stayed pinned at -21 without it.
+
+        The honest alternative would be to fix the embedding *scale* instead
+        (a larger head init, or ``kernel_delta`` calibrated to the observed
+        distance distribution), which is what the paper's numbers assume.
 
         Chunked because a completed episode arrives in a single call and can
         be as long as ``StepCounter``'s ``max_steps`` — 4500 on the Atari
@@ -1550,7 +1619,18 @@ class NECAlgorithm(BaseAlgorithm):
             raise ValueError(f"Unexpected batch shape: {bs}")
         n = E * T
 
-        self.greedy_module.step(n)
+        # Anneal epsilon.  NOT `self.greedy_module.step(n)`: torchrl's
+        # EGreedyModule.step loops `frames` times in Python, one tensor op per
+        # iteration, so annealing a 1600-frame batch costs 1600 GPU ops (~36 ms
+        # per batch, ~23 s per 1M frames) to compute a closed-form linear ramp.
+        # Each iteration does eps <- max(eps_end, eps - delta) with delta > 0
+        # and the clamp monotone, so n iterations are exactly
+        # max(eps_end, eps - n*delta).  Guarded by
+        # tests/test_nec_epsilon_anneal.py.
+        gm = self.greedy_module
+        if gm.annealing_num_steps > 0:
+            delta = (gm.eps_init - gm.eps_end) / gm.annealing_num_steps
+            gm.eps.data.copy_(torch.maximum(gm.eps_end, gm.eps - delta * n))
         self._collected_frames += n
 
         dev = self._buffer_device
@@ -1806,7 +1886,8 @@ class NECAlgorithm(BaseAlgorithm):
 
         # Forward through embedding network — gradients enabled
         h = self.embedding_net(obs_flat)                      # (B, embedding_dim)
-        h = nn.functional.normalize(h, dim=-1)               # unit-norm per paper §2
+        # Unit-norm: a REPO DEVIATION, not the paper. See _embed().
+        h = nn.functional.normalize(h, dim=-1)
 
         # NOTE: this stays a per-action Python loop (unlike estimate_all,
         # which batches across actions via dnd.knn_all_actions). Batching it

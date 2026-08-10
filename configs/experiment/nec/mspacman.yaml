@@ -30,8 +30,35 @@ run:
   game: mspacman
 
 algorithm:
-  # num_updates: 400 is now the nec_atari.yaml default (it applies to every
-  # action-repeat-4 Atari config, not just this one), so no override here.
+  # Paper §4 is "one replay update for every 16 observed frames" = 400 per
+  # 1600 agent steps at action-repeat 4, which is also the reference's
+  # learn_step=4. That is the nec_atari.yaml default. It is overridden DOWN here
+  # on evidence: across three runs of this repo, the only one that reached ~3000
+  # used 100, and the run that raised it to 400 plateaued at ~1000 by 270k steps
+  # — worse, despite also getting the better eps_end.
+  #
+  # CORRECTION to an earlier version of this comment: it claimed "4x the
+  # updates is 4x the encoder drift per collected frame". That is not what
+  # happens. Measured drift per collector batch, in units of the mean
+  # inter-state distance, under the settings in force at the time
+  # (lr=1e-4, alpha=0.99, eps=1e-8, max_grad_norm=10):
+  #
+  #     num_updates:   25      50     100     200     400
+  #     drift:       4.95x   4.93x   4.97x   5.07x   4.92x
+  #
+  # Drift is FLAT — it saturates within ~25 updates, because the clip bound on
+  # 100% of updates and eps=1e-8 then moved every parameter by ~lr regardless
+  # of gradient size. Lowering num_updates never addressed staleness. The fix
+  # was the optimiser trio in nec_atari.yaml (lr=1e-5/0.9/0.01, no clipping),
+  # which takes drift to ~1.1-1.7x at every update count above.
+  #
+  # This override is therefore kept on its two REAL justifications: the
+  # empirical run evidence above, and throughput — it cuts the dominant cost
+  # (num_updates x num_actions exact kNN scans per batch) by 4x. It remains a
+  # deliberate deviation from §4 and must be declared alongside any comparison
+  # to the paper's curves. Worth re-testing at 400 now that drift is fixed,
+  # since §4's rate is 400 and the two were previously confounded.
+  num_updates: 100
 
   # Training exploration floor. The paper only says "ε-greedy ... with a low ε"
   # (§3.2) and lists the rate among the swept-but-unreported values; the

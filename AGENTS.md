@@ -1249,21 +1249,56 @@ What actually shipped, and what was tried and reverted:
 | | reference | ours | status |
 |---|---|---|---|
 | updates per step | `learn_step=4` -> 1 update / 4 agent steps = **400** per 1600 | `num_updates: 400` (runs had logged 100) | **fixed** — 4x too few |
-| gradient clipping | none | `max_grad_norm: 10.0`, binds on 100 % of updates | **not changed** |
-| optimiser | `RMSPropOptimizer(1e-5, decay=0.9, epsilon=0.01)` | torch defaults `lr=1e-4, alpha=0.99, eps=1e-8`, exposed as `rmsprop_alpha` / `rmsprop_eps` | **not changed** |
+| gradient clipping | none | `max_grad_norm: null` | **fixed** — was 10.0, binding on 100 % of updates |
+| optimiser | `RMSPropOptimizer(1e-5, decay=0.9, epsilon=0.01)` | same: `lr=1e-5, rmsprop_alpha=0.9, rmsprop_eps=0.01` | **fixed** — was torch defaults |
 | loss reduction | `reduce_sum` | `.mean()` | **not changed** |
 | `kernel_delta` | 1e-3 with an unnormalised, `trunc_normal(0, 0.1)` embedding | 1e-3 with an L2-normalised one | **not changed** |
 
-The last three were changed and then reverted. The reasoning for changing them
-still stands on its own terms — the reference's optimiser measurably cuts
-embedding drift per 400-update batch from 8.7x to 3.1x the inter-state
-distance, and the reduction only transfers together with `(lr, alpha, eps)`
-because for RMSProp scaling the loss by `c` is equivalent to dividing `eps` by
-`c`. But none of it was shown to improve the score, and the settings they
-replaced are the ones from the only run that reached ~3000 on Ms. Pac-Man. They
-are left as one-line experiments instead:
+##### Why the optimiser trio was finally adopted
 
-    algorithm.lr=1e-5 algorithm.rmsprop_alpha=0.9 algorithm.rmsprop_eps=0.01
+It was changed and reverted twice before, on the grounds that it "was not shown
+to improve the score" and that torch's defaults were what the only ~3000 Ms.
+Pac-Man run used. That reasoning missed the mechanism. Measured encoder drift
+per collector batch, in units of the mean distance between distinct states:
+
+| `num_updates` | old (1e-4 / .99 / 1e-8 / clip 10) | reference trio (1e-5 / .90 / .01) |
+|---|---|---|
+| 25 | 4.95x | 1.13x |
+| 50 | 4.93x | 1.64x |
+| 100 | 4.97x | 1.66x |
+| 200 | 5.07x | 2.42x |
+| 400 | 4.92x | 1.07x |
+
+Two readings, both load-bearing:
+
+1. **~5x the inter-state distance exceeds the diameter of the unit sphere the
+   embeddings live on** (two random 64-d unit vectors sit at 1.41; mean
+   inter-state distance is ~0.28). A key written one batch pointed essentially
+   nowhere by the next, so the kNN retrieved neighbours whose stored returns
+   belonged to unrelated states. This violates NEC's stated premise (§6, "keys
+   stored in the DND remain relatively stable") and is the direct cause of the
+   signature seen on the 350k-step Ms. Pac-Man run: `eval/dnd_top_weight`
+   decaying toward `1/k` (a flat average over all k neighbours),
+   `train/dnd_blend_rate` collapsing 0.35 -> 0.05, and `train/q_loss` *rising*
+   1000 -> 2100 instead of converging. That run still climbed to ~1300 because
+   γ¹⁰⁰ = 0.37 leaves 63 % of Q⁽ᴺ⁾ as observed Monte-Carlo reward — the learning
+   came from the returns, not from the memory.
+2. **The old drift is flat in `num_updates`** — it saturates within ~25
+   updates, because the clip bound on every update and `eps=1e-8` then moved
+   each parameter by ~`lr` regardless of gradient size. So lowering
+   `num_updates` never addressed staleness, and any earlier note claiming
+   "4x the updates is 4x the drift" is wrong.
+
+The clip and `rmsprop_eps` must move together: clipping was only load-bearing
+because `eps=1e-8` damps nothing (removing both at once diverges, `q_loss`
+1.5e3 -> 1.9e4 in three batches), and `eps=0.01` damps the step on its own.
+To restore the previous behaviour for an A/B:
+
+    algorithm.lr=1e-4 algorithm.rmsprop_alpha=0.99 algorithm.rmsprop_eps=1e-8 algorithm.max_grad_norm=10
+
+The loss reduction stays `.mean()`: for RMSProp, scaling the loss by `c` is
+equivalent to dividing `eps` by `c`, so `reduce_sum` only transfers together
+with a re-derived `(lr, alpha, eps)` — it is not an independent knob.
 
 **Do not copy the reference's N-step return.** `NECAgent.Update` runs
 `for i in xrange(start_t-1, t, -1)`, which stops at `t+1` and therefore drops
@@ -1287,7 +1322,7 @@ Differences **left in place** — deliberate, but the first is the one to A/B fi
 #### fps: exact kNN vs the reference's ANNOY index
 
 We do an exact scan of the whole table; the reference uses an ANNOY tree. Our
-cost is therefore linear in DND size, so **throughput degrades as training
+cost is therefore linear in DND size, so **throughput decays as training
 proceeds** (CPU, 9 actions, k=50, per 1600-frame batch):
 
 | entries/action | `estimate_all` | `knn_action` | per batch | fps |
@@ -1296,13 +1331,66 @@ proceeds** (CPU, 9 actions, k=50, per 1600-frame batch):
 | 100,000 | 94.4 ms | 5.30 ms | 38.0 s | 42 |
 | 500,000 | 408 ms | 24.8 ms | 171 s | 9 |
 
-`_gradient_step`'s `num_updates x num_actions` `knn_action` calls dominate, so
-raising `num_updates` 100 -> 400 also multiplies this cost by 4. If throughput
-is the binding constraint, cut `dnd_capacity` (the paper's 5e5 never fills at
-1M frames anyway) or add an approximate index. Two smaller costs, both absent
-from the reference: `EGreedyModule.step(1600)` loops in Python (~23 s/1M
-frames), and the exact-match hash bookkeeping `_make_keys` (~6 s/1M frames) —
-which the reference disabled outright as "cleaner (and faster without)".
+`_gradient_step` issues `num_updates x num_actions` `knn_action` calls per batch
+(400 x 9 = 3600 full scans) against the reference's 32 tree lookups, and the
+policy's `estimate_all` scans every action's table once per env step. The two
+are roughly equal shares of the cost.
+
+Three fixes, all applied, measured together at **31 fps -> 127 fps (4.1x)** for
+a 1M-agent-step Ms. Pac-Man run:
+
+1. **`dnd_capacity` 5e5 -> 50k.** Capacity does nothing until a table is full,
+   and at ~0.093 inserts/action/step a 1M-step run only reaches ~93k — so 5e5
+   never evicted anything and the DND held keys from the randomly-initialised
+   encoder alongside current ones. 50k reproduces the paper's own turnover
+   ratio (~1.85 cycles) and bounds the scan.
+2. **`num_updates` 400 -> 100** for Ms. Pac-Man (see the experiment config):
+   cuts the training-side kNN 4x.
+3. **Epsilon anneal in closed form.** `EGreedyModule.step(frames)` loops
+   `frames` times in Python — 1600 tensor ops per batch (26.8 ms) to evaluate a
+   linear ramp. `NECAlgorithm.step` computes `max(eps_end, eps - n*delta)`
+   directly: **125x faster**, and *more* accurate — torchrl's float32
+   accumulation drifts ~2e-5 per batch and ~4e-4 over forty, always leaving
+   epsilon above the configured schedule. Guarded by
+   `tests/test_nec_epsilon_anneal.py`.
+
+4. **`DND._block_topk`: rank on similarity, not distance.** `knn_all_actions`
+   used to materialise the full `(A, b, n)` matrix and walk it four extra
+   times — `2 - 2*sim` into a fresh tensor, then `clamp_min_`, then `sqrt_`,
+   then `masked_fill` into *another* tensor of the same size (266 MB at A=9,
+   b=74, n=1e5). Since `‖q-h‖² = 2 - 2·q·h` is monotone decreasing in `q·h`,
+   ranking on the similarity matrix picks the same neighbours in the same
+   order; the conversion to distance then runs over `(A, b, k)` instead of
+   `(A, b, n)`, i.e. `n/k` = 2000x fewer elements. One in-place mask replaces
+   two full-size allocations.
+
+   Exact, not approximate — pinned against brute-force `cdist` in
+   `tests/test_nec_knn_all_actions.py` across ragged, empty, below-`k`,
+   full, chunked and non-unit-norm tables. Measured on `estimate_all`:
+
+   | entries/action | before | after | speedup |
+   |---|---|---|---|
+   | 10,000 | 78.6 ms | 32.7 ms | 2.4x |
+   | 50,000 | 395 ms | 154 ms | 2.6x |
+   | 100,000 | 677 ms | 371 ms | 1.8x |
+
+   This halves the *policy-side* share of the kNN cost, which fixes 1-3 above
+   leave untouched (they only reduce the training-side scans).
+
+Two smaller costs remain, both absent from the reference: the exact-match hash
+bookkeeping in `_make_keys` (a GPU->CPU sync per write, ~6 s per 1M frames),
+which the reference disabled outright as "cleaner (and faster without)"; and
+`_embed` re-embedding the retained window every `step()`.
+
+**On an approximate index.** `faiss` 1.15.0 is installed and currently unused.
+It is a smaller win than it looks and has not been adopted: benchmarked at
+100k entries/action, `IndexFlatL2` is only 1.9x faster than the exact torch
+path, and `IndexHNSWFlat` (M=32, efSearch=128) is 7.9x but returns
+**recall@50 = 0.745** and costs ~3.3 s per action to build — ~30 s per
+collector batch across 9 actions if rebuilt each time. `dnd_key_lr` moves keys
+on every update, so any prebuilt index goes stale within a batch. Adopting one
+means committing to a rebuild cadence and accepting sub-unity recall; do that
+only if the scan is still the binding constraint after 1-4 above.
 
 ### 6. NEC evaluation diagnostics (`eval/*`)
 
