@@ -366,10 +366,33 @@ class DND:
     # ------------------------------------------------------------------
 
     def _make_keys(self, states: torch.Tensor) -> list[bytes]:
-        """Quantise float32 embeddings to stable bytes keys (B rows → B keys)."""
+        """Quantise float32 embeddings to stable bytes keys (B rows → B keys).
+
+        Serialised in ONE pass and sliced, rather than per row.  The obvious
+        ``[q_cpu[i].numpy().tobytes() for i in range(n)]`` costs three Python
+        objects per row (a tensor view, a numpy array, a bytes), which shows up
+        badly now that ``flush_moved_slots`` re-hashes every slot a batch's kNN
+        touched — ~1.9e5 rows per collector batch at ``num_updates`` = 400,
+        against the ~1.6e3 rows the insert path alone needed.  Slicing a single
+        buffer is ~5x faster and allocates only the bytes objects that end up
+        in the dict:
+
+            rows      per-row      one-pass
+            10,000     30.2 ms      6.0 ms
+            50,000    151.3 ms     29.5 ms
+            180,000   585.3 ms    108.0 ms
+
+        Byte-for-byte identical output — the rows are contiguous and int32, so
+        row ``i`` is exactly ``raw[i*stride:(i+1)*stride]``.
+        """
         q = torch.round(states * self._key_scale).to(torch.int32)
         q_cpu = q.cpu().contiguous()
-        return [q_cpu[i].numpy().tobytes() for i in range(q_cpu.shape[0])]
+        n = q_cpu.shape[0]
+        if n == 0:
+            return []
+        raw = q_cpu.numpy().tobytes()
+        stride = len(raw) // n
+        return [raw[i * stride: (i + 1) * stride] for i in range(n)]
 
     # ------------------------------------------------------------------
     # Lazy key-tensor initialisation
@@ -734,8 +757,9 @@ class DND:
            stored key* to its slot.  Once a key moves, that entry is stale and
            a later ``write_batch`` could blend a value into a slot whose key is
            no longer the one that hashed there.  Moved slots are recorded and
-           delisted by :meth:`flush_moved_slots`.  Re-hashing instead would
-           cost a GPU->CPU sync per touched slot per update.
+           re-hashed in bulk by :meth:`flush_moved_slots`, once per collector
+           batch (NOT per update, which is what would cost a GPU->CPU sync per
+           touched slot).
 
         ``indices`` may repeat a slot (several queries can share a neighbour);
         ``index_put_(..., accumulate=True)`` sums those contributions, which is
@@ -769,33 +793,73 @@ class DND:
             self.keys[action, touched] = nn.functional.normalize(
                 self.keys[action, touched], dim=-1
             )
-            # Invariant 2: remember to delist (done in bulk, see flush_moved_slots).
+            # Invariant 2: remember to re-hash (in bulk, see flush_moved_slots).
             self._moved_slots[action].append(touched)
 
     def flush_moved_slots(self) -> int:
-        """Delist every slot whose key was moved by :meth:`apply_gradient`.
+        """Re-hash every slot whose key was moved by :meth:`apply_gradient`.
 
         Called once per collector batch rather than per gradient step: the
         Python dict work is proportional to the number of DISTINCT slots
-        touched, so batching collapses the 400 per-step passes into one.
+        touched, so batching collapses the per-step passes into one.
 
-        Returns the number of slots delisted (exposed as ``train/dnd_delisted``).
+        Returns the number of slots re-hashed (``train/dnd_rehashed``).
+
+        This used to **delist** moved slots instead — drop them from
+        ``_key_to_slot`` and never put them back — on the stated grounds that
+        re-hashing "would cost a GPU->CPU sync per touched slot per update".
+        That objection applies to the per-update location, not to this one:
+        ``flush_moved_slots`` already runs once per collector batch and already
+        pays exactly one sync per action to materialise its slot list, so
+        re-hashing here costs one extra batched ``_make_keys`` over ~1e3 rows.
+
+        Delisting was quietly fatal. Measured on Ms. Pac-Man, ~1,200 slots were
+        delisted per batch against ~198,000 total entries over a 270k-step run —
+        i.e. **every entry the kNN ever retrieved left the exact-match dict
+        permanently**. Two consequences, both visible in the logs:
+
+        1. The blend rule ``Q_i <- Q_i + alpha(Q^(N) - Q_i)`` (paper §3.3,
+           Eq. 4) can only fire on a key that is still listed, so it decayed
+           toward never firing — ``train/dnd_blend_rate`` collapsing toward 0
+           over a run is exactly this. That rule is NEC's headline mechanism
+           (§1: "rapidly updated estimates of the value function"), so losing
+           it reduces the DND to an append-only log of stale returns.
+        2. A re-encounter of a delisted state INSERTS A DUPLICATE rather than
+           updating the existing entry, so capacity is spent on near-identical
+           keys whose values then disagree.
+
+        Collision handling: two moved keys can quantise to the same bytes. The
+        mapping must stay bijective (``_insert_novel`` pops ``k_to_s[old_key]``
+        when it overwrites a slot), so the later slot wins the key and the
+        earlier one is dropped from ``_slot_to_key``. A slot with no key is
+        simply unblendable until overwritten, which is the old behaviour for
+        that one slot rather than for all of them.
         """
         total = 0
         for a in range(self.num_actions):
             chunks = self._moved_slots[a]
             if not chunks:
                 continue
-            slots = torch.unique(torch.cat(chunks)).cpu().tolist()
+            slots_t = torch.unique(torch.cat(chunks))
             self._moved_slots[a] = []
 
             k_to_s = self._key_to_slot[a]
             s_to_k = self._slot_to_key[a]
-            for slot in slots:
-                old_key = s_to_k.pop(slot, None)
-                if old_key is not None:
+            # One batched hash over the moved rows, not one call per slot.
+            new_keys = self._make_keys(self.keys[a, slots_t])
+
+            for slot, new_key in zip(slots_t.cpu().tolist(), new_keys):
+                old_key = s_to_k.get(slot)
+                if old_key is not None and old_key != new_key:
                     k_to_s.pop(old_key, None)
-                    total += 1
+
+                prev = k_to_s.get(new_key)
+                if prev is not None and prev != slot:
+                    s_to_k.pop(prev, None)
+
+                k_to_s[new_key] = slot
+                s_to_k[slot]    = new_key
+                total += 1
         return total
 
     # ------------------------------------------------------------------
@@ -980,7 +1044,7 @@ class DND:
         self._key_to_slot = [{} for _ in range(self.num_actions)]
         self._slot_to_key = [{} for _ in range(self.num_actions)]
         # Rebuilt empty: the dicts below are regenerated from the restored
-        # keys, so nothing is pending delisting at load time.
+        # keys, so nothing is pending a re-hash at load time.
         self._moved_slots = [[] for _ in range(self.num_actions)]
         # __setstate__ bypasses __init__, so the read-path counters (and the
         # `_record_lookups` flag estimate_all branches on) have to be created
@@ -1827,12 +1891,12 @@ class NECAlgorithm(BaseAlgorithm):
         # stale.  Delist them once per batch rather than once per update — the
         # cost is proportional to DISTINCT slots touched, so batching collapses
         # num_updates passes into one.
-        delisted = self.dnd.flush_moved_slots()
+        rehashed = self.dnd.flush_moved_slots()
 
         metrics = {
             **base_metrics,
             "train/updates":      float(len(losses)),
-            "train/dnd_delisted": float(delisted),
+            "train/dnd_rehashed": float(rehashed),
         }
         if losses:
             # Two host syncs per collector batch instead of two per update.

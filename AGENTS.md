@@ -1107,12 +1107,49 @@ entirely. Stateless SGD has no state to go stale.
    `test_nec_kernel_scale.py`). Touched rows are re-projected.
 2. **Hash validity.** `_key_to_slot` maps a quantised copy of a stored key to
    its slot; once the key moves, that entry is stale and `write_batch` could
-   blend into the wrong slot. Moved slots are recorded and delisted in bulk by
+   blend into the wrong slot. Moved slots are recorded and re-hashed in bulk by
    `flush_moved_slots()`, called once per collector batch from `step()` and
-   reported as `train/dnd_delisted`.
+   reported as `train/dnd_rehashed`.
 
 Setting `dnd_key_lr=dnd_value_lr=0` reproduces the old frozen-DND behaviour
 bit-for-bit, so the change can be A/B'd against earlier runs.
+
+##### Moved slots must be re-hashed, never delisted
+
+`flush_moved_slots()` originally **delisted** moved slots — dropped them from
+`_key_to_slot` and never restored them — because re-hashing "would cost a
+GPU->CPU sync per touched slot per update". That objection applies to the
+per-update location, not to `flush_moved_slots`, which already runs once per
+collector batch and already pays one sync per action to build its slot list.
+
+Delisting was quietly fatal, and it is the second reason the Ms. Pac-Man runs
+plateaued (the first being encoder drift, above). The kNN retrieves
+`num_updates x batch_size x k` neighbours per batch — 640,000 at 400/32/50 —
+so within a few batches **essentially every entry had left the exact-match
+dict permanently**. Two consequences:
+
+1. **The blend rule stops firing.** `Q_i <- Q_i + alpha(Q^(N) - Q_i)`
+   (§3.3, Eq. 4) only applies to a listed key, and it is NEC's headline
+   mechanism (§1, "rapidly updated estimates of the value function"). Without
+   it the DND degenerates to an append-only log of stale one-sample returns.
+   `train/dnd_blend_rate` decaying toward 0 over a run is this, not the
+   "expected" reading an earlier note claimed.
+2. **Re-encounters duplicate instead of updating**, spending capacity on
+   near-identical keys carrying disagreeing values.
+
+Note the old `train/dnd_delisted` *undercounted* badly — it only incremented
+when a slot still had a key, so each slot counted at most once ever. The
+500-2500/batch it showed against ~198,000 total entries was already enough to
+delist the whole table; the true touch count is ~1.1e5-1.9e5 per batch.
+`train/dnd_rehashed` reports that real number, so expect it to read far higher.
+
+Cost: 142 ms/batch at `num_updates=100`, 221 ms at 400 — against a kNN budget
+of seconds. Getting there needed `_make_keys` to serialise in one pass and
+slice, rather than allocating three Python objects per row (5x: 585 -> 108 ms
+at 1.8e5 rows), which speeds up the insert path too. Pinned by
+`tests/test_nec_dnd_rehash.py`, including the hash-collision case where two
+moved keys quantise identically and the slot<->key mapping must stay
+consistent.
 
 **Why this mattered:** before this, a stored key was written once and never
 refreshed. At `dnd_capacity=5e5` with ~178 inserts per action per collector
@@ -1164,7 +1201,7 @@ happen between duplicate frames embedded *within one* `step()` call, and the
 DND behaves close to an insert-only log.
 
 Now that gradients also move stored keys (§1), a hash entry additionally goes
-stale the moment its key is updated — `flush_moved_slots()` delists those, so
+stale the moment its key is updated — `flush_moved_slots()` re-hashes those, so
 the blend rate falls further rather than silently blending into a slot whose
 key has changed.
 
