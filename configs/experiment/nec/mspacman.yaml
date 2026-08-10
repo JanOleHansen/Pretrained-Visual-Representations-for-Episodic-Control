@@ -78,7 +78,7 @@ trainer:
   # worker process per env. 16 envs overruns the 32 GB devcontainer limit; the
   # OOM killer then takes out a ParallelEnv worker, which surfaces as
   # `EOFError: proc <pid> failed, last command: step_and_maybe_reset`.
-  num_envs: 8
+  num_envs: 16
   log_every_n_steps: 10_000
   # 50_000 agent steps == every 200k raw frames, per paper §4 ("We evaluate
   # MFEC and NEC every 200.000 frames").
