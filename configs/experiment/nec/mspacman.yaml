@@ -33,21 +33,29 @@ algorithm:
   # num_updates: 400 is now the nec_atari.yaml default (it applies to every
   # action-repeat-4 Atari config, not just this one), so no override here.
 
-  # The paper swept epsilon and never published the schedule (§4 lists the
-  # "epsilon-greedy exploration-rate" among the swept-but-unreported values,
-  # alongside the SGD learning rate, alpha, and the embedding dimensionality).
-  # The paper only says "we use ε-greedy policy during training with a low ε"
-  # (§3.2); the reference implementation uses a CONSTANT ε = 0.1 with no anneal
-  # at all. 0.05 sits between the two and matches eval_eps, so train/* and
-  # eval/* describe the same policy. The anneal deliberately outlasts the
-  # random warm-up: NEC only
-  # writes to the DND at episode end, and while an action's table holds <= k
-  # entries its Q is +inf (mapped to 1e9), so argmax degenerates to action 0.
-  # Annealing over 50k agent steps (200k raw frames) keeps real exploration
-  # alive until the DND is populated.
-  eps_end: 0.05
+  # Training exploration floor. The paper only says "ε-greedy ... with a low ε"
+  # (§3.2) and lists the rate among the swept-but-unreported values; the
+  # reference implementation uses a constant 0.1. Neither pins it down, so this
+  # is settled empirically: 0.001 is what the ONLY run of this repo that reached
+  # ~3000 on Ms. Pac-Man used, and raising it to 0.05 cost ~40% of the score at
+  # matched frames — that was the single learning-relevant change between those
+  # two runs.
+  eps_end: 0.001
+  # The anneal deliberately outlasts the random warm-up: NEC only writes to the
+  # DND at episode end, and while an action's table holds <= k entries its Q is
+  # +inf (mapped to 1e9), so argmax degenerates. Annealing over 50k agent steps
+  # (200k raw frames) keeps real exploration alive until the DND is populated.
   annealing_frames: 50_000
   init_random_frames: 12_500
+
+  # Eval ε has to decorrelate episodes without describing a different policy
+  # than training. ALE is deterministic here and NoopResetEnv does nothing on
+  # this game (measured: 8 episodes with a fixed policy, std exactly 0), so ε is
+  # the ONLY source of eval variance: at 0.001 ~55% of 700-step episodes replay
+  # identically, at 0.005 ~3% do. 0.005 also stays within 10x of eps_end, so
+  # train/* and eval/* describe the same policy and setup()'s mismatch warning
+  # stays quiet.
+  eval_eps: 0.005
 
 trainer:
   # total_frames counts AGENT STEPS. The paper's x-axis counts RAW ALE FRAMES,

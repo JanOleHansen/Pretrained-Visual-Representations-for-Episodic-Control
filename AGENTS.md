@@ -1206,16 +1206,16 @@ Everything §4 actually publishes, checked against the composed config:
 | Eq. 4 `Q_i <- Q_i + α(Q^(N) - Q_i)` | — | `write_batch` blend | ok |
 | §3.4 backprop updates "the keys and values of each action-specific memory ... using a lower learning rate than α" | < α = 0.1 | `dnd_key_lr: 1e-4`, `dnd_value_lr: 1e-5` | ok |
 | Fig. 2 "Gradients flow through the entire architecture" | — | `DND.apply_gradient` | ok |
-| **"We set δ = 10^-3"** | **1e-3** | **`kernel_delta: 1e-5`** | **deviation** |
+| "We set δ = 10^-3" | 1e-3 | `kernel_delta: 1e-3` | ok |
 
-The δ deviation is deliberate and is the only published number we do not use.
-δ is a squared distance, so it is only meaningful relative to the embedding
-scale, and this repo L2-normalises the embedding — which neither the paper nor
-the reference does. Measured, δ as a fraction of the mean squared distance to
-the 50 retrieved neighbours: paper/reference geometry 3e-5, ours **0.17**. See
-§5b. The paper-faithful alternative is to drop the normalisation and match the
-reference's `trunc_normal(0, 0.1)` init instead; that was not done because the
-kNN fast path (`_topk_l2_unit`) requires unit-norm keys.
+Every published number is now used as published. One thing worth knowing about
+δ: it is a squared distance, so it is only meaningful relative to the embedding
+scale, and this repo L2-normalises where the paper and the reference do not.
+Measured, δ is ~17 % of the mean squared distance to the k=50 neighbours here
+against ~0.003 % in the reference's geometry. Lowering it to 1e-5 was tried and
+**reverted**: it lifts an exact re-encounter from 5.6 % to 45 % of the kernel
+mass, but retrieval quality barely moved (held-out return-to-go prediction
+r = +0.50 -> +0.51) and no score improvement could be demonstrated.
 
 Swept-and-unreported by §4, so no paper value exists to match: the SGD learning
 rate, α (`dnd_lr`), the embedding dimensionality, and the ε-greedy rate.
@@ -1231,21 +1231,44 @@ Deviations that are **not** numerical:
   the reference; both act ε-greedily from step 0.
 * **Optimistic init.** Neither the paper nor the reference returns `+inf` for an
   under-populated action (the reference returns 0.0); we return `1e9`.
-* **`max_grad_norm: 10.0`** is in neither.
+* **Gradient clipping.** Neither clips; we keep `max_grad_norm: 10.0`, which —
+  measured — binds on **100 % of updates** (median raw grad norm ~1.7e3). So it
+  is the de-facto step-size control here, not a safety net. Removing it was
+  tried and reverted: torch's RMSProp `eps=1e-8` barely damps anything, so the
+  clip is the only thing bounding the step, and dropping both at once diverges
+  (`train/q_loss` 1.5e3 -> 1.9e4 within three batches). It only makes sense to
+  drop together with the reference's `rmsprop_eps=0.01`.
 
 ### 5b. Diff against the reference implementation
 
 `github.com/EndingCredits/Neural-Episodic-Control` is the implementation the module docstring cites. It is TensorFlow and
 its encoder is fixed, but every *numerical* choice below was checked against it
 directly (`NECAgent.py`, `knn_dictionary.py`, `networks.py`, `main.py`).
-Differences that were **fixed**:
+What actually shipped, and what was tried and reverted:
 
-| | reference | ours (before) | why it mattered |
+| | reference | ours | status |
 |---|---|---|---|
-| optimiser | `RMSPropOptimizer(1e-5, decay=0.9, epsilon=0.01)` | `torch.optim.RMSprop(lr=1e-4)` -> alpha=0.99, **eps=1e-8** | eps 1e6x smaller makes the step tend to `lr*sign(g)`. Embedding drift per 400-update batch, relative to how far apart distinct states are: **8.7x** vs 3.1x. A key is written once and read for thousands of batches, so at 8.7x every key is stale before it is next read — measured: nearest stored key sat *further* from a query (0.13–0.18) than an unrelated current frame (0.094). |
-| loss reduction | `reduce_sum` | `.mean()` | Only meaningful together with the optimiser: for RMSProp, scaling the loss by `c` is equivalent to dividing `eps` by `c`. `mean` + the reference's `eps=0.01` damps every step by up to `batch_size`. Now `sum`; `train/q_loss` still logs the mean. |
-| `kernel_delta` vs embedding scale | no L2 norm, `trunc_normal(0, 0.1)` init -> d^2 ~ 17, **δ/d^2 ~ 3e-5** | L2 norm, torch default init -> d^2 ~ 5.8e-3, **δ/d^2 = 0.17** | δ is a squared distance and only means anything relative to the embedding scale. At 0.17 the divide-by-zero *guard* is the dominant term: all k weights ~1/δ, `Q(s,a)` collapses to a per-action constant, argmax returns one fixed action for every state (measured: Q varied 44x more across actions than states). Exact re-encounter got 5.6 % of kernel mass (uniform floor 2.0 %); at δ=1e-5 it gets 45 %. |
-| updates per step | `learn_step=4` -> 1 update / 4 agent steps = **400** per 1600 | runs logged `train/updates=100` | 4x too few. Independently confirms `num_updates: 400`. |
+| updates per step | `learn_step=4` -> 1 update / 4 agent steps = **400** per 1600 | `num_updates: 400` (runs had logged 100) | **fixed** — 4x too few |
+| gradient clipping | none | `max_grad_norm: 10.0`, binds on 100 % of updates | **not changed** |
+| optimiser | `RMSPropOptimizer(1e-5, decay=0.9, epsilon=0.01)` | torch defaults `lr=1e-4, alpha=0.99, eps=1e-8`, exposed as `rmsprop_alpha` / `rmsprop_eps` | **not changed** |
+| loss reduction | `reduce_sum` | `.mean()` | **not changed** |
+| `kernel_delta` | 1e-3 with an unnormalised, `trunc_normal(0, 0.1)` embedding | 1e-3 with an L2-normalised one | **not changed** |
+
+The last three were changed and then reverted. The reasoning for changing them
+still stands on its own terms — the reference's optimiser measurably cuts
+embedding drift per 400-update batch from 8.7x to 3.1x the inter-state
+distance, and the reduction only transfers together with `(lr, alpha, eps)`
+because for RMSProp scaling the loss by `c` is equivalent to dividing `eps` by
+`c`. But none of it was shown to improve the score, and the settings they
+replaced are the ones from the only run that reached ~3000 on Ms. Pac-Man. They
+are left as one-line experiments instead:
+
+    algorithm.lr=1e-5 algorithm.rmsprop_alpha=0.9 algorithm.rmsprop_eps=0.01
+
+**Do not copy the reference's N-step return.** `NECAgent.Update` runs
+`for i in xrange(start_t-1, t, -1)`, which stops at `t+1` and therefore drops
+the immediate reward `r[t]`, shifting every discount exponent by one. Our
+`lfilter`-based `_compute_n_step_returns` is correct; the reference is not.
 
 Differences **left in place** — deliberate, but the first is the one to A/B first:
 
