@@ -95,21 +95,27 @@ action per collector batch an entry survived ~2800 batches — over a million
 gradient steps of CNN drift — while the kNN kept retrieving it as though it
 still lived in the current embedding space.
 
-One remaining deviation from the paper: DND eviction is FIFO (ring-buffer
-insertion order), not LRU as §3.1 specifies — nothing updates recency on
-lookup.
+Eviction is **LRU**, as paper §3.3 specifies: "We overwrite the item that has
+least recently shown up as a neighbour when we reach the memory's maximum
+capacity." ``DND._lru`` stamps every slot a kNN returns (and every slot
+written or blended), and ``_insert_novel`` evicts the coldest live slots.
 
-The old justification for FIFO ("stored keys go stale, so evicting the
-oldest evicts the stalest") no longer applies now that gradients refresh the
-keys. It is left as FIFO on cost/benefit grounds, not principle: **eviction
-policy has no effect at all until a table is full**, and at
-``dnd_capacity`` = 5e5 with ~178 inserts per action per collector batch that
-is ~2800 batches (~4.5M agent steps). Below that the two policies are
-bit-identical, so switching would change nothing for any run shorter than
-that, while touching the ring-buffer serialisation
-(``__getstate__``/``__setstate__`` rotate by ``_write_ptrs``) and the
-recency bookkeeping on the hottest path. Worth doing before a full-length
-40M-frame run; not worth it to debug one.
+This was a plain FIFO ring buffer until the eviction regime became reachable.
+The justification for FIFO was explicitly conditional — "eviction policy has
+no effect at all until a table is full", which at ``dnd_capacity`` = 5e5 and
+~178 inserts per action per batch meant ~4.5M agent steps, beyond any run
+attempted. Cutting ``dnd_capacity`` to 5e4 for throughput voided that
+precondition: tables now fill at ~450k agent steps, and a 900k-step Ms.
+Pac-Man run spent half its life evicting under the wrong policy. The symptom
+was ``train/dnd_size`` flattening against capacity while ``train/q_loss``
+turned around and climbed (1.5e3 -> 8.5e3) even though ``train/q_values``
+had plateaued.
+
+FIFO is specifically wrong once the blend rule is live: a frequently
+re-encountered state occupies ONE slot whose *value* is refreshed by
+blending but whose *insertion order* never is, so FIFO discards precisely the
+best-estimated, most-reused entries on a fixed timer. LRU is what keeps
+them.
 
 One further caveat, caught in review:
 
@@ -283,6 +289,21 @@ class DND:
         self._sizes      = [0] * num_actions
         self._write_ptrs = [0] * num_actions
 
+        # LRU recency, per paper §3.3: "We overwrite the item that has least
+        # recently shown up as a neighbour when we reach the memory's maximum
+        # capacity."  ``_lru[a, s]`` is the value of ``_tick`` at the last
+        # retrieval (or insertion) of slot ``s``; :meth:`_insert_novel` evicts
+        # the smallest.  Slots that have never held an entry keep -1 so they
+        # are always preferred as victims over any live entry.
+        #
+        # int64 rather than the reference's float accumulator: it increments
+        # once per lookup CALL (not per neighbour) and stays exact forever,
+        # where `tm += 0.01` in float32 stops incrementing at ~1.7e5.
+        self._lru  = torch.full(
+            (num_actions, capacity), -1, dtype=torch.int64, device=device
+        )
+        self._tick = 0
+
         self._key_to_slot: list[dict[bytes, int]] = [{} for _ in range(num_actions)]
         self._slot_to_key: list[dict[int, bytes]] = [{} for _ in range(num_actions)]
 
@@ -393,6 +414,34 @@ class DND:
         raw = q_cpu.numpy().tobytes()
         stride = len(raw) // n
         return [raw[i * stride: (i + 1) * stride] for i in range(n)]
+
+    # ------------------------------------------------------------------
+    # LRU recency bookkeeping (paper §3.3)
+    # ------------------------------------------------------------------
+
+    def _touch(self, action: int | None, indices: torch.Tensor) -> None:
+        """Mark slots as just-retrieved, for LRU eviction.
+
+        ``action=None`` means ``indices`` is the ``(A, ...)`` batched result of
+        :meth:`knn_all_actions` and every action's row is touched at once;
+        otherwise it is the ``(m, k)`` result of :meth:`knn_action` for one
+        action.
+
+        One integer ``_tick`` per CALL, not per neighbour: recency only has to
+        order slots against each other, and a per-call stamp keeps this to a
+        single fused scatter instead of a scan over the returned indices.
+        Writes are unconditional (no read-modify-write), so duplicate indices
+        within one call are harmless.
+        """
+        if indices.numel() == 0:
+            return
+        self._tick += 1
+        if action is None:
+            A = indices.shape[0]
+            flat = indices.reshape(A, -1)
+            self._lru.scatter_(1, flat, self._tick)
+        else:
+            self._lru[action].index_fill_(0, indices.reshape(-1), self._tick)
 
     # ------------------------------------------------------------------
     # Lazy key-tensor initialisation
@@ -655,6 +704,8 @@ class DND:
             out_d[:, qs:qe] = bd
             out_i[:, qs:qe] = bi
 
+        # LRU: these slots have just "shown up as a neighbour" (paper §3.3).
+        self._touch(None, out_i)
         return out_d, out_i
 
     # ------------------------------------------------------------------
@@ -723,6 +774,8 @@ class DND:
             best_dists, keep = merged_d.topk(k_eff, dim=1, largest=False)
             best_idx   = merged_i.gather(1, keep)
 
+        # LRU: same as knn_all_actions, but for this action's table only.
+        self._touch(action, best_idx)
         return best_dists, best_idx
 
     # ------------------------------------------------------------------
@@ -939,6 +992,9 @@ class DND:
             vals_t  = torch.tensor(list(slot_updates.values()),
                                    dtype=self.values.dtype, device=self.device)
             self.values.data[action, slots_t] = vals_t
+            # A blended entry is in active use; the reference stamps recency on
+            # write too (`self.lru[index] = self.tm` in LRU_KNN.add).
+            self._touch(action, slots_t)
 
         # --- Insert novel entries via ring buffer ---------------------------
         if novel_rows:
@@ -960,10 +1016,43 @@ class DND:
             values = values[-self.capacity:]
             n = self.capacity
 
-        ptr   = self._write_ptrs[action]
-        slots = torch.arange(ptr, ptr + n, device=self.device) % self.capacity
+        # Slot selection: append while the table has room, then evict by LRU.
+        #
+        # Paper §3.3: "We overwrite the item that has least recently shown up
+        # as a neighbour when we reach the memory's maximum capacity." This was
+        # a plain FIFO ring buffer until the eviction regime actually became
+        # reachable: the old justification for FIFO was that
+        # ``dnd_capacity`` = 5e5 never fills inside a run (~4.5M agent steps),
+        # which stopped being true when capacity was cut to 5e4 — tables now
+        # fill at ~450k steps, and FIFO then evicts on a fixed timer regardless
+        # of usefulness. That is precisely what LRU exists to prevent: with the
+        # blend rule live, a frequently re-encountered state occupies ONE slot
+        # that is refreshed in value but never in insertion order, so FIFO
+        # discards exactly the best-estimated, most-reused entries first.
+        # While the table is filling, slots [0, size) are live and the write
+        # pointer equals the size — the invariant __setstate__ also relies on.
+        size = self._sizes[action]
+        free = self.capacity - size
+        if free >= n:
+            slots = torch.arange(size, size + n, device=self.device)
+        else:
+            # Take the remaining free slots, then the n - free coldest LIVE
+            # ones. The victim search is restricted to [0, size): searching the
+            # whole table would return the still-unwritten slots (they hold -1,
+            # the smallest possible stamp), which are already in `head` — and
+            # duplicate slots would corrupt the slot<->key dicts below.
+            head    = torch.arange(size, self.capacity, device=self.device)
+            victims = torch.topk(
+                self._lru[action, :size], n - free, largest=False, sorted=False
+            ).indices
+            slots = torch.cat([head, victims])
+
         self.keys[action, slots]         = states
         self.values.data[action, slots]  = values.to(self.values.dtype)
+        # Newly written entries are the most recent thing in the table; without
+        # this they would hold the evicted entry's stale stamp (or -1) and be
+        # evicted again by the very next insert.
+        self._touch(action, slots)
 
         new_keys   = self._make_keys(states)
         slots_list = slots.tolist()
@@ -976,8 +1065,11 @@ class DND:
             k_to_s[key]  = slot
             s_to_k[slot] = key
 
-        self._write_ptrs[action] = int((ptr + n) % self.capacity)
-        self._sizes[action]      = min(self._sizes[action] + n, self.capacity)
+        # Kept only for the fill phase (ptr == size) and for __getstate__'s
+        # rotation check, which must see 0 once full: with LRU the slot order
+        # is no longer insertion order, so there is nothing to rotate.
+        self._sizes[action]      = min(size + n, self.capacity)
+        self._write_ptrs[action] = self._sizes[action] % self.capacity
 
     # ------------------------------------------------------------------
     # Serialisation (mirrors QEC.__getstate__ / __setstate__)
@@ -993,31 +1085,45 @@ class DND:
             "key_scale":    self._key_scale,
             "_sizes":       list(self._sizes),
             "_write_ptrs":  list(self._write_ptrs),
+            # LRU recency must round-trip: without it a resumed run restarts
+            # every stamp at 0 and the next inserts evict essentially at
+            # random until the table has been swept again.
+            "_tick":        self._tick,
             "action_keys":  None,
             "action_values": None,
+            "action_lru":   None,
         }
         if self.keys is None:
             return d
 
-        action_keys, action_values = [], []
+        action_keys, action_values, action_lru = [], [], []
         for a in range(self.num_actions):
             sz  = self._sizes[a]
             ptr = self._write_ptrs[a]
             if sz == 0:
                 action_keys.append(None)
                 action_values.append(np.array([], dtype=np.float32))
+                action_lru.append(np.array([], dtype=np.int64))
                 continue
             if sz == self.capacity and ptr != 0:
+                # Only reachable for checkpoints written by the pre-LRU FIFO
+                # code, which left ptr != 0 on a full table. _lru must be
+                # rolled by the SAME shift or recency would be reattached to
+                # the wrong slots.
                 k_t = torch.roll(self.keys[a],         -ptr, dims=0)[:sz]
                 v_t = torch.roll(self.values.data[a],  -ptr, dims=0)[:sz]
+                l_t = torch.roll(self._lru[a],         -ptr, dims=0)[:sz]
             else:
                 k_t = self.keys[a, :sz]
                 v_t = self.values.data[a, :sz]
+                l_t = self._lru[a, :sz]
             action_keys.append(k_t.cpu().numpy())
             action_values.append(v_t.cpu().numpy())
+            action_lru.append(l_t.cpu().numpy())
 
         d["action_keys"]   = action_keys
         d["action_values"] = action_values
+        d["action_lru"]    = action_lru
         return d
 
     def __setstate__(self, d: dict) -> None:
@@ -1040,6 +1146,13 @@ class DND:
 
         dev = self.device
         self.values = torch.zeros(self.num_actions, self.capacity, device=dev)
+
+        # -1 marks "never written", so any slot the checkpoint did not fill is
+        # preferred as an eviction victim over every restored entry.
+        self._lru  = torch.full(
+            (self.num_actions, self.capacity), -1, dtype=torch.int64, device=dev
+        )
+        self._tick = int(d.get("_tick", 0))
 
         self._key_to_slot = [{} for _ in range(self.num_actions)]
         self._slot_to_key = [{} for _ in range(self.num_actions)]
@@ -1069,11 +1182,18 @@ class DND:
             self.num_actions, self.capacity, embedding_dim,
             dtype=torch.float32, device=dev,
         )
+        # A pre-LRU checkpoint has no "action_lru"; those entries then keep -1
+        # and are evicted first, which is the correct fallback — nothing is
+        # known about their recency, and FIFO order is not a usable proxy.
+        lru_np = d.get("action_lru") or [None] * self.num_actions
         for a, (k_np, v_np) in enumerate(zip(d["action_keys"], d["action_values"])):
             sz = self._sizes[a]
             if sz > 0 and k_np is not None:
                 self.keys[a, :sz]        = torch.from_numpy(k_np).to(dev)
                 self.values.data[a, :sz] = torch.from_numpy(v_np).to(dev)
+                l_np = lru_np[a]
+                if l_np is not None and len(l_np) == sz:
+                    self._lru[a, :sz] = torch.from_numpy(l_np).to(dev)
 
         for a in range(self.num_actions):
             sz = self._sizes[a]

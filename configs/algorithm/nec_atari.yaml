@@ -51,6 +51,14 @@ embedding_dim: 64        # (swept, unreported) — §4 lists "dimensionality of
 # and is the dominant throughput term (see AGENTS.md 5b).
 #
 # Raise it for longer runs: capacity ~= 0.093 * total_frames / 1.85.
+#
+# NOTE — this value is what makes eviction reachable at all (tables fill at
+# ~450k agent steps, vs ~4.5M at the paper's 5e5), so it is coupled to the
+# eviction POLICY. That policy was FIFO when this was first set to 50k, on a
+# rationale that only held while nothing was ever evicted; it is now LRU per
+# §3.3 (see AGENTS.md 4b). Do not lower this further without re-reading that
+# section — under LRU a small capacity is much safer, because what survives
+# is what the kNN actually retrieves.
 dnd_capacity: 50_000
 k: 50                    # (paper §4) "we set the number of nearest neighbours
                          # p = 50 in all our experiments"

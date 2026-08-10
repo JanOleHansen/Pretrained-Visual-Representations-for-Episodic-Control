@@ -1180,16 +1180,46 @@ Adam's per-slot state on eviction, or use a plain low-LR SGD step for
 optimizer's parameter list, that's the change that caused the original
 regression.
 
-### 4b. Eviction is still FIFO, and that is now a cost decision
+### 4b. Eviction is LRU (§3.3)
 
-§3.1 specifies LRU. The old rationale for FIFO ("keys go stale, so oldest ==
-stalest") died with §1 — keys are refreshed now. It is left as FIFO because
-**eviction policy has no effect until a table is full**: at
-`dnd_capacity=5e5` and ~178 inserts per action per batch that is ~2800
-batches (~4.5M agent steps), and below that the two policies are
-bit-identical. Switching means reworking the ring-buffer serialisation
-(`__getstate__`/`__setstate__` rotate by `_write_ptrs`) plus recency
-bookkeeping on the hottest path. Do it before a full 40M-frame run.
+`DND._lru` stamps every slot returned by `knn_action` / `knn_all_actions`, and
+every slot written or blended; `_insert_novel` fills any remaining free slots
+and then evicts the coldest **live** ones (`topk(_lru[a, :size], largest=False)`).
+
+This was FIFO until the eviction regime became reachable. That decision was
+explicitly conditional — "eviction policy has no effect until a table is
+full", which at `dnd_capacity=5e5` and ~178 inserts/action/batch meant ~4.5M
+agent steps, beyond any run attempted. **Cutting `dnd_capacity` to 5e4 for
+throughput voided the precondition without anyone re-opening the decision**:
+tables now fill at ~450k agent steps, so a 900k-step Ms. Pac-Man run spent
+half its life evicting under the wrong policy. Symptom in the logs:
+`train/dnd_size` flattening against capacity while `train/q_loss` turns
+around and climbs (1.5e3 → 8.5e3) with `train/q_values` already plateaued.
+
+FIFO is specifically wrong once the blend rule is live (§5): a frequently
+re-encountered state occupies ONE slot whose *value* is refreshed by blending
+but whose *insertion order* never is, so FIFO discards precisely the
+best-estimated, most-reused entries on a fixed timer.
+
+Three things this had to get right, all pinned by `tests/test_nec_dnd_lru.py`:
+
+* **Victims come from `[0, size)` only.** Searching the whole table returns
+  the still-unwritten slots (they hold the sentinel `-1`), which are already
+  being filled in the same call — duplicate slots would corrupt the
+  slot↔key dicts.
+* **Newly written slots are stamped.** Otherwise they inherit the evicted
+  entry's cold stamp and are evicted again by the very next insert.
+* **`_lru` and `_tick` are checkpointed.** Without that a resume restarts
+  every stamp at 0 and evicts near-randomly until the table is swept again.
+  Pre-LRU checkpoints have no `action_lru`; those entries load as `-1`
+  (evicted first), which is the correct fallback — FIFO order is not a usable
+  proxy for recency.
+
+Cost on the hot path is negligible: one integer stamp per lookup *call* (not
+per neighbour), fused into a single scatter — 0.1–0.7 % of the kNN call it
+rides along with. `_write_ptrs` survives only for the fill phase (`ptr ==
+size`) and is 0 once full, so `__getstate__` no longer rotates: with LRU the
+slot order is not insertion order and there is nothing to rotate.
 
 ### 5. The exact-match blend rule is largely inert in practice
 
@@ -1260,8 +1290,9 @@ rate, α (`dnd_lr`), the embedding dimensionality, and the ε-greedy rate.
 Deviations that are **not** numerical:
 
 * **Eviction.** §3.3: "We overwrite the item that has least recently shown up
-  as a neighbour" (LRU). Ours is FIFO. Never binds at this budget — 5e5 per
-  action against ~110k inserts per action over a 1M-agent-step run.
+  as a neighbour" (LRU). Ours is LRU too — see §4b. Do NOT reason about this
+  as "never binds": that was true only at `dnd_capacity=5e5`, and capacity is
+  now 5e4, which fills at ~450k agent steps.
 * **Approximate NN.** §3.1 uses kd-trees; ours is an exact scan. Same answer,
   much slower — see the fps table in §5b.
 * **Warm-up.** `init_random_frames: 12_500` has no counterpart in the paper or
