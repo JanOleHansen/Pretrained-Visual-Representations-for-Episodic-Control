@@ -20,3 +20,20 @@ ModuleNotFoundError("No module named 'faiss.swigfaiss_avx2'")
 [2026-07-24 10:41:11,936][dinov2][INFO] - using MLP layer as FFN
 [2026-07-24 10:52:29,737][dinov2][INFO] - using MLP layer as FFN
 [2026-07-24 12:46:08,279][dinov2][INFO] - using MLP layer as FFN
+[2026-08-07 08:41:12,608][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-07 08:41:12,611][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-07 10:20:10,224][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-07 10:20:10,226][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-07 10:20:10,227][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-07 10:20:10,228][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-07 10:20:10,228][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-07 10:20:10,229][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-07 10:20:10,230][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-07 10:20:10,231][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-07 10:36:59,911][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-07 10:36:59,912][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-07 11:04:20,573][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-07 11:04:20,575][asyncio][WARNING] - socket.send() raised exception.
+[2026-08-10 06:26:17,293][dinov2][INFO] - using MLP layer as FFN
+[2026-08-10 06:31:31,077][dinov2][INFO] - using MLP layer as FFN
+[2026-08-10 06:33:58,084][dinov2][INFO] - using MLP layer as FFN

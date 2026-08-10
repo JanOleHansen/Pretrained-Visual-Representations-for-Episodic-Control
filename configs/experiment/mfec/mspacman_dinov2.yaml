@@ -29,7 +29,7 @@ trainer:
   # matching mspacman.yaml so the encoder arms share an x-axis.
   # (The previous 40_000_100 here was a units slip: that is 160M emulator
   # frames, 4x the paper budget.)
-  total_frames: 12_500_000
+  total_frames: 1_000_000
   seed: 42
   accelerator: gpu
   devices: [0]
@@ -39,7 +39,7 @@ trainer:
   # whole point of episodic control.  4 matches mspacman.yaml; DINOv2 makes the
   # temptation to raise it stronger (the ViT forward is the bottleneck) but the
   # sample-efficiency cost is the same.
-  num_envs: 4
+  num_envs: 16
   log_every_n_steps: 10_000
-  eval_every_n_steps: 200_000   # 200k decisions = 800k emulator frames
-  num_eval_episodes: 5
+  eval_every_n_steps: 50_000
+  num_eval_episodes: 10

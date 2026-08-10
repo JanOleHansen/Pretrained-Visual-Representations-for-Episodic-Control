@@ -42,15 +42,15 @@ algorithm:
   # entries its Q is +inf (mapped to 1e9), so argmax degenerates to action 0.
   # Annealing over 50k agent steps (200k raw frames) keeps real exploration
   # alive until the DND is populated.
-  eps_end: 0.001
+  eps_end: 0.05
   annealing_frames: 50_000
   init_random_frames: 12_500
 
 trainer:
-  # 10_000_100 agent steps == 40M raw ALE frames, matching the paper's x-axis
+  # 1_000_000 agent steps == 40M raw ALE frames, matching the paper's x-axis
   # and the MFEC Ms. Pac-Man run. For the directly-comparable Table 3 number
   # (NEC Ms. Pac-Man = 4142.8 at 10M frames) use total_frames=2_500_100.
-  total_frames: 10_000_100
+  total_frames: 1_000_000
   seed: 42
   accelerator: gpu
   devices: [0]
@@ -65,4 +65,4 @@ trainer:
   # 50_000 agent steps == every 200k raw frames, per paper §4 ("We evaluate
   # MFEC and NEC every 200.000 frames").
   eval_every_n_steps: 50_000
-  num_eval_episodes: 5
+  num_eval_episodes: 10

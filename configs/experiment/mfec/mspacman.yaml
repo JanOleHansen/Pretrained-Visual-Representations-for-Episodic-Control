@@ -18,7 +18,7 @@ trainer:
   #     paper frames = 4 x (this axis)
   #
   # 12.5M decisions = 50M emulator frames = the full x-range of Figure 1.
-  total_frames: 12_500_000
+  total_frames: 1_000_000
   seed: 42
   accelerator: gpu
   devices: [0]
@@ -27,7 +27,7 @@ trainer:
   # num_envs buys throughput at the cost of the one-shot latching that is the
   # whole point of episodic control.  4 is the compromise; raise it if
   # wall-clock hurts more than sample efficiency.
-  num_envs: 4
+  num_envs: 16
   log_every_n_steps: 10_000
-  eval_every_n_steps: 200_000   # 200k decisions = 800k emulator frames
-  num_eval_episodes: 5
+  eval_every_n_steps: 50_000   # 50k decisions = 200k emulator frames
+  num_eval_episodes: 10
