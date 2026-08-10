@@ -1197,12 +1197,40 @@ switches it on.
 | Metric | Reads |
 |---|---|
 | `eval/epsilon` | the exploration rate evaluation actually ran at |
-| `eval/dnd_top_weight` | mean `max_i w_i / Σ_i w_i`. **At `1/k` (0.02 at the paper's k=50) the kernel is a flat mean over all `k` neighbours**, every action of a state scores alike, and the argmax is noise however full the tables are. This is NEC's analogue of MFEC's hit rate. |
+| `eval/dnd_top_weight` | mean `max_i w_i / Σ_i w_i`. **Do not compare this against `1/k`** — see the calibration note below. Useful as a *trend*: it should lift when stored states are queried back. |
 | `eval/dnd_nn_dist` | mean L2 from the query to its nearest stored key. Embeddings are unit-norm, so this is bounded by 2 and comparable across runs; drifting upward means stored keys are going stale faster than `dnd_key_lr` refreshes them. |
 | `eval/dnd_optimistic_rate` | fraction of *(state, action)* pairs still answered with the `+inf` sentinel (`size <= k`). Above 0 late in a run means an action is starved and argmax is chasing the sentinel. |
 
 Denominator is every *(state, action)* pair (all `\|A\|` per frame), matching
 MFEC's eval-side convention and **not** comparable to any `train/*` counter.
+
+#### Calibrating `eval/dnd_top_weight`
+
+An earlier version of this section claimed that `top_weight` near `1/k` meant
+the kernel had degenerated and the memory was unused. **That is wrong.** With
+`k` = 50 in 64 dimensions the 1st and 50th neighbour sit at nearly the same
+distance, so the inverse-distance weights are near-uniform even for a good
+retriever. Measured on 6000 real Ms. Pac-Man frames, predicting held-out
+discounted return-to-go:
+
+| retriever | Pearson r | rmse vs predict-the-mean | `top_weight` |
+|---|---|---|---|
+| NEC embedding (shipped) | +0.50 | -14.7 % | 0.025 |
+| raw pixels (k-NN reference) | +0.60 | -20.3 % | 0.029 |
+| centre-then-normalise | +0.40 | -7.1 % | 0.033 |
+
+So near-`1/k` is the normal reading, and a *higher* `top_weight` is not
+automatically better — centring the embedding raises `top_weight` while making
+retrieval measurably **worse**. Judge retrieval by the returns, and use
+`top_weight` only for the exact-re-encounter signal it was added for.
+
+Related, and also measured: `kernel_delta` = 1e-3 is ~20 % of the typical
+squared neighbour distance under the shipped L2-normalised embedding
+(d^2 ~ 4e-3), so the paper's division-by-zero *guard* is not negligible the way
+the paper assumes. Dropping it to 1e-5 is a small, consistent improvement
+(r +0.50 -> +0.51) and stays 22x above the float32 error floor of the
+`2 - 2*sim` fast path in `_topk_l2_unit` (measured 4.5e-7). It is **not**
+changed by default — the gain is marginal and 1e-3 is the published value.
 
 ### 7. `eval_eps` and `eps_end` must not drift apart
 

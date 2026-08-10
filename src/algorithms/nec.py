@@ -1919,11 +1919,25 @@ class NECAlgorithm(BaseAlgorithm):
 
         1. **The memory holds a bad policy.** Returns are low, the kernel is
            peaked, the neighbours are close. Train longer / tune the DND.
-        2. **The memory is not being used.** ``dnd_top_weight`` sits near
-           ``1/k`` (0.02 at the paper's k=50), so Q is a flat mean over 50
-           stored values, every action of a state scores alike, and the argmax
-           is noise. Returns then look like a bad policy but the policy is not
-           the problem.
+        2. **The memory is not being used.** Judge this from
+           ``dnd_top_weight`` only against the calibration below — **not**
+           against ``1/k``. An earlier version of this docstring claimed that
+           ``top_weight`` near ``1/k`` (0.02 at the paper's k=50) meant the
+           kernel had degenerated to a flat mean; that is wrong, and acting on
+           it costs a wrong diagnosis. Measured on 6000 real Ms. Pac-Man
+           frames, predicting held-out discounted return-to-go:
+
+               retriever                     Pearson r   top_weight
+               NEC embedding (shipped)         +0.50       0.025
+               raw pixels (k-NN reference)     +0.60       0.029
+
+           A retriever that beats the predict-the-mean baseline by 15% still
+           sits at 0.029, because with ``k`` = 50 in 64 dimensions the 1st and
+           50th neighbour are always at nearly the same distance. Near-``1/k``
+           is the *normal* reading. What ``top_weight`` genuinely detects is
+           the exact-re-encounter case: a stored state queried back should
+           dominate its neighbours, and if that never lifts the average then
+           the DND is being written and read in different embedding spaces.
         3. **The evaluation policy is not the policy that was trained.** This
            is why ``eval/epsilon`` is reported here, right next to the
            returns. ``eval_eps`` and the annealed training floor ``eps_end``

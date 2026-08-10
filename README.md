@@ -667,7 +667,7 @@ hit rate.
 | Metric | What a bad value means |
 |---|---|
 | `eval/epsilon` | Compare with `train/epsilon`. `eval_eps` (in `nec_atari.yaml`) and `eps_end` (per-experiment) are independent knobs, so a run can train one policy and score another. `setup()` warns when they differ by more than 10x. |
-| `eval/dnd_top_weight` | Share of kernel mass on the nearest neighbour. At `1/k` (0.02 at k=50) the kernel is a flat mean over all `k` neighbours — every action of a state scores alike and the argmax is noise, however full the tables are. |
+| `eval/dnd_top_weight` | Share of kernel mass on the nearest neighbour. **Do not read this against `1/k`**: with k=50 in 64-d even a strong retriever sits at ~0.03 (a raw-pixel k-NN reference measures 0.029). Watch the trend, not the level; a *higher* value is not automatically better. |
 | `eval/dnd_nn_dist` | Mean L2 to the nearest stored key. Embeddings are unit-norm so this is bounded by 2; drifting upward means stored keys go stale faster than `dnd_key_lr` refreshes them. |
 | `eval/dnd_optimistic_rate` | Fraction of *(state, action)* pairs still answered with the `+inf` sentinel. Above 0 late in a run means a starved action is capturing the argmax. |
 | `train/dnd_blend_rate` | **Not** expected near 0 on Atari. Duplicate frames (the opening freeze, the pause after each death) are 17.6 % of a Ms. Pac-Man rollout, and they blend legitimately. 0.1–0.5 is normal here. |
