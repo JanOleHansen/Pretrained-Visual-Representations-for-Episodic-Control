@@ -57,6 +57,11 @@ Usage
     python scripts/encoder_diagnostics.py                       # random projection only
     python scripts/encoder_diagnostics.py \
         --dinov2-weights /datahome/rschwinger/models/dinov2_vits14_pretrain.pth
+    python scripts/encoder_diagnostics.py --clip --resnet       # every PVM arm
+    python scripts/encoder_diagnostics.py --clip --device cuda  # key stability!
+
+The CLIP arm needs the optional ``open_clip_torch`` package
+(``uv add open_clip_torch``); nothing else here does.
 
 ``--dinov2-random-init`` builds the ViT architecture with *untrained* weights.
 That tells you nothing about representation quality, but the numerics (and
@@ -294,6 +299,36 @@ def build_encoders(args) -> list[tuple[str, object, str]]:
         out.append((label, enc, "mspacman_mfec_train_rgb"))
 
 
+    if args.clip or args.clip_weights or args.clip_random_init:
+        from src.encoders.clip_encoder import CLIPEncoder
+
+        # No _RandomInit subclass is needed here, unlike DINOv2/ResNet:
+        # open_clip builds an untrained model when `pretrained` is None, and
+        # CLIPEncoder passes that straight through.  Same caveat applies —
+        # valid for the key-stability columns ONLY, not for AUC or contrast.
+        if args.clip_random_init:
+            enc = CLIPEncoder(
+                weights_path=None,
+                pretrained_tag=None,
+                model_name=args.clip_model,
+                image_size=args.clip_image_size,
+                normalize=not args.clip_no_normalize,
+            )
+            label = f"CLIP {args.clip_model} RANDOM-INIT ({enc.state_dim}-d)"
+        else:
+            enc = CLIPEncoder(
+                weights_path=args.clip_weights,
+                pretrained_tag=args.clip_pretrained,
+                model_name=args.clip_model,
+                image_size=args.clip_image_size,
+                normalize=not args.clip_no_normalize,
+            )
+            label = f"CLIP {args.clip_model} ({enc.state_dim}-d)"
+        if enc.normalize:
+            label += " L2"
+
+        out.append((label, enc, "mspacman_mfec_train_rgb"))
+
     if args.vae_checkpoint:
         from src.encoders.vae_encoder import VAEEncoder
 
@@ -337,7 +372,25 @@ def main() -> int:
     p.add_argument("--resnet-model", default="resnet18",
                    help="any torchvision resnet: resnet18/34/50/101/152")
     p.add_argument("--resnet-image-size", type=int, default=224)
-
+    # clip -- needs the optional `open_clip_torch` package (uv add open_clip_torch)
+    p.add_argument("--clip", action="store_true",
+                   help="add a CLIP vision-tower arm (open_clip downloads the "
+                        "weights unless --clip-weights is given)")
+    p.add_argument("--clip-weights", default=None,
+                   help="local open_clip checkpoint for offline boxes; implies --clip")
+    p.add_argument("--clip-random-init", action="store_true",
+                   help="build the CLIP ViT untrained: valid for key stability ONLY")
+    p.add_argument("--clip-model", default="ViT-B-32",
+                   help="open_clip architecture name, hyphenated: ViT-B-32, "
+                        "ViT-B-16, ViT-L-14 (NOT OpenAI's 'ViT-B/32')")
+    p.add_argument("--clip-pretrained", default="openai",
+                   help="open_clip pretrained tag, used only when "
+                        "--clip-weights is absent (e.g. openai, laion2b_s34b_b79k)")
+    p.add_argument("--clip-image-size", type=int, default=None,
+                   help="default None = the backbone's native resolution")
+    p.add_argument("--clip-no-normalize", action="store_true",
+                   help="skip the L2 normalisation, i.e. do NOT put MFEC's "
+                        "Euclidean kNN on CLIP's cosine metric (ablation)")
 
     p.add_argument("--vae-checkpoint", default=None)
     p.add_argument("--device", default="cpu",
@@ -361,7 +414,8 @@ def main() -> int:
     encoders = build_encoders(args)
     if len(encoders) == 1:
         print("NOTE: only the random-projection baseline was built. Pass "
-              "--dinov2-weights (or --dinov2-random-init) to compare arms.\n")
+              "--dinov2-weights, --resnet or --clip (or their *-random-init "
+              "variants) to compare arms.\n")
 
     frame_cache: dict[str, torch.Tensor] = {}
     rows = []

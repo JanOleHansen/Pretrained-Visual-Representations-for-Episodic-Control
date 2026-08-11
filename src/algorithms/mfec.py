@@ -214,6 +214,17 @@ class MFECAlgorithm(BaseAlgorithm):
             resnet_weights_path: str | None = None,
             resnet_model_name: str = "resnet18",
             resnet_image_size: int = 224,
+            # clip — needs the optional `open_clip_torch` package, imported
+            # lazily so the other encoders do not depend on it.
+            clip_weights_path: str | None = None,
+            clip_model_name: str = "ViT-B-32",
+            clip_pretrained_tag: str | None = "openai",
+            clip_image_size: int | None = None,
+            # L2-normalise phi, making MFEC's Euclidean kNN equal to the cosine
+            # metric CLIP's contrastive objective was trained on.  Set False to
+            # ablate that choice.
+            clip_normalize: bool = True,
+            clip_interpolation: str = "bicubic",
 
     ) -> None:
 
@@ -242,6 +253,13 @@ class MFECAlgorithm(BaseAlgorithm):
         self.resnet_weights_path = resnet_weights_path
         self.resnet_model_name = resnet_model_name
         self.resnet_image_size = resnet_image_size
+        #clip
+        self.clip_weights_path = clip_weights_path
+        self.clip_model_name = clip_model_name
+        self.clip_pretrained_tag = clip_pretrained_tag
+        self.clip_image_size = clip_image_size
+        self.clip_normalize = clip_normalize
+        self.clip_interpolation = clip_interpolation
 
         self._collected_frames = 0
 
@@ -279,7 +297,14 @@ class MFECAlgorithm(BaseAlgorithm):
             #resnet
             resnet_weights_path=self.resnet_weights_path,
             resnet_model_name=self.resnet_model_name,
-            resnet_image_size=self.resnet_image_size
+            resnet_image_size=self.resnet_image_size,
+            #clip
+            clip_weights_path=self.clip_weights_path,
+            clip_model_name=self.clip_model_name,
+            clip_pretrained_tag=self.clip_pretrained_tag,
+            clip_image_size=self.clip_image_size,
+            clip_normalize=self.clip_normalize,
+            clip_interpolation=self.clip_interpolation,
         )
 
         # Detect number of parallel envs from the proof env's batch_size.

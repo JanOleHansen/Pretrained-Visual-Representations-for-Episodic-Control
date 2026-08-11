@@ -1,0 +1,91 @@
+# @package _global_
+# MFEC on ALE/MsPacman-v5 with a frozen CLIP vision tower as φ — the
+# contrastive-PVM arm of the encoder ablation, against mspacman.yaml (random
+# projection), mspacman_vae.yaml (paper-exact VAE), mspacman_dinov2.yaml
+# (self-supervised ViT) and mspacman_resnet.yaml (supervised ResNet).
+#
+# WHY CLIP IS THE STRONGEST A-PRIORI PVM CANDIDATE HERE.  MFEC uses φ as a
+# *metric* — the whole decision rule is "which stored key is nearest".  CLIP is
+# the only one of the three foundation models whose pretraining objective is
+# itself a metric on the embedding space (contrastive image-text similarity);
+# DINOv2's self-distillation and MAE's reconstruction are not.  CLIPEncoder
+# therefore returns the *projected* embedding and L2-normalises it, which makes
+# MFEC's Euclidean kNN exactly the cosine kNN CLIP was trained under.  See
+# src/encoders/clip_encoder.py.
+#
+# REQUIRES `open_clip_torch`, which is an optional dependency:
+#     uv add open_clip_torch
+# and a local checkpoint on an offline cluster (see algorithm.clip_weights_path).
+defaults:
+  - override /algorithm: mfec_atari
+  - override /environment: mspacman_mfec_train_rgb
+  - override /environment@eval_environment: mspacman_mfec_eval_rgb
+  - _self_
+
+run:
+  algorithm: mfec
+  game: mspacman
+
+algorithm:
+  encoder_name: clip
+
+  # null -> open_clip downloads `clip_pretrained_tag` from its hub, which needs
+  # network access.  On an offline node, fetch the checkpoint once elsewhere and
+  # point this at the local file, exactly as dinov2_weights does.
+  clip_weights_path: null
+
+  # open_clip spells architectures with hyphens ("ViT-B-32"), NOT OpenAI's
+  # "ViT-B/32".  ViT-B-32 is the cheap choice: 49 patch tokens against
+  # ViT-B-16's 196, i.e. roughly 4x less attention for the same parameter
+  # count, and the ViT forward is this pipeline's bottleneck.
+  clip_model_name: ViT-B-32
+  clip_pretrained_tag: openai
+
+  # null = the backbone's native resolution (224).  Anything else is passed to
+  # open_clip as force_image_size, which interpolates positional embeddings
+  # away from the pretraining resolution — only set it deliberately.
+  clip_image_size: null
+
+  # L2-normalise φ so Euclidean kNN == cosine kNN. Set false to ablate.
+  clip_normalize: true
+  # CLIP's own preprocessing uses bicubic.  Set "bilinear" to hold resizing
+  # identical to the DINOv2/ResNet arms if you would rather control for it than
+  # give each backbone its native pipeline.
+  clip_interpolation: bicubic
+
+  # Informational only — CLIPEncoder overwrites state_dim from a real forward
+  # pass (512 for the projected ViT-B-32/ViT-B-16 embedding, 768 for ViT-L-14).
+  # Keep it truthful anyway: it sizes the zero-length fallback tensor in
+  # MFECAlgorithm._embed_observations, and the QEC memory arithmetic below.
+  state_dim: 512
+
+  # QEC MEMORY.  QEC._init_states allocates the whole buffer eagerly as
+  # (num_actions, buffer_size, state_dim) float32, so with 9 Ms. Pac-Man
+  # actions the default buffer_size of 1e6 costs 9 * 1e6 * 512 * 4 = 18.4 GB of
+  # GPU memory before a single frame is collected.  Measured peak usage on a
+  # 1M-decision run is ~40k entries per action (train/qec_size), so 100k leaves
+  # 2.5x headroom at 1.84 GB.
+  #
+  # This is INERT, not a hyperparameter change: eviction never fires while
+  # buffer_size exceeds the peak, so results are identical to buffer_size=1e6.
+  # It stops being inert on a longer run — a 12.5M-decision budget will exceed
+  # 100k entries per action, at which point LRU eviction starts and the
+  # algorithm genuinely changes.  Raise it (and the GPU) for those.
+  buffer_size: 100_000
+
+trainer:
+  # UNITS: total_frames counts agent *decisions*; the paper's x-axis counts ALE
+  # emulator frames at 4 per decision.  1M decisions = 4M emulator frames.
+  # Matches mspacman.yaml and mspacman_dinov2.yaml so the encoder arms share an
+  # x-axis.
+  total_frames: 1_000_000
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  num_envs: 16
+  log_every_n_steps: 10_000
+  eval_every_n_steps: 50_000
+  # eval_eps=0.0 (see configs/algorithm/mfec_atari.yaml) makes every eval
+  # episode identical on a deterministic ALE, so N>1 buys N copies of one
+  # number at N times the cost.
+  num_eval_episodes: 1

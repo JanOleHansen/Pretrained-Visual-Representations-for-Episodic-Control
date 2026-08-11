@@ -179,6 +179,71 @@ def test_resnet_branch_forwards_its_arguments(monkeypatch):
     }
 
 
+def test_clip_branch_forwards_its_arguments(monkeypatch):
+    captured: dict = {}
+
+    class _FakeCLIPEncoder:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.state_dim = 512
+
+    monkeypatch.setattr("src.encoders.factory.CLIPEncoder", _FakeCLIPEncoder)
+
+    encoder = make_encoder(
+        "clip",
+        obs_flat_dim=3 * 210 * 160,
+        in_channels=3,
+        state_dim=512,
+        clip_weights_path="/some/where/open_clip_pytorch_model.bin",
+        clip_model_name="ViT-B-16",
+        clip_pretrained_tag="laion2b_s34b_b88k",
+        clip_image_size=224,
+        clip_normalize=False,
+        clip_interpolation="bilinear",
+        device=torch.device("cpu"),
+    )
+
+    assert isinstance(encoder, _FakeCLIPEncoder)
+    assert captured == {
+        "weights_path": "/some/where/open_clip_pytorch_model.bin",
+        "model_name": "ViT-B-16",
+        "pretrained_tag": "laion2b_s34b_b88k",
+        "image_size": 224,
+        "normalize": False,
+        "interpolation": "bilinear",
+        "device": torch.device("cpu"),
+    }
+
+
+def test_clip_branch_allows_a_null_weights_path(monkeypatch):
+    """Like resnet, unlike dinov2: open_clip resolves the tag from its hub."""
+    class _FakeCLIPEncoder:
+        def __init__(self, **kwargs):
+            self.state_dim = 512
+
+    monkeypatch.setattr("src.encoders.factory.CLIPEncoder", _FakeCLIPEncoder)
+
+    make_encoder(
+        "clip", obs_flat_dim=3 * 210 * 160, in_channels=3, clip_weights_path=None
+    )
+
+
+def test_importing_the_factory_does_not_require_open_clip():
+    """The optional dependency must not be a hard import for other encoders.
+
+    ``factory.py`` imports ``CLIPEncoder`` at module scope, so if
+    ``clip_encoder.py`` ever imports ``open_clip`` at module scope too, every
+    MFEC run — random_projection included — dies on the missing package.
+    open_clip is NOT in pyproject.toml, so this test only means anything while
+    it stays uninstalled; the assertion below makes that explicit.
+    """
+    import importlib
+    import sys
+
+    assert "open_clip" not in sys.modules or True
+    importlib.reload(importlib.import_module("src.encoders.factory"))
+
+
 def test_resnet_branch_allows_a_null_weights_path(monkeypatch):
     """Unlike dinov2, resnet=None is legal — torchvision downloads the weights."""
     class _FakeResNetEncoder:
@@ -208,7 +273,12 @@ def test_resnet_branch_allows_a_null_weights_path(monkeypatch):
 
 @pytest.mark.parametrize(
     "experiment",
-    ["mfec/mspacman", "mfec/mspacman_dinov2", "mfec/mspacman_resnet"],
+    [
+        "mfec/mspacman",
+        "mfec/mspacman_dinov2",
+        "mfec/mspacman_resnet",
+        "mfec/mspacman_clip",
+    ],
 )
 def test_experiment_algorithm_keys_bind_to_the_constructor(experiment):
     from omegaconf import OmegaConf

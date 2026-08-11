@@ -3,6 +3,10 @@ from .random_projectins import RandomProjectionEncoder
 from .vae_encoder import VAEEncoder
 from .dino_v2_encoder import DINOv2Encoder
 from .resnet_encoder import ResNetEncoder
+# Safe to import at module scope: clip_encoder.py imports `open_clip` lazily,
+# inside CLIPEncoder.__init__.  A top-level import there would make the missing
+# optional dependency break *every* MFEC run, not just the clip arm.
+from .clip_encoder import CLIPEncoder
 
 
 def make_encoder(
@@ -23,6 +27,13 @@ def make_encoder(
         resnet_weights_path: str | None = None,
         resnet_model_name: str = "resnet18",
         resnet_image_size: int = 224,
+        # clip
+        clip_weights_path: str | None = None,
+        clip_model_name: str = "ViT-B-32",
+        clip_pretrained_tag: str | None = "openai",
+        clip_image_size: int | None = None,
+        clip_normalize: bool = True,
+        clip_interpolation: str = "bicubic",
 ):
     """Build MFEC's φ.
 
@@ -56,5 +67,18 @@ def make_encoder(
             weights_path=resnet_weights_path,
             image_size=resnet_image_size,
             device=device,
+        )
+    if name == "clip":
+        # weights_path=None is legal (like resnet, unlike dinov2): open_clip
+        # resolves clip_pretrained_tag from its hub, which needs network
+        # access.  Pass a path on an offline cluster.
+        return CLIPEncoder(
+            weights_path=clip_weights_path,
+            model_name=clip_model_name,
+            pretrained_tag=clip_pretrained_tag,
+            image_size=clip_image_size,
+            device=device,
+            normalize=clip_normalize,
+            interpolation=clip_interpolation,
         )
     raise ValueError(f"Unknown encoder name: {name}")
