@@ -22,9 +22,12 @@ Coverage:
      pre-refactor inline block.
   4. Config-swap smoke -- `setup()` + `step()` end-to-end with a deliberately
      different (test-only) factory, so pluggability is proven, not assumed.
-  5. DINOv2 finetune scaffolding -- YAML composes and the factory builds a
-     module with trainable params, against a STUB backbone (no downloads,
-     mirroring tests/test_dinov2_encoder.py's approach for MFEC).
+  5. DINOv2 group selection -- YAML composes and the factory builds a module
+     with trainable params, against a STUB backbone (no downloads, mirroring
+     tests/test_dinov2_encoder.py's approach for MFEC). This file covers only
+     the *config-group seam*; DINOv2Embedding's own behaviour (channel
+     adapter, param groups, finetuning through NEC's loop, and the real
+     ViT-S/14) lives in tests/test_nec_dinov2_finetune.py.
 """
 from __future__ import annotations
 
@@ -398,7 +401,12 @@ def test_setup_and_step_with_a_different_embedding_network():
 
 
 # ---------------------------------------------------------------------------
-# 5. DINOv2 finetune scaffolding -- stubbed backbone, no network calls
+# 5. DINOv2 group selection -- stubbed backbone, no network calls
+#
+# Only the config-group seam is checked here. Everything DINOv2-specific --
+# the channel adapter's init, param_groups, whether NEC's loop actually
+# finetunes the backbone, and the real ViT-S/14 -- is in
+# tests/test_nec_dinov2_finetune.py.
 # ---------------------------------------------------------------------------
 
 STUB_EMBED_DIM = 32

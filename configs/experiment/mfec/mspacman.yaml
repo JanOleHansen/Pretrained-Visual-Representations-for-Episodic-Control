@@ -9,6 +9,20 @@ defaults:
   - override /environment@eval_environment: mspacman_mfec_eval
   - _self_
 
+algorithm:
+  # QEC MEMORY.  Held identical to the PVM arms (mspacman_dinov2 / _clip) so
+  # the encoder ablation differs only in the encoder.  QEC._init_states
+  # allocates (num_actions, buffer_size, state_dim) float32 eagerly: at the
+  # mfec_atari default of 1e6 that is 9 * 1e6 * 64 * 4 = 2.3 GB even for the
+  # 64-d random projection.  Measured peak on this 1M-decision budget is ~40k
+  # entries per action, so 100k keeps 2.5x headroom.
+  #
+  # INERT at this budget: eviction never fires while buffer_size exceeds the
+  # peak, so results are unchanged relative to buffer_size=1e6.  On the 12.5M
+  # budget of mspacman_5seed.yaml it would NOT be inert, which is why that
+  # config keeps the 1e6 default.
+  buffer_size: 100_000
+
 trainer:
   # UNITS: total_frames counts agent *decisions* (StepTrainer does
   # `self._step += batch.numel()`), while the paper's x-axis counts ALE

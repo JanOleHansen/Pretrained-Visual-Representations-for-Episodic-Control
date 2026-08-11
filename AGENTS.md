@@ -339,8 +339,8 @@ src/
                               NEC embedding networks — NECEmbeddingNetwork
                               (contract Protocol), NatureEmbedding (CNN trunk,
                               no Q-head; default), DINOv2Embedding (finetunable
-                              ViT; SCAFFOLDING, see "Adding a new NEC embedding
-                              network")
+                              ViT + channel adapter + param_groups; see
+                              "Adding a new NEC embedding network")
   algorithms/
     base.py                 — BaseAlgorithm ABC; TrainingState and CollectorConfig dataclasses
     dqn.py                  — DQNAlgorithm; replay/network factories (defaults + setup contract)
@@ -354,6 +354,10 @@ src/
     factory.py               — make_encoder(name, ...)
     random_projectins.py    — RandomProjectionEncoder (default; filename has a typo, kept as-is)
     vae_encoder.py           — VAEEncoder (frozen ConvVAE, embeds mean ++ log-std)
+    dino_v2_encoder.py       — DINOv2Encoder (frozen ViT, CLS token, ImageNet stats)
+    resnet_encoder.py        — ResNetEncoder (frozen ImageNet ResNet, pooled features)
+    clip_encoder.py          — CLIPEncoder (frozen CLIP vision tower, projected + L2;
+                              needs the OPTIONAL open_clip_torch package, imported lazily)
   models/
     conv_vae.py              — ConvVAE (Blundell et al. 2016 App. D architecture);
                               vae_loss/gaussian_nll/kl_diag_gaussian used by train_vae.py
@@ -387,7 +391,8 @@ configs/
   algorithm/embedding_network/  — NEC encoder config group (swap with
                               `algorithm/embedding_network=<name>`)
     nature.yaml             — NatureDQN trunk + dense layer (DEFAULT; the paper's net)
-    dinov2_finetune.yaml    — finetunable DINOv2 ViT (SCAFFOLDING, unvalidated)
+    dinov2_finetune.yaml    — finetunable DINOv2 ViT (weights_path required;
+                              image_size is the throughput knob)
   environment/cartpole.yaml — env kwargs (name, transforms)
   environment/pong_train.yaml     — Atari Pong (training transforms incl. EndOfLife + Sign + VecNorm; DQN only)
   environment/pong_mfec_train.yaml — Atari Pong for MFEC (same stack WITHOUT VecNorm; see note below)
@@ -444,6 +449,11 @@ configs/
                               resnet18, state_dim=512) + the mspacman_mfec_*_rgb env pair.
                               resnet_weights_path may be null (torchvision downloads
                               IMAGENET1K_V1); set a path on an offline cluster.
+  experiment/mfec/mspacman_clip.yaml — same, with encoder_name=clip (frozen CLIP ViT-B-32
+                              vision tower, projected + L2-normalised, state_dim=512) + the
+                              mspacman_mfec_*_rgb env pair.  Needs the optional
+                              open_clip_torch package; clip_weights_path may be null
+                              (open_clip downloads), set a path on an offline cluster.
   experiment/nec/pong.yaml     — NEC on Pong (10M agent steps = 40M raw frames, num_envs=16);
                               keeps the clipped env — Pong's rewards are already in [-1, 1]
                               so SignTransform is a no-op there, not a deviation
@@ -451,21 +461,38 @@ configs/
                               uses hero_nec_train (unclipped)
   experiment/nec/mspacman.yaml — NEC on Ms. Pac-Man (10M agent steps = 40M raw frames,
                               num_envs=8); uses mspacman_nec_train (unclipped)
+  experiment/nec/mspacman_dinov2.yaml — same task and env pair, with the embedding_network
+                              group swapped to dinov2_finetune (finetuned ViT-S/14) and
+                              run.encoder=dinov2 so the run dir does not collide.  The
+                              PVM arm of the NEC encoder ablation against mspacman.yaml.
+                              weights_path is required and the checked-in path is
+                              cluster-local.  NOTE it keeps the 4x84x84 NEC env, unlike
+                              MFEC's DINOv2 arm which needs an RGB env pair — the
+                              finetuned adapter handles channels, a frozen ViT cannot
   logger/{wandb,tensorboard}.yaml
   paths/default.yaml
   train.yaml, eval.yaml, train_vae.yaml
 tests/
   test_env_seeding.py       — ParallelEnv workers get reproducible, non-colliding streams;
                               a num_envs=1 env must not re-seed the parent process
-  test_smoke.py             — DQN-on-CartPole, DQN-on-Pong, DDPG-on-HalfCheetah, A2C-on-HalfCheetah, MFEC-on-Pong, NEC-on-Pong smoke tests
+  test_smoke.py             — DQN-on-CartPole, DQN-on-Pong, DDPG-on-HalfCheetah, A2C-on-HalfCheetah, MFEC-on-Pong, NEC-on-Pong, NEC-on-Pong-with-DINOv2 smoke tests
   test_mfec_encoder_refactor.py — encoder-abstraction transparency: setup() wiring, embed()
                               shape/determinism, forward(), deepcopy sharing, checkpoint round-trip
   test_mfec_estimator_gap.py — eval_eps defaults to 0.0 (greedy eval) and QEC exposes the
                               exact-vs-kNN estimator gap as eval/exact_minus_knn_value
+  test_clip_encoder.py      — CLIP PVM encoder: lazy open_clip import, projected+L2 output,
+                              CLIP (not ImageNet) stats, no centre crop, determinism,
+                              state round-trip, and an MFEC end-to-end run on the RGB env.
+                              Runs against a stub open_clip, so CI needs no package.
   test_nec_embedding_network.py — NEC embedding-network config group: shape/dtype contract,
                               gradient flow (proves the encoder is genuinely trainable),
                               Hydra-composition architecture regression, config-swap
-                              setup()+step() end-to-end, DINOv2 scaffolding (stub backbone)
+                              setup()+step() end-to-end, DINOv2 group selection (stub backbone)
+  test_nec_dinov2_finetune.py — DINOv2Embedding itself: channel-adapter init, param_groups
+                              and setup()'s use of them, finetuning through step(),
+                              gradients reaching the backbone, checkpoint round-trip.
+                              Second tier (NEC_DINOV2_REAL=1, NEC_DINOV2_REPO_DIR=... if
+                              offline) builds the genuine dinov2_vits14
 ```
 
 ## Adding a new algorithm
@@ -749,8 +776,76 @@ collector's policy uses), same as `qec`.
 Available: `random_projection` (default), `vae`, `dinov2`, `resnet`
 (frozen ImageNet ResNet, `src/encoders/resnet_encoder.py`; `state_dim` comes
 off `fc.in_features`, `fc` becomes `nn.Identity`, and `weights_path=None` is
-legal — torchvision downloads `IMAGENET1K_V1`). The RGB backbones share the
-`mspacman_mfec_train_rgb` / `mspacman_mfec_eval_rgb` env pair.
+legal — torchvision downloads `IMAGENET1K_V1`), and `clip`. The RGB backbones
+(`dinov2`, `resnet`, `clip`) share the `mspacman_mfec_train_rgb` /
+`mspacman_mfec_eval_rgb` env pair.
+
+### `clip` — an OPTIONAL dependency, imported lazily
+
+`CLIPEncoder` (`src/encoders/clip_encoder.py`) needs `open_clip_torch`, which
+is deliberately **not** in `pyproject.toml` (`uv add open_clip_torch` to get
+it). `factory.py` imports `CLIPEncoder` at module scope, so `clip_encoder.py`
+must keep `import open_clip` **inside `__init__`** — hoisting it to module
+scope makes the missing package break every MFEC run, `random_projection`
+included. Pinned by
+`tests/test_encoder_factory.py::test_importing_the_factory_does_not_require_open_clip`.
+The whole test file for it runs with a stub `open_clip` injected into
+`sys.modules`, so CI never needs the package.
+
+Three choices in it are load-bearing and follow from MFEC using φ as a
+**metric**, not as network input:
+
+1. **Projected embedding, not the pre-projection token.** `model.visual` is
+   what open_clip's `encode_image` calls, and it includes the projection into
+   the joint image-text space (512-d for ViT-B-32/ViT-B-16). That projection
+   is where the contrastive loss lives. `timm`'s CLIP entries expose the 768-d
+   pre-projection pooled token instead — do not swap to them without knowing
+   this. Keeping only `visual` also drops the ~63 M-param text tower.
+2. **L2 normalisation, on by default.** `‖a−b‖² = 2 − 2·cos(a,b)` on the unit
+   sphere, so MFEC's Euclidean kNN becomes exactly cosine kNN — the metric
+   CLIP was trained under. It also pins `‖φ‖` to 1.0, making the QEC's
+   *relative* near-exact tolerance `3e-5·(1+1) = 6e-5`, tighter than the random
+   projection's 9.8e-5 (i.e. conservative — unlike DINOv2, whose `‖φ‖ ≈ 20`
+   widens it ~6×). `clip_normalize: false` ablates it.
+3. **CLIP's own mean/std and no centre crop.** The constants differ from
+   ImageNet's, and stock CLIP inference uses the former; `ResNetEncoder` and
+   `DINOv2Encoder` correctly use ImageNet's because *their* backbones were
+   trained with them. The centre crop in CLIP's reference pipeline would cut a
+   210×160 Atari frame down to its middle and discard the maze edges and the
+   score row, so the whole frame is resized instead — losing pixels is worse
+   than distorting them when the embedding is a memory key.
+
+Model names use open_clip's hyphenated spelling (`ViT-B-32`), not OpenAI's
+`ViT-B/32`. Like `resnet` and unlike `dinov2`, `clip_weights_path: null` is
+legal — open_clip then resolves `clip_pretrained_tag` over the network, so set
+a path on an offline cluster.
+
+Same float32-ViT key-stability caveat as DINOv2: run
+`scripts/encoder_diagnostics.py --clip --device cuda` on the training GPU and
+require `key b/s == 1.000` before trusting a run.
+
+### QEC memory is sized by `state_dim`, and it is not small
+
+`QEC._init_states` allocates `(num_actions, buffer_size, state_dim)` float32
+**eagerly**, so a wider encoder costs GPU memory before a frame is collected.
+On Ms. Pac-Man's 9 actions at the `mfec_atari` default `buffer_size: 1_000_000`:
+
+| encoder | `state_dim` | eager allocation |
+|---|---|---|
+| `random_projection` | 64 | 2.3 GB |
+| `dinov2` ViT-S/14 | 384 | 13.8 GB |
+| `resnet` resnet18 / `clip` ViT-B-32 | 512 | 18.4 GB |
+| `dinov2` ViT-B/14, `clip` ViT-L-14 | 768 | 27.6 GB |
+
+Measured peak on a 1M-decision run is ~40 k entries per action
+(`train/qec_size`), so the 1M default is ~25× oversized. The 1M-decision
+experiment configs (`mspacman`, `mspacman_dinov2`, `mspacman_clip`) therefore
+set `buffer_size: 100_000`, which is **inert** — LRU eviction never fires while
+`buffer_size` exceeds the peak, so results are identical to `1e6`. It stops
+being inert on the 12.5M-decision configs (`mspacman_5seed`,
+`mspacman_resnet`), which exceed 100 k entries per action; those keep the 1e6
+default. **Check `train/qec_size` against `buffer_size` before reusing this
+number on a longer run.**
 
 ### Adding an encoder keyword is a THREE-file change
 
@@ -1655,7 +1750,7 @@ Options:
 | option | factory | status |
 |---|---|---|
 | `nature` (default) | `src.networks.NatureEmbedding` | the paper's network; used by every `experiment/nec/*.yaml` |
-| `dinov2_finetune` | `src.networks.DINOv2Embedding` | **scaffolding, unvalidated** — see below |
+| `dinov2_finetune` | `src.networks.DINOv2Embedding` | finetuned DINOv2 ViT-S/14; bundled as `experiment/nec/mspacman_dinov2.yaml` — see below |
 
 **Do not confuse this with MFEC's encoders** (`src/encoders/`, selected by the
 `algorithm.encoder_name` *string*, not a config group). The two systems are
@@ -1689,7 +1784,14 @@ It states:
   do **not** pre-normalise inside the module — see
   `tests/test_nec_kernel_scale.py` for why that normalisation exists;
 - no state beyond `state_dict()`, unless you also extend
-  `_get_training_state` / `_load_training_state`.
+  `_get_training_state` / `_load_training_state`;
+- **optionally** `param_groups(base_lr) -> list[dict]`. When present,
+  `NECAlgorithm._build_optimizer` hands its result to RMSProp instead of a
+  flat `parameters()` list — that is how a module splits itself across
+  learning rates (see `DINOv2Embedding`). Modules without the attribute are
+  unaffected. The groups must cover exactly the trainable parameters, and
+  the grouping must be reproducible from the constructor args alone, since
+  resume rebuilds the optimizer through the same method.
 
 `NatureEmbedding(obs_shape, embedding_dim, *, ...)` is the standard
 implementation: a CNN trunk + single dense layer — the same convolutional
@@ -1762,30 +1864,92 @@ flow, Hydra-composition architecture regression, config-swap end-to-end).
      `num_envs` partial episodes per process restart. Dropping the replay
      buffer means the gradient path no-ops until it refills; `step()` reports
      **`train/updates`** so that gap is visible.
-6. **Add tests** to `tests/test_nec_embedding_network.py` (shape/dtype,
-   all-params-trainable, YAML composes + instantiates). If the network needs
-   downloaded weights, monkeypatch the loader to a stub backbone so CI stays
-   offline — `tests/test_dinov2_encoder.py` and the `_StubViT` fixture in
-   `test_nec_embedding_network.py` show the pattern.
+6. **Add tests** to `tests/test_nec_embedding_network.py` for the *config-group
+   seam* (shape/dtype, all-params-trainable, YAML composes + instantiates), and
+   put behaviour specific to your network in its own file —
+   `tests/test_nec_dinov2_finetune.py` is the worked example. If the network
+   needs downloaded weights, monkeypatch the loader to a stub backbone so CI
+   stays offline (`tests/test_dinov2_encoder.py` and the `_StubViT` fixtures
+   show the pattern), and put anything a stub structurally cannot check —
+   real state_dict loading, real patch grids, real gradient paths — behind an
+   opt-in env var as a second tier.
 7. **Update `README.md` and `AGENTS.md`** (this table).
 
-#### `dinov2_finetune` — scaffolding, not a finished feature
+#### `dinov2_finetune` — finetunable DINOv2 ViT
 
 `src.networks.DINOv2Embedding` +
-`configs/algorithm/embedding_network/dinov2_finetune.yaml` scaffold a
-finetunable DINOv2 ViT: torch.hub architecture load + local `.pth`
-state_dict (same pattern as `src/encoders/dino_v2_encoder.py`), a 1×1 conv
-channel adapter, bilinear resize to `image_size`, ImageNet normalisation,
-ViT, then `nn.Linear(embed_dim, embedding_dim)`. Unlike the MFEC encoder it
-does **not** freeze the backbone; `freeze_backbone: bool = False` is exposed
-to toggle later.
+`configs/algorithm/embedding_network/dinov2_finetune.yaml`. Pipeline:
+torch.hub architecture load + local `.pth` state_dict (same pattern as
+`src/encoders/dino_v2_encoder.py`), a 1×1 conv channel adapter, bilinear
+resize to `image_size`, ImageNet normalisation, ViT, then
+`nn.Linear(embed_dim, embedding_dim)`. Unlike the MFEC encoder it does
+**not** freeze the backbone — `freeze_backbone: false` is the default and
+the reason a NEC-specific class exists.
 
-**Verified** (against a stub backbone, no downloads): the YAML composes, the
-factory builds, forward shape/dtype, and `freeze_backbone` gating.
-**Not verified**: that real `dinov2_vits14` weights load through this path,
-that 84×84 → 224 upsampled Atari frames are sensible ViT input, or that NEC
-learns anything with it. No training run has used it. Validate before
-drawing any conclusion from a run that selects it.
+Run it via the bundled experiment, or as a group override on any NEC game:
+
+```shell
+python src/train.py experiment=nec/mspacman_dinov2 \
+    algorithm.embedding_network.weights_path=/path/dinov2_vits14_pretrain.pth
+
+python src/train.py experiment=nec/pong \
+    algorithm/embedding_network=dinov2_finetune \
+    algorithm.embedding_network.weights_path=/path/dinov2_vits14_pretrain.pth \
+    run.encoder=dinov2
+```
+
+**Three things about it that are load-bearing, not incidental:**
+
+1. **The channel adapter is initialised, not random.** `weight = 1/C`,
+   `bias = 0`, so the 4-frame Atari stack enters the ViT as its mean
+   replicated to R=G=B — a plain grayscale image in `[0, 1]`, which is what
+   the ImageNet normalisation downstream assumes. A default `nn.Conv2d`
+   init instead feeds the ViT out-of-distribution channels, and a
+   pretrained representation that is only useful *after* the adapter has
+   been learned is not a pretrained representation. The symmetry breaks on
+   the first gradient (the 3 output channels get different gradients
+   through the patch-embed conv), so the adapter can still learn a
+   motion-encoding assignment.
+2. **It uses `param_groups`, an opt-in extension of the contract.**
+   `DINOv2Embedding.param_groups(base_lr)` puts the pretrained backbone at
+   `base_lr * backbone_lr_scale` (default 0.1) and the fresh adapter + head
+   at `base_lr`; `NECAlgorithm._build_optimizer` picks it up via `hasattr`.
+   This matters because NEC's RMSProp trio (lr=1e-5, α=0.9, ε=0.01) was
+   calibrated on `NatureEmbedding`, where every parameter is random init.
+   `backbone_lr_scale: 1.0` restores a uniform rate. **`_build_optimizer` is
+   shared by `setup()` and `_load_training_state()` on purpose** — resume
+   rebuilds the optimizer before `load_state_dict`, which raises on a
+   group-count mismatch.
+3. **It keeps the standard 4×84×84 NEC env**, unlike the MFEC DINOv2 arm,
+   which needs `mspacman_mfec_*_dinov2` (RGB, no GrayScale/Resize) because
+   its frozen ViT cannot adapt channels. Same env as `nec/mspacman.yaml`
+   means the encoder is the only variable in the ablation, and the frame
+   stack — NEC's only velocity signal — is preserved.
+
+**Cost.** The ViT dominates every phase (policy inference at
+batch=`num_envs`, episode re-embedding, and `num_updates × batch_size`
+gradient updates), and cost is quadratic in the token count, so
+`image_size` is the throughput knob: 224 → 16×16 patches, 112 → 8×8, 98 →
+7×7 (the smallest that does not downsample an 84×84 frame). Checkpoints are
+~177 MB rather than a few MB — 22M ViT params plus RMSProp's `square_avg`.
+
+**Verified** (`tests/test_nec_dinov2_finetune.py`, plus
+`tests/test_smoke.py::test_smoke_nec_pong_dinov2_finetune`): with a stub
+backbone — adapter init, param-group split and its use by `setup()`,
+finetuning through NEC's real `step()`, gradient arrival at the backbone via
+the DND kernel term, checkpoint round-trip with groups intact, and the full
+`_train()` path from the CLI override. With the **real** `dinov2_vits14`
+(opt-in, `NEC_DINOV2_REAL=1`, `NEC_DINOV2_REPO_DIR=` for offline hosts) —
+forward shape at every documented `image_size`, a real state_dict loading
+with `strict=True` and changing the output, gradients reaching
+`blocks.0.attn.qkv` / `patch_embed.proj` / `cls_token`, and NEC
+`setup()` → `step()` end-to-end. Also run manually against
+`experiment=nec/mspacman_dinov2` on ALE with the real ViT: DND writes,
+gradient updates, checkpoint save, and resume all confirmed.
+
+**Not verified**: whether NEC *scores* better with DINOv2 than with
+`nature`. No full training run has been completed — that is the experiment,
+not a precondition for it. `backbone_lr_scale` is likewise untuned.
 
 ### 4. Exact-match dict and VecNorm
 

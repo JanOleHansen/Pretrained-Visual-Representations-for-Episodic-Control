@@ -201,6 +201,19 @@ class NECEmbeddingNetwork(Protocol):
        checkpoints the network with ``embedding_net.state_dict()`` only.  A
        factory needing more must extend ``_get_training_state`` /
        ``_load_training_state`` (see AGENTS.md).
+
+    Optional extension
+    ------------------
+    A module MAY define ``param_groups(base_lr: float) -> list[dict]``.  When
+    present, ``NECAlgorithm._build_optimizer`` passes its result to RMSProp
+    instead of a flat ``parameters()`` list, which is how a module splits
+    itself across learning rates — see :class:`DINOv2Embedding`, whose
+    pretrained backbone runs below its randomly-initialised head.  Modules
+    without the attribute are unaffected.  The groups must cover exactly the
+    trainable parameters: ``NECAlgorithm`` still checkpoints and restores the
+    whole ``state_dict()``, and it rebuilds the optimizer through the same
+    method on resume, so the grouping has to be reproducible from the
+    constructor arguments alone.
     """
 
     def __call__(
@@ -251,28 +264,18 @@ _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 class DINOv2Embedding(nn.Module):
-    """**SCAFFOLDING — UNTESTED AGAINST REAL WEIGHTS. NOT A FINISHED FEATURE.**
+    """Finetunable DINOv2 ViT as a NEC embedding network.
 
-    Finetunable DINOv2 ViT as a NEC embedding network, selected by
-    ``configs/algorithm/embedding_network/dinov2_finetune.yaml``.
-
-    What is actually verified (``tests/test_nec_embedding_network.py``, with
-    ``torch.hub.load`` monkeypatched to a stub backbone): the YAML composes,
-    the factory builds, the forward shape/dtype contract holds, and
-    ``freeze_backbone`` gates ``requires_grad`` as documented.  What is
-    **not** verified: that real ``dinov2_vits14`` weights load through this
-    path, that the grayscale→RGB adapter and 84→224 upsample are the right
-    preprocessing for Atari frames, or that NEC learns anything with it.
-    Nobody has run a training job with this. Treat every hyperparameter
-    below as a placeholder and validate before drawing conclusions from a
-    run that uses it.
+    Selected by ``configs/algorithm/embedding_network/dinov2_finetune.yaml``,
+    i.e. ``algorithm/embedding_network=dinov2_finetune`` on the CLI.
 
     Contrast with MFEC's :class:`src.encoders.dino_v2_encoder.DINOv2Encoder`,
     which is the *frozen* variant: it calls ``p.requires_grad_(False)`` on
     every backbone parameter because MFEC's QEC hash needs a bit-exact,
     never-changing φ.  NEC trains its embedding end-to-end, so this class
-    deliberately leaves the backbone trainable by default
-    (``freeze_backbone=False``) — see :class:`NECEmbeddingNetwork` clause 2.
+    leaves the backbone trainable by default (``freeze_backbone=False``) —
+    see :class:`NECEmbeddingNetwork` clause 2.  That difference is the entire
+    reason a NEC-specific class exists rather than reusing the encoder.
 
     Pipeline: ``(B, C, H, W)`` → 1×1 conv channel adapter (only when
     ``C != 3``; Atari gives 4 stacked grayscale frames, the ViT wants RGB) →
@@ -280,6 +283,40 @@ class DINOv2Embedding(nn.Module):
     ``nn.Linear(backbone.embed_dim, embedding_dim)`` head.  The head keeps
     the output unconstrained (not unit-norm), as clause 3 of the contract
     requires: NEC L2-normalises downstream.
+
+    Channel adapter is initialised, not random
+    ------------------------------------------
+    The adapter is seeded to ``weight = 1/C``, ``bias = 0``, which makes its
+    output the **mean over the stacked frames, replicated to R=G=B** — a
+    plain grayscale image in ``[0, 1]``, exactly the kind of input DINOv2's
+    ImageNet normalisation expects.  A default-initialised ``nn.Conv2d``
+    instead emits ~N(0, ·) channels of a different scale and sign, so the
+    ViT's first forward pass sees out-of-distribution input and the
+    pretrained features are worth approximately nothing at step 0.  Since a
+    pretrained representation that is only useful *after* the adapter has
+    been learned defeats the point of using a PVM at all, the identity-ish
+    init is load-bearing, not cosmetic.
+
+    The symmetry is broken by the first gradient (the three output channels
+    receive different gradients through the ViT's patch-embedding conv), so
+    the adapter is free to learn a frame-to-channel assignment that encodes
+    motion if that helps.  It just does not *start* from noise.
+
+    Discriminative learning rate
+    ----------------------------
+    :meth:`param_groups` puts the pretrained backbone in its own group at
+    ``base_lr * backbone_lr_scale`` and leaves the freshly-initialised
+    adapter + head at ``base_lr``.  ``NECAlgorithm.setup()`` uses it when
+    present (see ``NECAlgorithm._build_optimizer``).  This is the standard
+    finetuning arrangement — a randomly-initialised head needs a much larger
+    step than a pretrained trunk that is already near a good solution — and
+    it matters more than usual here because NEC's RMSProp settings
+    (lr=1e-5, α=0.9, ε=0.01) were calibrated on ``NatureEmbedding``, where
+    *every* parameter is random init.
+
+    ``backbone_lr_scale`` is **not** a validated number: no training run has
+    been used to tune it. 0.1 is the conventional default; 1.0 restores a
+    single uniform learning rate.
 
     Parameters
     ----------
@@ -290,11 +327,17 @@ class DINOv2Embedding(nn.Module):
         for tests.
     model_name      : torch.hub entrypoint, e.g. ``dinov2_vits14``.
     repo_dir        : local clone of facebookresearch/dinov2 for offline
-        hosts; ``None`` fetches from torch.hub.
-    image_size      : ViT input size; must be a multiple of 14.
+        hosts; ``None`` fetches from torch.hub (which also reuses an
+        already-downloaded ``~/.cache/torch/hub`` copy without network).
+    image_size      : ViT input size; must be a multiple of 14.  This is the
+        dominant throughput knob: cost is quadratic in the token count, so
+        224 (16×16=256 patches) is ~5.3× the compute of 98 (7×7=49), which
+        is the smallest multiple of 14 that does not *downsample* an 84×84
+        Atari frame.
     freeze_backbone : ``True`` freezes the ViT and trains only the adapter +
-        head.  Defaults to ``False`` (full finetuning) — the whole point of
-        having a NEC-specific variant.
+        head.  Defaults to ``False`` (full finetuning).
+    backbone_lr_scale : multiplier on the backbone's learning rate relative
+        to the adapter + head; see above.
     """
 
     def __init__(
@@ -307,12 +350,14 @@ class DINOv2Embedding(nn.Module):
         repo_dir: str | None = None,
         image_size: int = 224,
         freeze_backbone: bool = False,
+        backbone_lr_scale: float = 0.1,
     ) -> None:
         super().__init__()
         assert image_size % 14 == 0, (
             "DINOv2 ViT requires image_size to be a multiple of 14"
         )
         self.image_size = image_size
+        self.backbone_lr_scale = float(backbone_lr_scale)
 
         # Architecture only (pretrained=False); weights are loaded below so
         # the same code path works from a local .pth on an offline host.
@@ -338,6 +383,13 @@ class DINOv2Embedding(nn.Module):
         self.channel_adapter: nn.Module = (
             nn.Identity() if in_channels == 3 else nn.Conv2d(in_channels, 3, kernel_size=1)
         )
+        if isinstance(self.channel_adapter, nn.Conv2d):
+            # Mean over input channels, replicated to R=G=B. See the class
+            # docstring: a random init here throws away the pretraining.
+            with torch.no_grad():
+                self.channel_adapter.weight.fill_(1.0 / in_channels)
+                self.channel_adapter.bias.zero_()
+
         self.head = nn.Linear(int(self.backbone.embed_dim), embedding_dim)
 
         self.register_buffer(
@@ -347,8 +399,37 @@ class DINOv2Embedding(nn.Module):
             "_std", torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1), persistent=False
         )
 
+    def param_groups(self, base_lr: float) -> list[dict]:
+        """Optimizer param groups: backbone at a scaled LR, head at ``base_lr``.
+
+        ``NECAlgorithm._build_optimizer`` calls this when the embedding
+        network defines it and falls back to a flat ``parameters()``
+        otherwise, so this is an opt-in extension of
+        :class:`NECEmbeddingNetwork`, not a new requirement on it.
+
+        Frozen parameters are filtered out rather than handed to the
+        optimizer with ``requires_grad=False``: they would never receive a
+        gradient, but they would still be counted by anything that inspects
+        ``param_groups``, and an all-frozen group is an empty group.
+        """
+        backbone = [p for p in self.backbone.parameters() if p.requires_grad]
+        head = [
+            p
+            for module in (self.channel_adapter, self.head)
+            for p in module.parameters()
+            if p.requires_grad
+        ]
+        groups: list[dict] = []
+        if backbone:
+            groups.append({"params": backbone, "lr": base_lr * self.backbone_lr_scale})
+        if head:
+            groups.append({"params": head, "lr": base_lr})
+        return groups
+
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         x = obs.float().reshape(-1, *obs.shape[-3:])          # (B, C, H, W)
+        # Adapt channels BEFORE the resize: the 1x1 conv is ~7x cheaper at
+        # 84x84 than at 224x224, and the result is identical either way.
         x = self.channel_adapter(x)                            # (B, 3, H, W)
         if x.shape[-1] != self.image_size or x.shape[-2] != self.image_size:
             x = F.interpolate(

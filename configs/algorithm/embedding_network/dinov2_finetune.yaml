@@ -1,14 +1,7 @@
-# NEC embedding network: finetunable DINOv2 ViT.
-#
-# ***SCAFFOLDING — UNVALIDATED. No training run has ever used this.***
-# Composition, construction, forward shape and the freeze_backbone flag are
-# covered by tests/test_nec_embedding_network.py (against a STUB backbone,
-# no downloads). Everything else — real weight loading, whether 84x84
-# Atari frames upsampled to 224 are sensible ViT input, whether NEC learns
-# with it — is unverified. See src/networks.py::DINOv2Embedding.
+# NEC embedding network: finetunable DINOv2 ViT (src/networks.py::DINOv2Embedding).
 #
 # Unlike MFEC's `encoder_name=dinov2` (frozen, src/encoders/dino_v2_encoder.py),
-# this variant is trainable end-to-end: `freeze_backbone: false` by default,
+# this variant is trained end-to-end with the DND: `freeze_backbone: false`,
 # which is the entire reason a NEC-specific class exists.
 #
 #   python src/train.py experiment=nec/mspacman \
@@ -16,9 +9,22 @@
 #       algorithm.embedding_network.weights_path=/path/dinov2_vits14_pretrain.pth \
 #       run.encoder=dinov2
 #
+# `configs/experiment/nec/mspacman_dinov2.yaml` bundles exactly that (plus a
+# throughput-adjusted trainer block), so prefer `experiment=nec/mspacman_dinov2`
+# and keep this group override for one-off arms on other games.
+#
 # Set `run.encoder` explicitly (as above, or in the experiment config) so the
-# run directory name distinguishes it from a `nature` run — `run.encoder`
-# reads `algorithm.encoder_name`, which is an MFEC-only key.
+# run directory name distinguishes it from a `nature` run — `run.encoder` reads
+# `algorithm.encoder_name`, which is an MFEC-only key.
+#
+# WHAT IS VERIFIED (tests/test_nec_dinov2_finetune.py): the real dinov2_vits14
+# architecture builds, a real `torch.save(state_dict)` loads through it with
+# `strict=True`, the forward shape/dtype contract holds at every image_size,
+# gradients reach the ViT's own blocks, `param_groups` splits the learning
+# rate, and NEC runs setup() -> step() -> checkpoint -> resume end-to-end with
+# this network. WHAT IS NOT: whether NEC actually *scores* better with DINOv2
+# than with `nature` on Atari. No training run has been completed — that is the
+# experiment, not a precondition for it.
 _partial_: true
 _target_: src.networks.DINOv2Embedding
 
@@ -29,5 +35,33 @@ weights_path: ???
 
 model_name: dinov2_vits14     # vits14=384 ... vitg14=1536 backbone width
 repo_dir: null                # local clone of facebookresearch/dinov2 (offline hosts)
-image_size: 224               # must be a multiple of 14
+
+# ViT input size; must be a multiple of 14. THIS IS THE THROUGHPUT KNOB — cost
+# is quadratic in the token count, and the ViT forward dominates every phase of
+# a NEC step (policy inference, episode re-embedding, and num_updates x
+# batch_size gradient updates).
+#
+#   image_size   patches   relative cost   note
+#      224        16x16        1.00        DINOv2's pretraining resolution
+#      112         8x8         0.25
+#       98         7x7         0.19        smallest that does not DOWNSAMPLE an
+#                                          84x84 Atari frame
+#
+# 224 is the default for parity with MFEC's frozen arm (`dinov2_image_size` in
+# configs/algorithm/mfec_atari.yaml), so the two encoders see identical input.
+# Drop to 98 if throughput is the binding constraint; the 84 -> 224 upsample
+# invents no information, it only buys the resolution the ViT was trained at.
+image_size: 224
+
 freeze_backbone: false        # true -> train only the channel adapter + head
+
+# Learning-rate multiplier for the pretrained backbone, relative to the
+# randomly-initialised channel adapter + head (which stay at `algorithm.lr`).
+# The standard finetuning arrangement: a fresh head needs a far larger step
+# than a trunk already near a good solution. It matters more than usual here
+# because NEC's RMSProp trio (lr=1e-5, alpha=0.9, eps=0.01, see nec_atari.yaml)
+# was calibrated on NatureEmbedding, where every parameter is random init.
+#
+# NOT a validated number — no run has been used to tune it. 0.1 is the
+# convention; 1.0 restores a single uniform learning rate for every parameter.
+backbone_lr_scale: 0.1

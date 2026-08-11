@@ -1644,23 +1644,48 @@ class NECAlgorithm(BaseAlgorithm):
         # 4. Replay buffer — stores (obs, action, n_step_return)
         self.replay_buffer = self._make_replay_buffer()
 
-        # 5. Optimizer — CNN embedding network only.
-        # RMSProp per paper §4: "We used the RMSProp algorithm for gradient
-        # descent training."  (This was Adam until the paper was re-checked.)
-        # The DND's own keys/values are NOT in here: they are updated by a
-        # stateless sparse SGD step in _gradient_step, because a stateful
-        # optimiser's per-slot moments go stale when the ring buffer overwrites
-        # a slot.  See DND.apply_gradient.
-        self.optimizer = torch.optim.RMSprop(
-            self.embedding_net.parameters(),
-            lr=self.lr,
-            alpha=self.rmsprop_alpha,
-            eps=self.rmsprop_eps,
-        )
+        # 5. Optimizer — embedding network only.  See _build_optimizer.
+        self.optimizer = self._build_optimizer()
 
         # 6. Per-env carry buffers for partial episodes across batch boundaries
         self._num_envs: int = int(env_bs[0]) if len(env_bs) == 1 else 1
         self._carry: list[dict | None] = [None] * self._num_envs
+
+    def _build_optimizer(self) -> torch.optim.Optimizer:
+        """RMSProp over the embedding network — and only the embedding network.
+
+        RMSProp per paper §4: "We used the RMSProp algorithm for gradient
+        descent training."  (This was Adam until the paper was re-checked.)
+        The DND's own keys/values are NOT in here: they are updated by a
+        stateless sparse SGD step in ``_gradient_step``, because a stateful
+        optimiser's per-slot moments go stale when the ring buffer overwrites
+        a slot.  See :meth:`DND.apply_gradient`.
+
+        Embedding networks MAY define ``param_groups(base_lr) -> list[dict]``
+        to split themselves across learning rates; ``DINOv2Embedding`` uses it
+        to run its pretrained ViT below the rate of its freshly-initialised
+        adapter + head.  This is an opt-in extension of the
+        ``NECEmbeddingNetwork`` contract: a plain ``nn.Module`` (such as
+        ``NatureEmbedding``) has no such attribute and gets the flat
+        ``parameters()`` list, bit-for-bit as before.
+
+        Shared by ``setup()`` and ``_load_training_state()``, which rebuilds
+        the optimizer before restoring its state — they must construct the
+        same param groups or ``load_state_dict`` raises on a group-count
+        mismatch, and a resumed DINOv2 run would silently lose the split.
+        """
+        net = self.embedding_net
+        params = (
+            net.param_groups(self.lr)
+            if hasattr(net, "param_groups")
+            else net.parameters()
+        )
+        return torch.optim.RMSprop(
+            params,
+            lr=self.lr,
+            alpha=self.rmsprop_alpha,
+            eps=self.rmsprop_eps,
+        )
 
     # ------------------------------------------------------------------
     # Embedding helper
@@ -2333,12 +2358,7 @@ class NECAlgorithm(BaseAlgorithm):
         dnd_state["device"] = self._buffer_device
         self.dnd.__setstate__(dnd_state)
 
-        self.optimizer = torch.optim.RMSprop(
-            self.embedding_net.parameters(),
-            lr=self.lr,
-            alpha=self.rmsprop_alpha,
-            eps=self.rmsprop_eps,
-        )
+        self.optimizer = self._build_optimizer()
         self.optimizer.load_state_dict(state.optimizer_state_dict)
         self._collected_frames = int(state.extra["collected_frames"])
 

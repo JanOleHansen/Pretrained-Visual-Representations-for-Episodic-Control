@@ -21,6 +21,19 @@ algorithm:
   dinov2_image_size: 224
   state_dim: 384
 
+  # QEC MEMORY.  QEC._init_states allocates (num_actions, buffer_size,
+  # state_dim) float32 eagerly, so with 9 Ms. Pac-Man actions the mfec_atari
+  # default of 1e6 costs 9 * 1e6 * 384 * 4 = 13.8 GB of GPU memory before a
+  # frame is collected — for a buffer whose measured peak is ~40k entries per
+  # action (train/qec_size) on this 1M-decision budget.  100k keeps 2.5x
+  # headroom at 1.4 GB.
+  #
+  # INERT at this budget: eviction never fires while buffer_size exceeds the
+  # peak, so this does not change results relative to buffer_size=1e6.  It
+  # WOULD change them on a 12.5M-decision run, which exceeds 100k entries per
+  # action — that is why mspacman_5seed.yaml is left at the 1e6 default.
+  buffer_size: 100_000
+
 trainer:
   # UNITS: total_frames counts agent *decisions* (StepTrainer does
   # `self._step += batch.numel()`), while the paper's x-axis counts ALE

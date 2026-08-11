@@ -220,3 +220,54 @@ def test_smoke_nec_pong():
     assert isinstance(metrics, dict)
     assert "train/epsilon" in metrics
     assert "train/dnd_size" in metrics
+
+
+def test_smoke_nec_pong_dinov2_finetune(monkeypatch):
+    """NEC with the DINOv2 embedding network, driven from the CLI override.
+
+    `algorithm/embedding_network=dinov2_finetune` is the documented way to run
+    this arm, so the smoke test exercises it exactly that way rather than
+    constructing the network by hand -- the Hydra group swap, the 4-channel
+    Atari observation reaching the ViT's channel adapter, and the two-group
+    optimizer all have to survive the real `_train()` path.
+
+    The backbone is a STUB (torch.hub.load monkeypatched, `weights_path=null`),
+    same tiering as tests/test_dinov2_encoder.py: the real ViT-S/14 is 22M
+    parameters and needs the facebookresearch/dinov2 architecture code, which
+    CI has no way to fetch. The real backbone is covered end-to-end by
+    tests/test_nec_dinov2_finetune.py's NEC_DINOV2_REAL tier.
+    """
+    pytest.importorskip("ale_py")
+    import torch
+    import torch.nn as nn
+
+    class _StubViT(nn.Module):
+        embed_dim = 32
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(3, self.embed_dim)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.proj(x.mean(dim=(-1, -2)))
+
+    monkeypatch.setattr("torch.hub.load", lambda *a, **k: _StubViT())
+
+    cfg = load_experiment_cfg(
+        "nec/pong",
+        [
+            *_nec_pong_overrides(),
+            "algorithm/embedding_network=dinov2_finetune",
+            # `???` in the YAML; null is the "keep the hub init" path, which is
+            # what the stub wants -- there is no pretrained .pth to point at.
+            "algorithm.embedding_network.weights_path=null",
+            "algorithm.embedding_network.image_size=28",
+            "run.encoder=dinov2",
+        ],
+    )
+    from src.train import _train
+
+    metrics = _train(cfg)
+    assert isinstance(metrics, dict)
+    assert "train/epsilon" in metrics
+    assert "train/dnd_size" in metrics
