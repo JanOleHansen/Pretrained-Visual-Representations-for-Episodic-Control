@@ -20,6 +20,11 @@ run:
   encoder: ${oc.select:algorithm.encoder_name,none}
   seed: ${trainer.seed}
   name: ${run.algorithm}_${run.game}_${run.encoder}_seed${run.seed}
+  # `name` without the seed: the set of runs a multi-seed sweep should be
+  # averaged over.  Consumed by the W&B logger's `group`, which is what lets
+  # `-m trainer.seed=42,43,44,45,46` be plotted as one mean +/- SEM curve
+  # instead of five separate ones (Blundell et al. 2016, Figure 1).
+  group: ${run.algorithm}_${run.game}_${run.encoder}
   id: ${run.name}_${now:%Y%m%d-%H%M%S}
 
 

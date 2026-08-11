@@ -4,6 +4,11 @@ logger:
     project: torchrl-hydra-template
     entity: null                # set via env var WANDB_ENTITY or CLI override
     name: ${run.name}           # set via CLI override
+    # Shared by every seed of one experiment (= run.name without the seed), so
+    # `-m trainer.seed=42,43,44,45,46` produces one W&B group that the UI can
+    # average with a standard-error band — Blundell et al. (2016) Figure 1's
+    # protocol.  Set to null to disable grouping.
+    group: ${run.group}
     tags: []
     mode: online                # "online" | "offline" | "disabled"
     save_dir: ${paths.log_dir}/wandb/

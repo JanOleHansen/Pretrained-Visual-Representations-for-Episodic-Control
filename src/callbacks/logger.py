@@ -10,6 +10,15 @@ class WandBLogger:
         project: W&B project name
         entity: W&B entity (team/user). None uses the default from wandb login.
         name: run name. None lets W&B generate one.
+        group: name shared by every run that is a *repeat* of the same
+            experiment — i.e. `run.name` without the seed. Seeds of one
+            experiment must share it and different experiments must not.
+            W&B's "Group by → group" then plots the mean across seeds with a
+            standard-error band, which is exactly what Figure 1 of Blundell
+            et al. (2016) is ("Dark curves show the mean of five runs ...
+            Light shading shows the standard error of the mean across runs").
+            Without it a seed sweep lands as N unrelated runs and there is
+            nothing for W&B to average over. None disables grouping.
         tags: list of tags to attach to the run
         mode: "online", "offline", or "disabled"
     """
@@ -19,6 +28,7 @@ class WandBLogger:
         project: str = "torchrl-hydra-template",
         entity: str | None = None,
         name: str | None = None,
+        group: str | None = None,
         tags: list[str] | None = None,
         mode: str = "online",
         save_dir: str | None = None,
@@ -26,6 +36,7 @@ class WandBLogger:
         self.project = project
         self.entity = entity
         self.name = name
+        self.group = group
         self.tags = tags or []
         self.mode = mode
         self.save_dir = save_dir
@@ -45,6 +56,7 @@ class WandBLogger:
             project=self.project,
             entity=self.entity,
             name=self.name,
+            group=self.group,
             tags=self.tags,
             mode=self.mode,
             config=config_dict,
