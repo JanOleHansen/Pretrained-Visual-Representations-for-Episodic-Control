@@ -108,6 +108,48 @@ def test_value_stats_expose_the_exact_vs_knn_gap():
     assert k_sum / k_n == pytest.approx(100.0)
 
 
+def test_the_gap_survives_an_encoder_with_zero_dict_hits():
+    """The case every float32 PVM encoder is actually in.
+
+    Measured on CUDA, the QEC hash key match rate between embedding a batch and
+    embedding one row is **0.000** for DINOv2, ResNet and CLIP (1.000 only for
+    the float64 random projection): a ViT/CNN cannot produce bit-identical
+    output across batch shapes, and a key is `round(phi * key_scale)` over
+    `d` coordinates that must ALL survive rounding.  So at evaluation those
+    encoders take zero dict hits and every Eq. (2) case-1 answer arrives
+    through the near-exact rescue instead.
+
+    Keying the value statistics off the dict-hit counter therefore omitted
+    `eval/exact_minus_knn_value` for exactly the encoders it exists to compare,
+    leaving the metric visible only on the random-projection baseline.
+    """
+    qec, states = _filled_qec()
+    far = torch.full((4, STATE_DIM), 50.0) + 0.01 * torch.arange(4).unsqueeze(1)
+    for a in range(NUM_ACTIONS):
+        qec.add_batch(a, far, torch.full((4,), 10.0, dtype=torch.float64))
+
+    # Perturb the query below the near-exact tolerance but far enough to change
+    # every quantised key — exactly what float32 batch-shape drift does.
+    #
+    # Real drift is ~1e-6; two grid steps are needed here only because this
+    # fixture has STATE_DIM=3.  That difference IS the phenomenon: a key
+    # survives only if all `d` coordinates survive rounding, with probability
+    # ~(1 - 2*drift*key_scale)**d, so 1e-6 is harmless at d=3 and fatal at the
+    # d=384/512 of a real ViT.
+    drifted = states[:8] + 2.0 / qec._key_scale
+
+    qec.reset_lookup_stats()
+    qec.estimate_all(drifted)
+    queries, exact, near = qec.lookup_stats()
+
+    assert exact == 0, "dict hits should be wiped out by the drift"
+    assert near > 0, "the near-exact rescue must be carrying these lookups"
+
+    e_sum, e_n, k_sum, k_n = qec.value_stats()
+    assert e_n == near, "rescued lookups must count on the exact side"
+    assert e_sum / e_n == pytest.approx(100.0)
+
+
 def test_eval_metrics_reports_the_gap():
     algorithm = MFECAlgorithm(
         device=torch.device("cpu"), state_dim=STATE_DIM, k=2, buffer_size=256,

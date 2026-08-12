@@ -846,9 +846,66 @@ property the CLIP arm exists to measure. `CLIPEncoder.__init__` raises instead.
 declaration and the local file does not make a wrong architecture right.
 Guarded by `tests/test_clip_encoder.py`.
 
-Same float32-ViT key-stability caveat as DINOv2: run
-`scripts/encoder_diagnostics.py --clip --device cuda` on the training GPU and
-require `key b/s == 1.000` before trusting a run.
+Same float32-ViT key-stability caveat as DINOv2 — and it **fails**; see below.
+
+### MEASURED: every float32 encoder fails key stability on CUDA
+
+`scripts/encoder_diagnostics.py --device cuda`, 150 Ms. Pac-Man frames:
+
+| encoder | dim | key b/s | key rep | adj AUC | rel contr |
+|---|---|---|---|---|---|
+| `random_projection` | 64 | **1.000** | 1.000 | 0.955 | 0.627 |
+| `dinov2` ViT-S/14 | 384 | **0.000** | 1.000 | 0.991 | 0.697 |
+| `resnet` resnet18 | 512 | **0.000** | 1.000 | 0.991 | 0.690 |
+| `clip` ViT-B-32-quickgelu | 512 | **0.000** | 1.000 | 0.990 | 0.728 |
+
+`key rep` is 1.000 everywhere, so the encoders *are* deterministic. What breaks
+is **batch-shape** invariance: cuBLAS selects float32 GEMM kernels by batch
+size, so `φ(x)` inside a 16-row batch differs from `φ(x)` alone in the last
+bits. A key is `round(φ · key_scale)` over `d` coordinates and survives only if
+**none** of them lands within the drift of a grid boundary:
+
+```
+P(key survives) ≈ (1 - 2 · drift · key_scale) ** d
+```
+
+At `d=384`, `drift≈1e-6`, `key_scale=1e5` that is ~1e-18 — hence exactly 0.000.
+`RandomProjectionEncoder` escapes only because float64 accumulation puts its
+drift at ~1e-15, not because 64 dimensions are special.
+
+**Do not "fix" this by lowering `key_scale`.** The ladder search the script now
+prints (`key_scale*`) will report a value that restores 1.000, but for a 384-d
+encoder that value is ~10 — a 0.1 grid, coarser than the nearest-neighbour
+separation, which merges genuinely distinct states into one key. That is a
+silently wrong Q-value, strictly worse than the current behaviour. Nor is
+"accumulate in float64" actionable: it works for one matmul, not a ViT.
+
+**What actually happens, and why runs still work.** The consequences are
+bounded and were verified:
+
+- **Training is unaffected.** The collector embeds `num_envs` rows on every
+  policy call and `step()` reuses those cached embeddings, so every QEC write
+  and every train-time query uses the same batch shape. `train/exact_hit_rate`
+  is real.
+- **Evaluation loses only the O(1) path.** `estimate_all` falls through to the
+  near-exact rescue, which accepts the top-1 neighbour when
+  `‖q − s₁‖ ≤ 3e-5·(1+‖q‖)`. Drift is ~1e-6 while the nearest *distinct* frame
+  sits at ~30% of the mean pairwise distance, so the rescue resolves to the
+  same entry the dict would have found. It returns the identical stored value,
+  just via kNN instead of a hash lookup.
+- **`eval/exact_hit_rate` reads 0 for every PVM arm** and is not comparable
+  across encoders. Use `eval/memory_hit_rate`, which counts both paths.
+
+`QEC.value_stats` therefore counts near-exact rescues on the *exact* side.
+Keying it off `_lookup_exact` (dict hits only) omitted
+`eval/exact_minus_knn_value` entirely for DINOv2/ResNet/CLIP — the encoders the
+metric exists to compare. Guarded by
+`tests/test_mfec_estimator_gap.py::test_the_gap_survives_an_encoder_with_zero_dict_hits`.
+
+If you ever need the hash path back on a neural encoder, the sound fix is a
+bucket-and-verify scheme (coarse key for the O(1) lookup, exact L2 check to
+reject collisions), not a finer or coarser `key_scale`. That is a real change
+to `QEC` and has not been made.
 
 ### QEC memory is sized by `state_dim`, and it is not small
 

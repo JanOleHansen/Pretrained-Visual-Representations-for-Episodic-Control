@@ -135,23 +135,70 @@ def collect_frames(env_config_name: str, n_frames: int, seed: int) -> torch.Tens
 # Metrics
 # ---------------------------------------------------------------------------
 
-def key_stability(encoder, frames: torch.Tensor, key_scale: float) -> tuple[float, float]:
-    """(batch-vs-single match rate, repeat match rate) of the QEC hash key."""
+#: key_scale candidates tried when recommending a coarser quantisation, from
+#: the current default downwards. Each step is 10x coarser.
+_KEY_SCALE_LADDER = (1e5, 1e4, 1e3, 1e2, 1e1, 1e0)
+
+
+def key_stability(
+    encoder, frames: torch.Tensor, key_scale: float
+) -> dict[str, float]:
+    """How well the QEC hash key survives a change of batch shape.
+
+    Returns ``batch_single`` / ``repeat`` match rates at ``key_scale``, plus the
+    two numbers that make a failure actionable:
+
+    ``drift``
+        Largest absolute per-coordinate difference between embedding a frame
+        inside a batch and embedding it alone. This is the physical quantity —
+        float32 GEMM kernels on CUDA are chosen by batch size, so the reduction
+        order (and therefore the last bits) changes with it.
+
+    ``key_scale_ok``
+        The coarsest-to-finest ladder search for the largest ``key_scale`` that
+        still gives a **1.000** batch-vs-single match rate, or ``nan`` if even
+        the coarsest does not. This matters because the failure is not "the
+        embedding is wrong", it is "the quantisation grid is finer than the
+        noise": a key is `round(phi * key_scale)` over `d` coordinates, so the
+        key survives only if *no* coordinate lands within ``drift`` of a grid
+        boundary — probability ``(1 - 2*drift*key_scale)**d``. With d=384 and
+        drift=1e-6 that is ~1e-18 at key_scale=1e5, i.e. exactly the 0.000 a
+        float32 ViT reports.
+    """
     from src.algorithms.mfec import QEC
 
-    qec = QEC(1, 8, 1, torch.device("cpu"), key_scale=key_scale)
-
-    batched = qec._make_keys(encoder.embed(frames))
-    repeat = qec._make_keys(encoder.embed(frames))
-    single = [
-        qec._make_keys(encoder.embed(frames[i : i + 1]))[0]
-        for i in range(frames.shape[0])
-    ]
+    # Embed once, reuse for every scale — a ViT forward per frame is the
+    # expensive part and the ladder search must not multiply it.
+    emb_batched = encoder.embed(frames).cpu()
+    emb_repeat = encoder.embed(frames).cpu()
+    emb_single = torch.cat(
+        [encoder.embed(frames[i : i + 1]).cpu() for i in range(frames.shape[0])]
+    )
 
     n = frames.shape[0]
-    bs = sum(batched[i] == single[i] for i in range(n)) / n
-    rp = sum(batched[i] == repeat[i] for i in range(n)) / n
-    return bs, rp
+
+    def match_rate(scale: float) -> float:
+        qec = QEC(1, 8, 1, torch.device("cpu"), key_scale=scale)
+        a, b = qec._make_keys(emb_batched), qec._make_keys(emb_single)
+        return sum(a[i] == b[i] for i in range(n)) / n
+
+    qec = QEC(1, 8, 1, torch.device("cpu"), key_scale=key_scale)
+    keys_b, keys_r = qec._make_keys(emb_batched), qec._make_keys(emb_repeat)
+
+    key_scale_ok = float("nan")
+    for scale in _KEY_SCALE_LADDER:
+        if scale > key_scale:
+            continue
+        if match_rate(scale) == 1.0:
+            key_scale_ok = scale
+            break
+
+    return {
+        "key_batch_single": match_rate(key_scale),
+        "key_repeat": sum(keys_b[i] == keys_r[i] for i in range(n)) / n,
+        "drift": float((emb_batched - emb_single).abs().max()),
+        "key_scale_ok": key_scale_ok,
+    }
 
 
 def geometry(emb: torch.Tensor) -> dict[str, float]:
@@ -433,39 +480,66 @@ def main() -> int:
 
         print(f"[embed  ] {label}  (obs {tuple(frames.shape[1:])}) ...", flush=True)
         emb = enc.embed(frames).cpu()
-        bs, rp = key_stability(enc, frames, args.key_scale)
+        ks = key_stability(enc, frames, args.key_scale)
         g = geometry(emb)
         rows.append({
             "label": label,
             "dim": emb.shape[-1],
-            "key_batch_single": bs,
-            "key_repeat": rp,
             "auc": adjacency_auc(emb, near=args.near, far=args.far),
+            **ks,
             **g,
         })
 
     w = max(len(r["label"]) for r in rows) + 2
-    print("\n" + "=" * (w + 78))
+    width = w + 96
+    print("\n" + "=" * width)
     print(f"{'encoder':<{w}}{'dim':>5}{'key b/s':>10}{'key rep':>9}"
+          f"{'drift':>11}{'key_scale*':>12}"
           f"{'adj AUC':>10}{'rel contr':>11}{'dist CV':>10}{'mean d':>12}")
-    print("-" * (w + 78))
+    print("-" * width)
     for r in rows:
+        ok = r["key_scale_ok"]
+        ok_s = "none" if ok != ok else f"{ok:.0e}"          # nan check
         print(f"{r['label']:<{w}}{r['dim']:>5}{r['key_batch_single']:>10.3f}"
-              f"{r['key_repeat']:>9.3f}{r['auc']:>10.3f}{r['rel_contrast']:>11.3f}"
+              f"{r['key_repeat']:>9.3f}{r['drift']:>11.2e}{ok_s:>12}"
+              f"{r['auc']:>10.3f}{r['rel_contrast']:>11.3f}"
               f"{r['dist_cv']:>10.3f}{r['mean_dist']:>12.4g}")
-    print("=" * (w + 78))
+    print("=" * width)
+    print("drift      = max |phi(batch) - phi(single)| per coordinate")
+    print("key_scale* = coarsest-to-finest largest key_scale giving key b/s = 1.000")
 
     print("\nInterpretation:")
     bad = False
     for r in rows:
         if r["key_batch_single"] < 1.0:
             bad = True
+            ok = r["key_scale_ok"]
             print(f"  FAIL  {r['label']}: key match (batch vs single) = "
                   f"{r['key_batch_single']:.3f}, must be 1.000.\n"
                   "        Training embeds num_envs rows, evaluate() embeds 1 —\n"
                   "        they disagree on the key, so eval never takes the\n"
-                  "        exact-match path and MFEC's Eq. (1) latching is lost.\n"
-                  "        Fix: accumulate φ in float64, as RandomProjectionEncoder does.")
+                  "        O(1) exact-match path.  MFEC then leans entirely on\n"
+                  "        QEC's near-exact rescue (a relative-tolerance kNN\n"
+                  f"        test), which is slower and unverified per encoder.\n"
+                  f"        Cause: coordinate drift {r['drift']:.1e} against a "
+                  f"quantisation step of {1 / args.key_scale:.1e}\n"
+                  f"        ({r['dim']} coordinates must ALL survive rounding).")
+            if ok == ok:                                    # not nan
+                print(f"        Fix: algorithm.key_scale={ok:.0e} gives 1.000 "
+                      f"for this encoder.\n"
+                      "        Check first that it does not merge distinct "
+                      "states — compare against\n"
+                      "        the nearest-neighbour distance in 'mean d' x "
+                      "(1 - 'rel contr').")
+            else:
+                print("        No key_scale in the ladder fixes it; this "
+                      "encoder cannot use the\n        hash path at all.")
+            print("        NOTE: 'accumulate in float64' only works for "
+                  "RandomProjectionEncoder\n"
+                  "        (one matmul). A float32 ViT/CNN cannot give "
+                  "bit-identical output\n"
+                  "        across batch shapes — cuBLAS picks kernels by "
+                  "batch size.")
         if r["key_repeat"] < 1.0:
             bad = True
             print(f"  FAIL  {r['label']}: not run-to-run deterministic "

@@ -659,6 +659,28 @@ and expensive to discover after a multi-day run:
 The random-projection baseline scores AUC ≈ 0.92 with perfect key stability;
 use it as the reference when judging another encoder's numbers.
 
+**Measured result (CUDA, 150 Ms. Pac-Man frames):** every float32 encoder fails
+key stability, and it is not fixable by tuning:
+
+| encoder | dim | key b/s | adj AUC | rel contr |
+|---|---|---|---|---|
+| `random_projection` | 64 | **1.000** | 0.955 | 0.627 |
+| `dinov2` ViT-S/14 | 384 | **0.000** | 0.991 | 0.697 |
+| `resnet` resnet18 | 512 | **0.000** | 0.991 | 0.690 |
+| `clip` ViT-B-32-quickgelu | 512 | **0.000** | 0.990 | 0.728 |
+
+cuBLAS picks float32 GEMM kernels by batch size, so `φ(x)` in a 16-row batch
+differs from `φ(x)` alone in the last bits, and a key survives only if all `d`
+coordinates escape rounding — probability `(1 − 2·drift·key_scale)^d`, i.e.
+~1e-18 at `d=384`. Training is unaffected (one batch shape throughout); at
+evaluation the exact-hash path is replaced by the near-exact rescue, which
+resolves to the same entry and returns the same value. Read
+`eval/memory_hit_rate`, not `eval/exact_hit_rate`, when comparing encoders.
+Details and the reason lowering `key_scale` is *not* the fix are in AGENTS.md.
+
+Note the flip side of the same table: all three PVMs beat the random projection
+on both discriminability columns, with CLIP best on relative contrast.
+
 ## NEC embedding networks
 
 MFEC's encoder is **frozen**; NEC's is **trained end-to-end**, so the two have

@@ -1054,6 +1054,16 @@ class QEC:
         # the same reason as _lookup_near.  Their difference in means is the
         # systematic advantage a *tried* action holds over an untried one.
         self._exact_value_sum = torch.zeros((), dtype=torch.float64, device=self.device)
+        # Counted separately from _lookup_exact, which tallies *dict* hits only.
+        # A float32 encoder (any ViT/CNN) scores 0 dict hits at evaluation — its
+        # embedding is not bit-identical across batch shapes, so the quantised
+        # key never matches (measured: 0.000 for DINOv2/ResNet/CLIP on CUDA,
+        # 1.000 for the float64 random projection).  Every Eq. (2) case-1 answer
+        # on those encoders therefore arrives via the near-exact rescue below.
+        # Keying the value stats off _lookup_exact would silently omit
+        # eval/exact_minus_knn_value for exactly the encoders it exists to
+        # compare.
+        self._exact_value_count = torch.zeros((), dtype=torch.long, device=self.device)
         self._knn_value_sum = torch.zeros((), dtype=torch.float64, device=self.device)
         self._knn_count = torch.zeros((), dtype=torch.long, device=self.device)
 
@@ -1070,7 +1080,7 @@ class QEC:
         """
         return (
             float(self._exact_value_sum),
-            self._lookup_exact,
+            int(self._exact_value_count),
             float(self._knn_value_sum),
             int(self._knn_count),
         )
@@ -1188,6 +1198,7 @@ class QEC:
                 exact_hit_vals = self.values[a, hit_s_t]
                 result[a, hit_b_t] = exact_hit_vals.float()
                 self._exact_value_sum += exact_hit_vals.sum()
+                self._exact_value_count += len(hit_b)
 
             if not miss_b:
                 continue   # all queries hit — no kNN needed for this action
@@ -1245,6 +1256,11 @@ class QEC:
             knn_only = ~near_exact
             self._knn_value_sum += knn_avg.double()[knn_only].sum()
             self._knn_count += knn_only.sum()
+            # ...and the rescued ones belong on the EXACT side of the gap: they
+            # return the stored value, not a neighbourhood mean.  This is the
+            # only path that fires for a float32 encoder at eval.
+            self._exact_value_sum += exact_vals.double()[near_exact].sum()
+            self._exact_value_count += near_exact.sum()
 
         return result.T.to(dev_q)   # (B, A)
 
