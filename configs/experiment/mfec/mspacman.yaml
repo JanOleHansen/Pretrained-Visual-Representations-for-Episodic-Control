@@ -18,9 +18,9 @@ algorithm:
   # entries per action, so 100k keeps 2.5x headroom.
   #
   # INERT at this budget: eviction never fires while buffer_size exceeds the
-  # peak, so results are unchanged relative to buffer_size=1e6.  On the 12.5M
-  # budget of mspacman_5seed.yaml it would NOT be inert, which is why that
-  # config keeps the 1e6 default.
+  # peak, so results are unchanged relative to buffer_size=1e6.  On the longer
+  # budgets (mspacman_resnet at 12.5M, the 40M configs) it would NOT be inert,
+  # which is why those keep the 1e6 default.
   buffer_size: 100_000
 
 trainer:

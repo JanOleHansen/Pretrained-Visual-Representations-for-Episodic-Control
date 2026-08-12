@@ -31,7 +31,7 @@ algorithm:
   # INERT at this budget: eviction never fires while buffer_size exceeds the
   # peak, so this does not change results relative to buffer_size=1e6.  It
   # WOULD change them on a 12.5M-decision run, which exceeds 100k entries per
-  # action — that is why mspacman_5seed.yaml is left at the 1e6 default.
+  # action — raise it (and the GPU) for those.
   buffer_size: 100_000
 
 trainer:

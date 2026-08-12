@@ -30,6 +30,15 @@ dependencies = [
     "torchvision>=0.26.0",
 ]
 
+[project.optional-dependencies]
+# MFEC's `clip` encoder only (src/encoders/clip_encoder.py).  Kept out of the
+# base dependencies on purpose: nothing else in the repo needs it, the test
+# suite runs against a stub, and `clip_encoder.py` imports it lazily inside
+# CLIPEncoder.__init__ so its absence costs the other encoders nothing.
+# Install with:
+#     uv sync --extra clip
+clip = ["open_clip_torch>=2.24.0"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

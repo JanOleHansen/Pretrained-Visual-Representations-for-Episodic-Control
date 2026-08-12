@@ -77,6 +77,9 @@ source .venv/bin/activate
 python src/train.py experiment=dqn/cartpole
 ```
 
+`uv sync` covers everything except MFEC's `clip` encoder, whose backbone
+package is an opt-in extra: `uv sync --extra clip` (see "MFEC encoders").
+
 A full training run (500k frames, ~7 minutes on CPU) reproduces the torchrl SOTA
 reference for DQN-CartPole.
 
@@ -569,9 +572,10 @@ MFEC's state embedding is pluggable (`algorithm.encoder_name`):
   contrastive counterpart to `dinov2` and `resnet`. See
   `experiment/mfec/mspacman_clip.yaml`.
 
-  **Needs the optional `open_clip_torch` package** (`uv add open_clip_torch`);
-  it is imported lazily inside `CLIPEncoder.__init__`, so leaving it
-  uninstalled costs nothing to the other encoders. `clip_weights_path` may be
+  **Needs the optional `open_clip_torch` package** — it is a
+  `[project.optional-dependencies]` extra, so install it with
+  `uv sync --extra clip`. It is imported lazily inside `CLIPEncoder.__init__`,
+  so leaving it uninstalled costs nothing to the other encoders. `clip_weights_path` may be
   `null`, in which case open_clip resolves `clip_pretrained_tag` from its hub
   over the network — pass a local checkpoint on an offline cluster, as
   `dinov2_weights` requires.

@@ -615,9 +615,22 @@ process only, and that is not enough.** `ParallelEnv` uses
 `torch`/`numpy`/`random` RNGs come from OS entropy. Before this was fixed,
 nothing called `set_seed` anywhere, and two runs after an identical
 `seed_everything(42)` produced different per-worker start states — measured.
-`experiment=mfec/mspacman_5seed` with `seed: 42,43,44,45,46` was therefore
-**not** five controlled seeds; only the random-projection matrix varied, and in
+A five-seed sweep (`seed: 42,43,44,45,46`) was therefore **not** five
+controlled seeds; only the random-projection matrix varied, and in
 `mfec/mspacman.yaml` (which left `algorithm.seed: null`) not even that.
+
+Multi-seed runs no longer need a dedicated config — the `*_5seed.yaml` files
+were deleted in `270e98a`. `configs/algorithm/mfec_atari.yaml` sets
+`seed: ${trainer.seed}`, so sweeping the trainer seed varies the encoder seed
+with it, and `run.name` carries the seed so output dirs and W&B runs do not
+collide:
+
+```shell
+python src/train.py -m experiment=mfec/mspacman trainer.seed=42,43,44,45,46
+```
+
+`run.group` (= `run.name` without the seed) is passed to the W&B logger, so the
+sweep lands as one group the UI can average with a standard-error band.
 
 Why it is fatal rather than cosmetic: with `repeat_action_probability=0.0` an
 ALE reset is fully deterministic, so `NoopResetEnv`'s `torch.randint` draw is
@@ -783,8 +796,9 @@ legal — torchvision downloads `IMAGENET1K_V1`), and `clip`. The RGB backbones
 ### `clip` — an OPTIONAL dependency, imported lazily
 
 `CLIPEncoder` (`src/encoders/clip_encoder.py`) needs `open_clip_torch`, which
-is deliberately **not** in `pyproject.toml` (`uv add open_clip_torch` to get
-it). `factory.py` imports `CLIPEncoder` at module scope, so `clip_encoder.py`
+is deliberately kept out of the base dependencies — it is a
+`[project.optional-dependencies]` extra, installed with **`uv sync --extra
+clip`**. `factory.py` imports `CLIPEncoder` at module scope, so `clip_encoder.py`
 must keep `import open_clip` **inside `__init__`** — hoisting it to module
 scope makes the missing package break every MFEC run, `random_projection`
 included. Pinned by
@@ -842,10 +856,10 @@ Measured peak on a 1M-decision run is ~40 k entries per action
 experiment configs (`mspacman`, `mspacman_dinov2`, `mspacman_clip`) therefore
 set `buffer_size: 100_000`, which is **inert** — LRU eviction never fires while
 `buffer_size` exceeds the peak, so results are identical to `1e6`. It stops
-being inert on the 12.5M-decision configs (`mspacman_5seed`,
-`mspacman_resnet`), which exceed 100 k entries per action; those keep the 1e6
-default. **Check `train/qec_size` against `buffer_size` before reusing this
-number on a longer run.**
+being inert on the longer budgets — `mspacman_resnet` (12.5M) and the 40M
+configs exceed 100 k entries per action — so those keep the 1e6 default.
+**Check `train/qec_size` against `buffer_size` before reusing this number on a
+longer run.**
 
 ### Adding an encoder keyword is a THREE-file change
 
