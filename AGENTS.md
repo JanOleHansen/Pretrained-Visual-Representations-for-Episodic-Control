@@ -834,6 +834,18 @@ Model names use open_clip's hyphenated spelling (`ViT-B-32`), not OpenAI's
 legal — open_clip then resolves `clip_pretrained_tag` over the network, so set
 a path on an offline cluster.
 
+**QuickGELU pairing is checked, and the check is load-bearing.** OpenAI's CLIP
+was trained with QuickGELU activations; open_clip's plain `ViT-B-32` config
+uses standard GELU. open_clip loads the mismatch anyway and only emits a
+`UserWarning` — trivially lost in a multi-day log — after which the run
+produces a *subtly wrong embedding geometry*, i.e. corrupts exactly the
+property the CLIP arm exists to measure. `CLIPEncoder.__init__` raises instead.
+`openai` → `ViT-B-32-quickgelu`; `laion2b_*` / `datacomp_*` → plain
+`ViT-B-32`. The check keys off `clip_pretrained_tag` even when
+`clip_weights_path` is set, because the tag is the checkpoint's provenance
+declaration and the local file does not make a wrong architecture right.
+Guarded by `tests/test_clip_encoder.py`.
+
 Same float32-ViT key-stability caveat as DINOv2: run
 `scripts/encoder_diagnostics.py --clip --device cuda` on the training GPU and
 require `key b/s == 1.000` before trusting a run.

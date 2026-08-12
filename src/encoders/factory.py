@@ -29,7 +29,7 @@ def make_encoder(
         resnet_image_size: int = 224,
         # clip
         clip_weights_path: str | None = None,
-        clip_model_name: str = "ViT-B-32",
+        clip_model_name: str = "ViT-B-32-quickgelu",
         clip_pretrained_tag: str | None = "openai",
         clip_image_size: int | None = None,
         clip_normalize: bool = True,

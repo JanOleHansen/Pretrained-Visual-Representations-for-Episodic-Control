@@ -600,6 +600,21 @@ MFEC's state embedding is pluggable (`algorithm.encoder_name`):
   `ViT-B/32`. `ViT-B-32` is the cheap default: 49 patch tokens against
   `ViT-B-16`'s 196, i.e. ~4× less attention for the same parameter count.
 
+  **The `-quickgelu` suffix is mandatory with the `openai` tag.** OpenAI's CLIP
+  was trained with QuickGELU activations; open_clip's plain `ViT-B-32` config
+  uses standard GELU. Mismatched, open_clip loads the weights anyway, emits
+  only a `UserWarning`, and returns subtly wrong features — the worst possible
+  failure for an encoder whose entire value here is its geometry. `CLIPEncoder`
+  raises instead. The rule:
+
+  | pretrained tag | model name |
+  |---|---|
+  | `openai` | `ViT-B-32-quickgelu` |
+  | `laion2b_*`, `datacomp_*` | `ViT-B-32` (plain GELU) |
+
+  It applies to a locally-cached OpenAI checkpoint too — the file is right, the
+  architecture it is loaded into is what must match.
+
 The RGB encoders (`dinov2`, `resnet`, `clip`) share one env pair,
 `mspacman_mfec_train_rgb` / `mspacman_mfec_eval_rgb`: single RGB frame, no
 GrayScale/Resize (each encoder resizes and ImageNet-normalises inside

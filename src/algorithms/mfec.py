@@ -217,7 +217,7 @@ class MFECAlgorithm(BaseAlgorithm):
             # clip — needs the optional `open_clip_torch` package, imported
             # lazily so the other encoders do not depend on it.
             clip_weights_path: str | None = None,
-            clip_model_name: str = "ViT-B-32",
+            clip_model_name: str = "ViT-B-32-quickgelu",
             clip_pretrained_tag: str | None = "openai",
             clip_image_size: int | None = None,
             # L2-normalise phi, making MFEC's Euclidean kNN equal to the cosine

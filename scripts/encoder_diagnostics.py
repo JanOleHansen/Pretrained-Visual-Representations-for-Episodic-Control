@@ -61,7 +61,10 @@ Usage
     python scripts/encoder_diagnostics.py --clip --device cuda  # key stability!
 
 The CLIP arm needs the optional ``open_clip_torch`` package
-(``uv add open_clip_torch``); nothing else here does.
+(``uv sync --extra clip``); nothing else here does.  Its ``--clip-model``
+default carries the ``-quickgelu`` suffix, which is mandatory with the
+``openai`` tag — see "Checkpoint / architecture pairing" in
+``src/encoders/clip_encoder.py``.
 
 ``--dinov2-random-init`` builds the ViT architecture with *untrained* weights.
 That tells you nothing about representation quality, but the numerics (and
@@ -380,9 +383,11 @@ def main() -> int:
                    help="local open_clip checkpoint for offline boxes; implies --clip")
     p.add_argument("--clip-random-init", action="store_true",
                    help="build the CLIP ViT untrained: valid for key stability ONLY")
-    p.add_argument("--clip-model", default="ViT-B-32",
+    p.add_argument("--clip-model", default="ViT-B-32-quickgelu",
                    help="open_clip architecture name, hyphenated: ViT-B-32, "
-                        "ViT-B-16, ViT-L-14 (NOT OpenAI's 'ViT-B/32')")
+                        "ViT-B-16, ViT-L-14 (NOT OpenAI's 'ViT-B/32'). The "
+                        "-quickgelu suffix is REQUIRED with --clip-pretrained "
+                        "openai; LAION tags want the plain name.")
     p.add_argument("--clip-pretrained", default="openai",
                    help="open_clip pretrained tag, used only when "
                         "--clip-weights is absent (e.g. openai, laion2b_s34b_b79k)")

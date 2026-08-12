@@ -34,6 +34,25 @@ Preprocessing notes (both deliberate, both differ from stock CLIP)
   accepting the aspect-ratio distortion.  Losing pixels is much worse than
   distorting them when the embedding is a memory key.
 
+Checkpoint / architecture pairing — QuickGELU
+----------------------------------------------
+OpenAI's CLIP was trained with **QuickGELU** activations; open_clip's plain
+``ViT-B-32`` config uses standard GELU.  Pairing them loads fine and raises no
+error — it just produces subtly wrong features, which is the worst possible
+failure for an encoder whose entire value here is the geometry of its output.
+open_clip only emits a ``UserWarning``, easy to lose in a multi-day training
+log, so ``__init__`` turns it into a hard error.  The rule:
+
+===========================  ==========================
+pretrained tag               model name
+===========================  ==========================
+``openai``                   ``ViT-B-32-quickgelu``
+``laion2b_*`` / ``datacomp`` ``ViT-B-32``  (plain GELU)
+===========================  ==========================
+
+This applies to a locally-cached OpenAI checkpoint too: the file is correct,
+the *architecture* it is loaded into is what must match.
+
 Key stability
 -------------
 Like DINOv2 this is a **float32 ViT**, so it carries no guarantee that the
@@ -61,7 +80,7 @@ _CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
 _INSTALL_HINT = (
     "CLIPEncoder needs the `open_clip_torch` package, which is not installed.\n"
-    "    uv add open_clip_torch        (or: pip install open_clip_torch)\n"
+    "    uv sync --extra clip         (or: pip install open_clip_torch)\n"
     "open_clip is used rather than timm because it exposes the *projected* "
     "image embedding — the space CLIP's contrastive objective actually "
     "operates on, which is the whole reason to try CLIP as an episodic-memory "
@@ -103,7 +122,7 @@ class CLIPEncoder(Encoder):
     def __init__(
         self,
         weights_path: str | None = None,
-        model_name: str = "ViT-B-32",
+        model_name: str = "ViT-B-32-quickgelu",
         pretrained_tag: str | None = "openai",
         image_size: int | None = None,
         device: torch.device | None = None,
@@ -116,6 +135,24 @@ class CLIPEncoder(Encoder):
             import open_clip
         except ImportError as exc:                       # pragma: no cover
             raise ImportError(_INSTALL_HINT) from exc
+
+        # OpenAI's CLIP uses QuickGELU; open_clip's plain configs use GELU.
+        # Mismatched, open_clip loads the weights anyway and only warns, so the
+        # run silently produces the wrong embedding geometry. Fail loudly.
+        if (
+            (pretrained_tag or "").lower() == "openai"
+            and "quickgelu" not in model_name.lower()
+        ):
+            raise ValueError(
+                f"clip_model_name={model_name!r} is paired with "
+                f"clip_pretrained_tag='openai', but OpenAI's CLIP was trained "
+                f"with QuickGELU activations and {model_name!r} uses standard "
+                f"GELU. open_clip loads this combination with only a warning "
+                f"and returns subtly wrong features.\n"
+                f"    Fix: clip_model_name={model_name + '-quickgelu'!r}\n"
+                f"LAION/DataComp tags (laion2b_*, datacomp_*) want the plain "
+                f"name instead — they were trained with standard GELU."
+            )
 
         self.model_name = model_name
         self.normalize = bool(normalize)

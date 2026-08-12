@@ -38,7 +38,15 @@ algorithm:
   # "ViT-B/32".  ViT-B-32 is the cheap choice: 49 patch tokens against
   # ViT-B-16's 196, i.e. roughly 4x less attention for the same parameter
   # count, and the ViT forward is this pipeline's bottleneck.
-  clip_model_name: ViT-B-32
+  #
+  # The "-quickgelu" suffix is REQUIRED with the openai tag: OpenAI's CLIP was
+  # trained with QuickGELU activations while open_clip's plain ViT-B-32 config
+  # uses standard GELU.  Mismatched, open_clip loads the weights anyway and
+  # only emits a UserWarning, then returns subtly wrong features — the worst
+  # possible failure for an encoder whose whole value here is its geometry.
+  # CLIPEncoder turns that warning into a hard error.  LAION/DataComp tags
+  # (laion2b_*, datacomp_*) want the PLAIN name instead.
+  clip_model_name: ViT-B-32-quickgelu
   clip_pretrained_tag: openai
 
   # null = the backbone's native resolution (224).  Anything else is passed to

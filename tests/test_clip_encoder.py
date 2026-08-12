@@ -106,8 +106,8 @@ def test_missing_open_clip_raises_an_actionable_error(monkeypatch):
 
 def test_local_weights_path_wins_over_the_hub_tag(stub_open_clip):
     CLIPEncoder(weights_path="/local/ckpt.bin", pretrained_tag="openai",
-                model_name="ViT-B-16")
-    assert stub_open_clip["model_name"] == "ViT-B-16"
+                model_name="ViT-B-16-quickgelu")
+    assert stub_open_clip["model_name"] == "ViT-B-16-quickgelu"
     assert stub_open_clip["pretrained"] == "/local/ckpt.bin"
     assert stub_open_clip["precision"] == "fp32"
     # Not forwarded unless explicitly requested — older open_clip lacks it.
@@ -115,8 +115,53 @@ def test_local_weights_path_wins_over_the_hub_tag(stub_open_clip):
 
 
 def test_hub_tag_used_when_no_local_path(stub_open_clip):
-    CLIPEncoder(weights_path=None, pretrained_tag="laion2b_s34b_b79k")
+    CLIPEncoder(weights_path=None, pretrained_tag="laion2b_s34b_b79k",
+                model_name="ViT-B-32")
     assert stub_open_clip["pretrained"] == "laion2b_s34b_b79k"
+
+
+# ---------------------------------------------------------------------------
+# 2b. QuickGELU pairing — silent wrong features if unguarded
+# ---------------------------------------------------------------------------
+#
+# OpenAI's CLIP was trained with QuickGELU activations; open_clip's plain
+# ViT-B-32 config uses standard GELU. open_clip loads the mismatch anyway and
+# only emits a UserWarning, which is trivially lost in a training log — and the
+# result is a *subtly wrong embedding geometry*, i.e. exactly the property the
+# whole CLIP arm exists to measure. So the encoder refuses the combination.
+
+def test_openai_tag_with_plain_gelu_model_is_rejected(stub_open_clip):
+    with pytest.raises(ValueError, match="QuickGELU"):
+        CLIPEncoder(model_name="ViT-B-32", pretrained_tag="openai")
+
+
+def test_the_rejection_names_the_exact_fix(stub_open_clip):
+    with pytest.raises(ValueError, match=r"ViT-B-16-quickgelu"):
+        CLIPEncoder(model_name="ViT-B-16", pretrained_tag="openai")
+
+
+def test_openai_tag_is_rejected_even_with_local_weights(stub_open_clip):
+    """A local file does not make the architecture right.
+
+    The recommended offline flow parks OpenAI's checkpoint on disk and sets
+    clip_weights_path, so this is the path users actually hit. The tag still
+    documents the checkpoint's provenance, so it still has to agree.
+    """
+    with pytest.raises(ValueError, match="QuickGELU"):
+        CLIPEncoder(model_name="ViT-B-32", pretrained_tag="openai",
+                    weights_path="/datahome/me/models/clip_ViT-B-32_openai.pt")
+
+
+def test_laion_tags_want_the_plain_name(stub_open_clip):
+    """The rule is not "always quickgelu" — LAION used standard GELU."""
+    CLIPEncoder(model_name="ViT-B-32", pretrained_tag="laion2b_s34b_b79k")
+    CLIPEncoder(model_name="ViT-B-32", pretrained_tag="datacomp_xl_s13b_b90k")
+
+
+def test_the_default_pairing_is_self_consistent(stub_open_clip):
+    """The constructor defaults must not trip the constructor's own guard."""
+    encoder = CLIPEncoder()
+    assert "quickgelu" in encoder.model_name.lower()
 
 
 def test_random_init_is_expressible_as_no_weights_and_no_tag(stub_open_clip):
