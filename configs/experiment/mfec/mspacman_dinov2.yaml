@@ -3,10 +3,14 @@
 # the encoder ablation against mspacman.yaml (random projection) and
 # mspacman_vae.yaml (paper-exact VAE).  The env pair is the paper-faithful MFEC
 # one, so all three arms differ *only* in the encoder.
+# ENV: the shared RGB pair, not mspacman_mfec_*_dinov2.  Those two files are
+# byte-identical to the _rgb pair (verified), so this is not a behaviour change
+# — it just puts every RGB arm (rp_rgb / dinov2 / resnet / clip) on ONE env
+# definition, which is what makes phi the only variable between them.
 defaults:
   - override /algorithm: mfec_atari
-  - override /environment: mspacman_mfec_train_dinov2
-  - override /environment@eval_environment: mspacman_mfec_eval_dinov2
+  - override /environment: mspacman_mfec_train_rgb
+  - override /environment@eval_environment: mspacman_mfec_eval_rgb
   - _self_
 
 run:
@@ -21,18 +25,11 @@ algorithm:
   dinov2_image_size: 224
   state_dim: 384
 
-  # QEC MEMORY.  QEC._init_states allocates (num_actions, buffer_size,
-  # state_dim) float32 eagerly, so with 9 Ms. Pac-Man actions the mfec_atari
-  # default of 1e6 costs 9 * 1e6 * 384 * 4 = 13.8 GB of GPU memory before a
-  # frame is collected — for a buffer whose measured peak is ~40k entries per
-  # action (train/qec_size) on this 1M-decision budget.  100k keeps 2.5x
-  # headroom at 1.4 GB.
-  #
-  # INERT at this budget: eviction never fires while buffer_size exceeds the
-  # peak, so this does not change results relative to buffer_size=1e6.  It
-  # WOULD change them on a 12.5M-decision run, which exceeds 100k entries per
-  # action — raise it (and the GPU) for those.
-  buffer_size: 100_000
+  # QEC MEMORY.  Held identical across every Ms. Pac-Man arm so the encoder
+  # ablation differs only in phi — see mspacman.yaml for the sizing
+  # arithmetic, the measured peak (~72k entries on the busiest action at
+  # 1M decisions) and why eviction must never fire.
+  buffer_size: 300_000
 
 trainer:
   # UNITS: total_frames counts agent *decisions* (StepTrainer does

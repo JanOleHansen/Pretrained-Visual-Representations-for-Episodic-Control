@@ -28,23 +28,23 @@ algorithm:
   # ResNetEncoder reads the true value off fc.in_features; this only sizes the
   # zero-length fallback tensor in MFECAlgorithm, but keep it consistent.
   state_dim: 512
+  # Held identical across every Ms. Pac-Man arm — see mspacman.yaml.
+  buffer_size: 300_000
 
 trainer:
   # UNITS: total_frames counts agent *decisions* (StepTrainer does
   # `self._step += batch.numel()`), while the paper's x-axis counts ALE emulator
-  # frames at 4 per decision.  12.5M decisions = 50M emulator frames = the full
-  # x-range of Figure 1, matching every other encoder arm's x-axis.
-  total_frames: 12_500_000
+  # frames at 4 per decision.  1M decisions = 4M emulator frames — the SAME
+  # budget as every other Ms. Pac-Man arm.  This used to be 12.5M with
+  # num_envs=4, which made a resnet-vs-dinov2 read a comparison of frame budgets
+  # rather than of encoders.
+  total_frames: 1_000_000
   seed: 42
   accelerator: gpu
   devices: [0]
-  # Matches mspacman.yaml / mspacman_dinov2.yaml.  Every env in a ParallelEnv
-  # acts on a QEC that is only updated at episode end, so raising this buys
-  # throughput at the cost of the one-shot latching that is the point of
-  # episodic control.
-  num_envs: 4
+  num_envs: 16
   log_every_n_steps: 10_000
-  eval_every_n_steps: 200_000   # 200k decisions = 800k emulator frames
+  eval_every_n_steps: 50_000
   # eval_eps=0.0 (see configs/algorithm/mfec_atari.yaml) makes every eval
   # episode identical on a deterministic ALE, so N>1 buys N copies of one
   # number at N times the cost.

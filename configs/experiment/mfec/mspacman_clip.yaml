@@ -67,19 +67,11 @@ algorithm:
   # MFECAlgorithm._embed_observations, and the QEC memory arithmetic below.
   state_dim: 512
 
-  # QEC MEMORY.  QEC._init_states allocates the whole buffer eagerly as
-  # (num_actions, buffer_size, state_dim) float32, so with 9 Ms. Pac-Man
-  # actions the default buffer_size of 1e6 costs 9 * 1e6 * 512 * 4 = 18.4 GB of
-  # GPU memory before a single frame is collected.  Measured peak usage on a
-  # 1M-decision run is ~40k entries per action (train/qec_size), so 100k leaves
-  # 2.5x headroom at 1.84 GB.
-  #
-  # This is INERT, not a hyperparameter change: eviction never fires while
-  # buffer_size exceeds the peak, so results are identical to buffer_size=1e6.
-  # It stops being inert on a longer run — a 12.5M-decision budget will exceed
-  # 100k entries per action, at which point LRU eviction starts and the
-  # algorithm genuinely changes.  Raise it (and the GPU) for those.
-  buffer_size: 100_000
+  # QEC MEMORY.  Held identical across every Ms. Pac-Man arm so the encoder
+  # ablation differs only in phi — see mspacman.yaml for the sizing
+  # arithmetic, the measured peak (~72k entries on the busiest action at
+  # 1M decisions) and why eviction must never fire.
+  buffer_size: 300_000
 
 trainer:
   # UNITS: total_frames counts agent *decisions*; the paper's x-axis counts ALE

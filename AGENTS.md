@@ -434,12 +434,18 @@ configs/
   experiment/mfec/pong.yaml    — MFEC on Pong (40M frames, num_envs=16)
   experiment/mfec/breakout.yaml — MFEC on Breakout (1M frames)
   experiment/mfec/qbert.yaml   — MFEC on Q*Bert (40M frames, num_envs=16)
-  experiment/mfec/mspacman.yaml — MFEC on Ms. Pac-Man, paper-comparable (12.5M decisions =
-                              50M emulator frames = Figure 1's full x-range; num_envs=4)
-  experiment/mfec/mspacman_vae.yaml — same, with encoder_name=vae + singleframe env
-                              (vae_checkpoint is required, no default — see "Encoders" above)
-  experiment/mfec/mspacman_dinov2.yaml — same, with encoder_name=dinov2 (frozen ViT-S/14,
-                              state_dim=384) + the mspacman_mfec_*_dinov2 env pair.
+  experiment/mfec/mspacman.yaml — the PAPER BASELINE of the encoder ablation: random
+                              projection over a single 84x84 grayscale frame, Blundell et al.
+                              §3's exact phi.  1M decisions = 4M emulator frames, num_envs=16.
+                              See "The Ms. Pac-Man encoder ablation" for the other five arms;
+                              every non-phi knob is held equal across them.
+  experiment/mfec/mspacman_vae.yaml — same env pair and budget, encoder_name=vae (the paper's
+                              OTHER phi, §3).  vae_checkpoint is required, no default.
+                              Uses mspacman_mfec_* — NOT mspacman_*_singleframe, which is a
+                              DQN-style stack whose SignTransform would make its
+                              episode_reward a pellet count rather than a game score.
+  experiment/mfec/mspacman_dinov2.yaml — same budget, encoder_name=dinov2 (frozen ViT-S/14,
+                              state_dim=384) on the shared mspacman_mfec_*_rgb env pair.
                               dinov2_weights is required and has no usable default — the
                               checked-in path is cluster-local.  NOTE: this config used the
                               DQN-style mspacman_train_dinov2 env pair until Aug 2026; runs
@@ -449,6 +455,9 @@ configs/
                               resnet18, state_dim=512) + the mspacman_mfec_*_rgb env pair.
                               resnet_weights_path may be null (torchvision downloads
                               IMAGENET1K_V1); set a path on an offline cluster.
+  experiment/mfec/mspacman_rp_rgb.yaml — the ENCODER CONTROL: random projection over the
+                              same RGB observations the PVM arms get, state_dim=64.  Without
+                              it, PVM-vs-baseline is confounded with grayscale-vs-RGB.
   experiment/mfec/mspacman_clip.yaml — same, with encoder_name=clip (frozen CLIP ViT-B-32
                               vision tower, projected + L2-normalised, state_dim=512) + the
                               mspacman_mfec_*_rgb env pair.  Needs the optional
@@ -907,6 +916,49 @@ bucket-and-verify scheme (coarse key for the O(1) lookup, exact L2 check to
 reject collisions), not a finer or coarser `key_scale`. That is a real change
 to `QEC` and has not been made.
 
+### The Ms. Pac-Man encoder ablation — hold everything but φ equal
+
+Six arms, **two** env pairs. Every non-φ knob is identical: 1M decisions,
+`num_envs: 16`, `eval_every_n_steps: 50_000`, `buffer_size: 300_000`.
+
+| experiment | env pair | φ | d |
+|---|---|---|---|
+| `mfec/mspacman` | `mspacman_mfec_*` (84×84 grayscale) | random projection | 64 |
+| `mfec/mspacman_vae` | `mspacman_mfec_*` | ConvVAE | 64 |
+| `mfec/mspacman_rp_rgb` | `mspacman_mfec_*_rgb` (210×160 RGB) | random projection | 64 |
+| `mfec/mspacman_dinov2` | `mspacman_mfec_*_rgb` | DINOv2 ViT-S/14 | 384 |
+| `mfec/mspacman_resnet` | `mspacman_mfec_*_rgb` | ResNet-18 | 512 |
+| `mfec/mspacman_clip` | `mspacman_mfec_*_rgb` | CLIP ViT-B-32 | 512 |
+
+`mspacman` → `mspacman_rp_rgb` isolates the observation; `mspacman_rp_rgb` →
+the PVM arms isolates the encoder. **`mspacman_rp_rgb` is not optional** — the
+PVM arms see RGB and the paper baseline sees grayscale, and on Ms. Pac-Man
+ghost identity is colour-coded (a blue ghost is edible, worth 200–1600), so a
+direct `mspacman` vs `mspacman_dinov2` comparison credits the representation
+for information the baseline never received.
+
+Three traps this has already fallen into, now pinned by
+`tests/test_encoder_factory.py`:
+
+1. **`mspacman_resnet` ran 12.5M decisions** against everyone else's 1M, with
+   `num_envs: 4` — a budget comparison wearing an encoder comparison's clothes.
+2. **`mspacman_vae` ran on `mspacman_train_singleframe`**, a DQN-style stack
+   carrying `SignTransform` (reward clipped to `{-1,0,+1}`, so its
+   `episode_reward` was a pellet count, not a score — and MFEC argmaxes over
+   raw Monte-Carlo returns, so a dot scored the same as a ghost),
+   `EndOfLifeTransform`, and a 4,500-step cap instead of 27,000. It never
+   needed that file: `mspacman_mfec_train.yaml` is *already* a single 84×84
+   grayscale frame, which is exactly the paper's VAE input (`x ∈ R^7056`).
+   `mspacman_{train,eval}_singleframe.yaml` are now unused.
+3. **`mspacman_mfec_*_dinov2` duplicated `mspacman_mfec_*_rgb`** byte for byte.
+   Every RGB arm now shares the `_rgb` pair; the `_dinov2` env files are unused.
+
+Note the control keeps its exact-match hash: `RandomProjectionEncoder`'s
+float64 accumulation holds even at 100,800 input dims (RGB 210×160), measured
+`key b/s = 1.000`. So `rp_rgb` takes the O(1) dict path while the PVM arms on
+the *same* observations fall through to the near-exact rescue — a difference in
+lookup mechanism, not in the value returned (see the key-stability section).
+
 ### QEC memory is sized by `state_dim`, and it is not small
 
 `QEC._init_states` allocates `(num_actions, buffer_size, state_dim)` float32
@@ -920,15 +972,15 @@ On Ms. Pac-Man's 9 actions at the `mfec_atari` default `buffer_size: 1_000_000`:
 | `resnet` resnet18 / `clip` ViT-B-32 | 512 | 18.4 GB |
 | `dinov2` ViT-B/14, `clip` ViT-L-14 | 768 | 27.6 GB |
 
-Measured peak on a 1M-decision run is ~40 k entries per action
-(`train/qec_size`), so the 1M default is ~25× oversized. The 1M-decision
-experiment configs (`mspacman`, `mspacman_dinov2`, `mspacman_clip`) therefore
-set `buffer_size: 100_000`, which is **inert** — LRU eviction never fires while
-`buffer_size` exceeds the peak, so results are identical to `1e6`. It stops
-being inert on the longer budgets — `mspacman_resnet` (12.5M) and the 40M
-configs exceed 100 k entries per action — so those keep the 1e6 default.
-**Check `train/qec_size` against `buffer_size` before reusing this number on a
-longer run.**
+Measured at 1M decisions: `train/qec_size` (the **mean** over actions) tops
+out ~40 k, and the busiest action runs ~1.8x the mean, so the real peak is
+~72 k. Every Ms. Pac-Man arm therefore sets `buffer_size: 300_000` — >4x the
+peak, at 0.69 / 4.15 / 5.53 GB for d = 64 / 384 / 512.
+
+It is sized to sit safely **above** the peak rather than tightly: LRU eviction
+must never fire, or the algorithm changes mid-run — and would change at a
+different moment in each arm, silently breaking the ablation. On a longer
+budget watch `train/qec_size` and treat a mean of ~150 k as the ceiling.
 
 ### Adding an encoder keyword is a THREE-file change
 

@@ -275,6 +275,8 @@ def test_resnet_branch_allows_a_null_weights_path(monkeypatch):
     "experiment",
     [
         "mfec/mspacman",
+        "mfec/mspacman_vae",
+        "mfec/mspacman_rp_rgb",
         "mfec/mspacman_dinov2",
         "mfec/mspacman_resnet",
         "mfec/mspacman_clip",
@@ -298,3 +300,94 @@ def test_experiment_algorithm_keys_bind_to_the_constructor(experiment):
         f"{experiment} sets algorithm keys {unknown}, which are not parameters "
         f"of MFECAlgorithm.__init__ — instantiate() will raise TypeError."
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. The Ms. Pac-Man encoder ablation must vary ONLY the encoder
+# ---------------------------------------------------------------------------
+#
+# Six arms, two env pairs. Everything that is not phi has to be held equal or
+# the comparison measures the wrong thing — this has already gone wrong twice:
+# mspacman_resnet ran 12.5M decisions against everyone else's 1M, and
+# mspacman_vae ran on the DQN-style singleframe env, whose SignTransform clips
+# reward to {-1,0,+1} so its episode_reward was a pellet count rather than a
+# game score.
+
+_ABLATION_ARMS = [
+    "mfec/mspacman",            # paper baseline: 84x84 grayscale
+    "mfec/mspacman_vae",        # paper's second phi, same observations
+    "mfec/mspacman_rp_rgb",     # encoder control: RGB, random projection
+    "mfec/mspacman_dinov2",
+    "mfec/mspacman_resnet",
+    "mfec/mspacman_clip",
+]
+
+
+def _ablation_cfgs():
+    from tests.conftest import load_experiment_cfg
+
+    return {arm: load_experiment_cfg(arm, ["logger=[]"]) for arm in _ABLATION_ARMS}
+
+
+def test_every_arm_shares_one_training_budget():
+    cfgs = _ablation_cfgs()
+    budgets = {
+        arm: (c.trainer.total_frames, c.trainer.num_envs,
+              c.trainer.eval_every_n_steps, c.algorithm.buffer_size)
+        for arm, c in cfgs.items()
+    }
+    assert len(set(budgets.values())) == 1, (
+        f"arms differ in budget, so a between-arm comparison is not an encoder "
+        f"comparison: {budgets}"
+    )
+
+
+def test_the_rgb_arms_share_one_env_pair():
+    """rp_rgb / dinov2 / resnet / clip must see byte-identical observations."""
+    from hydra.core.hydra_config import HydraConfig
+
+    seen = {}
+    for arm in ["mfec/mspacman_rp_rgb", "mfec/mspacman_dinov2",
+                "mfec/mspacman_resnet", "mfec/mspacman_clip"]:
+        from tests.conftest import CONFIGS_DIR
+        from hydra import compose, initialize_config_dir
+        from hydra.core.global_hydra import GlobalHydra
+
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIGS_DIR, version_base="1.3"):
+            c = compose(config_name="train", return_hydra_config=True,
+                        overrides=[f"experiment={arm}", "logger=[]"])
+            HydraConfig.instance().set_config(c)
+            ch = c.hydra.runtime.choices
+            seen[arm] = (ch.environment, ch["environment@eval_environment"])
+
+    assert len(set(seen.values())) == 1, (
+        f"RGB arms are on different env pairs, so phi is not the only "
+        f"difference between them: {seen}"
+    )
+
+
+def test_the_paper_arms_use_the_paper_faithful_env():
+    """mspacman + vae are the Figure-1-comparable pair: no reward clipping."""
+    from hydra.core.hydra_config import HydraConfig
+    from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
+
+    from tests.conftest import CONFIGS_DIR
+
+    for arm in ["mfec/mspacman", "mfec/mspacman_vae"]:
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIGS_DIR, version_base="1.3"):
+            c = compose(config_name="train", return_hydra_config=True,
+                        overrides=[f"experiment={arm}", "logger=[]"])
+            HydraConfig.instance().set_config(c)
+            targets = [t["_target_"] for t in c.environment.transforms]
+
+        assert not any("SignTransform" in t for t in targets), (
+            f"{arm} clips reward: MFEC argmaxes over raw Monte-Carlo returns, "
+            f"so a dot (10 pts) would score the same as a ghost (200-1600), and "
+            f"its episode_reward would not be comparable to the other arms."
+        )
+        assert c.hydra.runtime.choices.environment.startswith("mspacman_mfec"), (
+            f"{arm} is not on the paper-faithful env pair"
+        )

@@ -9,19 +9,37 @@ defaults:
   - override /environment@eval_environment: mspacman_mfec_eval
   - _self_
 
+run:
+  # Without these, run.name/run.group fall back to the Hydra choice names and
+  # this arm reads "mfec_atari_mspacman_mfec_train_random_projection" while
+  # every other arm reads "mfec_mspacman_<encoder>" — inconsistent on disk and
+  # in W&B, where run.group is what a seed sweep is averaged over.
+  algorithm: mfec
+  game: mspacman
+
 algorithm:
-  # QEC MEMORY.  Held identical to the PVM arms (mspacman_dinov2 / _clip) so
-  # the encoder ablation differs only in the encoder.  QEC._init_states
-  # allocates (num_actions, buffer_size, state_dim) float32 eagerly: at the
-  # mfec_atari default of 1e6 that is 9 * 1e6 * 64 * 4 = 2.3 GB even for the
-  # 64-d random projection.  Measured peak on this 1M-decision budget is ~40k
-  # entries per action, so 100k keeps 2.5x headroom.
+  # QEC MEMORY — held IDENTICAL across every Ms. Pac-Man arm, so the encoder
+  # ablation differs only in phi.  This is the canonical comment; the other arms
+  # point back here.
   #
-  # INERT at this budget: eviction never fires while buffer_size exceeds the
-  # peak, so results are unchanged relative to buffer_size=1e6.  On the longer
-  # budgets (mspacman_resnet at 12.5M, the 40M configs) it would NOT be inert,
-  # which is why those keep the 1e6 default.
-  buffer_size: 100_000
+  # QEC._init_states allocates (num_actions, buffer_size, state_dim) float32
+  # eagerly, before a single frame is collected.  With 9 Ms. Pac-Man actions:
+  #
+  #     state_dim  buffer 1e6   buffer 3e5
+  #     64  (rp)      2.3 GB      0.69 GB
+  #     384 (dinov2) 13.8 GB      4.15 GB
+  #     512 (resnet/clip) 18.4 GB 5.53 GB
+  #
+  # 3e5 is chosen to sit safely ABOVE the peak, not to be tight: LRU eviction
+  # must never fire, or the algorithm changes mid-run — and would change at a
+  # different moment in each arm, which would silently break the ablation.
+  # Measured at 1M decisions: train/qec_size (the MEAN over actions) tops out
+  # ~40k, and the busiest action runs ~1.8x the mean, so the real peak is ~72k.
+  # 3e5 is >4x that.
+  #
+  # WATCH train/qec_size on a longer budget.  It logs the mean, so treat
+  # mean ~150k as the ceiling; past that, raise buffer_size (and the GPU).
+  buffer_size: 300_000
 
 trainer:
   # UNITS: total_frames counts agent *decisions* (StepTrainer does

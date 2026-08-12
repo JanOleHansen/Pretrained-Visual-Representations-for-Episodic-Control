@@ -1,0 +1,64 @@
+# @package _global_
+# MFEC on ALE/MsPacman-v5, random projection over the **RGB** observation.
+#
+# THIS IS THE ENCODER CONTROL, not a baseline. It exists because the PVM arms
+# (dinov2 / resnet / clip) differ from the paper baseline (mspacman.yaml) in two
+# ways at once, and only one of them is the thesis question:
+#
+#   mspacman.yaml       84x84 GRAYSCALE, random projection, 64-d
+#   mspacman_dinov2     210x160 RGB,     DINOv2 ViT-S/14,   384-d
+#
+# On Ms. Pac-Man the observation difference is not cosmetic: ghost identity is
+# colour-coded, and a *blue* ghost is edible and worth 200/400/800/1600 — where
+# the large scores come from. At 84x84 grayscale "ghost hunting you" and "ghost
+# you can eat" are near-identical; an RGB encoder can separate them. So a
+# DINOv2-beats-random-projection result read off those two arms is confounded:
+# it could be the representation, or it could be that one arm can see colour.
+#
+# This arm holds the observation fixed at the PVM arms' RGB pair and changes
+# ONLY phi, which is exactly what C1 asks ("do frozen PVRs outperform random
+# projections *as keys*"). Read it as:
+#
+#   mspacman  -> mspacman_rp_rgb   isolates the OBSERVATION (colour + resolution)
+#   mspacman_rp_rgb -> dinov2/resnet/clip   isolates the ENCODER
+#
+# state_dim stays at the paper's 64 on purpose. Matching the PVMs' 384/512
+# instead would trade one confound for another (encoder vs embedding width);
+# dimensionality is its own ablation (thesis 4.4.2), best done by projecting the
+# PVM features DOWN to 64-d rather than by inflating the control.
+defaults:
+  - override /algorithm: mfec_atari
+  - override /environment: mspacman_mfec_train_rgb
+  - override /environment@eval_environment: mspacman_mfec_eval_rgb
+  - _self_
+
+run:
+  algorithm: mfec
+  game: mspacman
+  # Distinguishes this from the grayscale baseline, whose run.encoder is also
+  # "random_projection" — without it the two arms collide in W&B and on disk.
+  encoder: random_projection_rgb
+
+algorithm:
+  encoder_name: random_projection
+  # 3 x 210 x 160 = 100,800 input dims -> a (100800, 64) float64 projection
+  # matrix, ~51 MB. RandomProjectionEncoder reads the input width from the env
+  # spec, so nothing else needs to change.
+  state_dim: 64
+  # Held identical across every Ms. Pac-Man arm — see mspacman.yaml.
+  buffer_size: 300_000
+
+trainer:
+  # UNITS: total_frames counts agent *decisions*; the paper's x-axis counts ALE
+  # emulator frames at 4 per decision. 1M decisions = 4M emulator frames.
+  total_frames: 1_000_000
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  num_envs: 16
+  log_every_n_steps: 10_000
+  eval_every_n_steps: 50_000
+  # eval_eps=0.0 (see configs/algorithm/mfec_atari.yaml) makes every eval
+  # episode identical on a deterministic ALE, so N>1 buys N copies of one
+  # number at N times the cost.
+  num_eval_episodes: 1

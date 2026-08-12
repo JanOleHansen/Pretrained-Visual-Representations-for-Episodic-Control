@@ -1,26 +1,53 @@
 # @package _global_
 # MFEC + paper-exact VAE encoder (Blundell et al. 2016, Appendix D) on
-# ALE/MsPacman-v5. Uses single 84x84 grayscale frames (no CatFrames) to match
-# the paper's VAE input exactly — see mspacman_train_singleframe.yaml.
+# ALE/MsPacman-v5.  Together with mspacman.yaml this is the paper's OWN encoder
+# ablation — random projection vs VAE, the two phi choices of §3 — and it is the
+# first half of research question C1.
+#
 # Pretrain the VAE first with src/train_vae.py, then pass its checkpoint here.
+#
+# ENV: uses the paper-faithful mfec pair, NOT mspacman_train_singleframe.
+# That config was written back when the MFEC Atari stacks still used
+# CatFrames N=4 and a single-frame variant had to be carved out.  It no longer
+# does: mspacman_mfec_train.yaml is ALREADY a single 84x84 grayscale frame, so
+# the VAE's paper-exact input (x in R^7056, in_channels=1) is satisfied by it
+# directly.  Meanwhile mspacman_train_singleframe is derived from the DQN-style
+# stack and drags in three things that are wrong here:
+#   * SignTransform  — rewards clipped to {-1,0,+1}, so the QEC would store
+#     pellet counts while every other arm stores true game score.  MFEC argmaxes
+#     over raw Monte-Carlo returns, so this also flattens a ghost (200-1600) to
+#     the value of a dot (10).  See "Reward scale for Atari MFEC runs".
+#   * EndOfLifeTransform — inert here, but noise.
+#   * StepCounter max_steps 4500 instead of 27,000 — a 5-minute episode cap.
+# Pointing at the mfec pair makes the VAE arm directly comparable to
+# mspacman.yaml: identical task, identical observations, only phi differs.
 defaults:
   - override /algorithm: mfec_atari
-  - override /environment: mspacman_train_singleframe
-  - override /environment@eval_environment: mspacman_eval_singleframe
+  - override /environment: mspacman_mfec_train
+  - override /environment@eval_environment: mspacman_mfec_eval
   - _self_
+
+run:
+  algorithm: mfec
+  game: mspacman
 
 algorithm:
   encoder_name: vae
   vae_checkpoint: ???   # required: algorithm.vae_checkpoint=<path from src/train_vae.py>
+  # embed() returns mean ++ log-std of a 32-dim latent = 64 values.
+  state_dim: 64
+  # Held identical across every Ms. Pac-Man arm — see mspacman.yaml.
+  buffer_size: 300_000
 
 trainer:
-  total_frames: 40_000_100
+  # 1M decisions = 4M emulator frames, matching every other Ms. Pac-Man arm.
+  total_frames: 1_000_000
   seed: 42
   accelerator: gpu
   devices: [0]
   num_envs: 16
   log_every_n_steps: 10_000
-  eval_every_n_steps: 200_000   # paper §4: "evaluate MFEC and NEC every 200,000 frames"
+  eval_every_n_steps: 50_000
   # eval_eps=0.0 (see configs/algorithm/mfec_atari.yaml) makes every eval
   # episode identical on a deterministic ALE, so N>1 buys N copies of one
   # number at N times the cost.

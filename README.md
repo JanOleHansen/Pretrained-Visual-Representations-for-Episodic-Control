@@ -43,10 +43,7 @@ Two derived rules:
 | MFEC      | ALE/Pong-v5      | `experiment=mfec/pong`          |
 | MFEC      | ALE/Breakout-v5  | `experiment=mfec/breakout`      |
 | MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`         |
-| MFEC      | ALE/MsPacman-v5  | `experiment=mfec/mspacman`      |
-| MFEC      | ALE/MsPacman-v5  | `experiment=mfec/mspacman_dinov2` (frozen DINOv2 ViT-S/14) |
-| MFEC      | ALE/MsPacman-v5  | `experiment=mfec/mspacman_resnet` (frozen ImageNet ResNet-18) |
-| MFEC      | ALE/MsPacman-v5  | `experiment=mfec/mspacman_clip` (frozen CLIP ViT-B-32) |
+| MFEC      | ALE/MsPacman-v5  | `experiment=mfec/mspacman` (see the encoder ablation below) |
 | NEC       | ALE/Pong-v5      | `experiment=nec/pong`           |
 | NEC       | ALE/Hero-v5      | `experiment=nec/hero`           |
 | NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman`       |
@@ -534,6 +531,38 @@ action 0 filled) and seeded the memory with degenerate single-action
 trajectories. Real Q-values are never perturbed, so a populated QEC evaluates
 deterministically. See "Optimistic init must be tie-broken RANDOMLY" in
 AGENTS.md.
+
+## The Ms. Pac-Man encoder ablation
+
+Six arms over **two** env pairs. Everything that is not φ is held equal —
+1M decisions, `num_envs: 16`, `eval_every: 50_000`, `buffer_size: 300_000` —
+so a between-arm difference is an encoder difference and nothing else.
+Pinned by `tests/test_encoder_factory.py`.
+
+| experiment | observations | φ | d | role |
+|---|---|---|---|---|
+| `mfec/mspacman` | 84×84 **grayscale** | random projection | 64 | **paper baseline** — Blundell et al. §3's exact φ, readable against Figure 1 |
+| `mfec/mspacman_vae` | 84×84 grayscale | frozen ConvVAE | 64 | the paper's *other* φ; first half of C1 |
+| `mfec/mspacman_rp_rgb` | 210×160 **RGB** | random projection | 64 | **encoder control** for the PVM arms |
+| `mfec/mspacman_dinov2` | 210×160 RGB | DINOv2 ViT-S/14 | 384 | self-supervised PVM |
+| `mfec/mspacman_resnet` | 210×160 RGB | ImageNet ResNet-18 | 512 | supervised PVM |
+| `mfec/mspacman_clip` | 210×160 RGB | CLIP ViT-B-32 | 512 | contrastive PVM |
+
+Read it as two independent steps:
+
+- `mspacman` → `mspacman_rp_rgb` isolates the **observation** (colour + resolution),
+- `mspacman_rp_rgb` → `dinov2`/`resnet`/`clip` isolates the **encoder**.
+
+That second step is what C1 actually asks, and it needs the control arm: on
+Ms. Pac-Man ghost identity is colour-coded and a *blue* ghost is edible and
+worth 200–1600, so at 84×84 grayscale the baseline structurally cannot see what
+the PVMs see. Comparing `mspacman` directly against `mspacman_dinov2` would
+credit the representation for information the baseline was never given.
+
+The control keeps `state_dim: 64` deliberately. Matching the PVMs' 384/512
+would trade one confound for another (encoder vs embedding width);
+dimensionality is its own ablation, better done by projecting the PVM features
+*down* to 64-d.
 
 ## MFEC encoders
 
