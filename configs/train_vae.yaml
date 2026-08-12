@@ -10,7 +10,12 @@
 defaults:
   - _self_
   - paths: default
-  - environment: mspacman_train_singleframe
+  # Must match the env the VAE arm actually runs on (experiment/mfec/
+  # mspacman_vae.yaml), or phi is pretrained on a different state distribution
+  # than it encodes.  Both stacks yield the same 84x84 grayscale pixels, but
+  # mspacman_train_singleframe truncates episodes at 4,500 decisions against
+  # this one's 27,000, so its frames under-represent late-game states.
+  - environment: mspacman_mfec_train
   - override hydra/job_logging: colorlog
   - override hydra/hydra_logging: colorlog
 
