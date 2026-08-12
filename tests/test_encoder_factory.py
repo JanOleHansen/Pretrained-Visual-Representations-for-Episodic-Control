@@ -28,6 +28,7 @@ import pytest
 import torch
 
 from src.encoders.factory import make_encoder
+from tests.conftest import CONFIGS_DIR
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -274,12 +275,12 @@ def test_resnet_branch_allows_a_null_weights_path(monkeypatch):
 @pytest.mark.parametrize(
     "experiment",
     [
-        "mfec/mspacman",
-        "mfec/mspacman_vae",
-        "mfec/mspacman_rp_rgb",
-        "mfec/mspacman_dinov2",
-        "mfec/mspacman_resnet",
-        "mfec/mspacman_clip",
+        "mfec/rp_gray",
+        "mfec/vae",
+        "mfec/rp_rgb",
+        "mfec/dinov2",
+        "mfec/resnet",
+        "mfec/clip",
     ],
 )
 def test_experiment_algorithm_keys_bind_to_the_constructor(experiment):
@@ -314,12 +315,12 @@ def test_experiment_algorithm_keys_bind_to_the_constructor(experiment):
 # game score.
 
 _ABLATION_ARMS = [
-    "mfec/mspacman",            # paper baseline: 84x84 grayscale
-    "mfec/mspacman_vae",        # paper's second phi, same observations
-    "mfec/mspacman_rp_rgb",     # encoder control: RGB, random projection
-    "mfec/mspacman_dinov2",
-    "mfec/mspacman_resnet",
-    "mfec/mspacman_clip",
+    "mfec/rp_gray",            # paper baseline: 84x84 grayscale
+    "mfec/vae",        # paper's second phi, same observations
+    "mfec/rp_rgb",     # encoder control: RGB, random projection
+    "mfec/dinov2",
+    "mfec/resnet",
+    "mfec/clip",
 ]
 
 
@@ -347,8 +348,8 @@ def test_the_rgb_arms_share_one_env_pair():
     from hydra.core.hydra_config import HydraConfig
 
     seen = {}
-    for arm in ["mfec/mspacman_rp_rgb", "mfec/mspacman_dinov2",
-                "mfec/mspacman_resnet", "mfec/mspacman_clip"]:
+    for arm in ["mfec/rp_rgb", "mfec/dinov2",
+                "mfec/resnet", "mfec/clip"]:
         from tests.conftest import CONFIGS_DIR
         from hydra import compose, initialize_config_dir
         from hydra.core.global_hydra import GlobalHydra
@@ -375,7 +376,7 @@ def test_the_paper_arms_use_the_paper_faithful_env():
 
     from tests.conftest import CONFIGS_DIR
 
-    for arm in ["mfec/mspacman", "mfec/mspacman_vae"]:
+    for arm in ["mfec/rp_gray", "mfec/vae"]:
         GlobalHydra.instance().clear()
         with initialize_config_dir(config_dir=CONFIGS_DIR, version_base="1.3"):
             c = compose(config_name="train", return_hydra_config=True,
@@ -388,6 +389,79 @@ def test_the_paper_arms_use_the_paper_faithful_env():
             f"so a dot (10 pts) would score the same as a ghost (200-1600), and "
             f"its episode_reward would not be comparable to the other arms."
         )
-        assert c.hydra.runtime.choices.environment.startswith("mspacman_mfec"), (
+        assert c.hydra.runtime.choices.environment.startswith("atari_mfec"), (
             f"{arm} is not on the paper-faithful env pair"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6. The `game` variable — one token per game, no per-game config files
+# ---------------------------------------------------------------------------
+#
+# configs/environment/atari_mfec_*.yaml build `name: ALE/${game}-v5`, so a whole
+# suite (e.g. the Atari-3 subset: Assault / BankHeist / RoadRunner) is a sweep
+# rather than a directory of near-duplicate files. Two things have to hold or
+# the sweep is silently wrong.
+
+_ATARI3 = ["Assault", "BankHeist", "RoadRunner", "Jamesbond", "MsPacman"]
+
+
+def _compose_game(arm: str, game: str):
+    from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
+    from hydra.core.hydra_config import HydraConfig
+
+    from tests.conftest import CONFIGS_DIR
+
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=CONFIGS_DIR, version_base="1.3"):
+        cfg = compose(config_name="train", return_hydra_config=True,
+                      overrides=[f"experiment={arm}", f"game={game}", "logger=[]"])
+        HydraConfig.instance().set_config(cfg)
+        return cfg
+
+
+@pytest.mark.parametrize("game", _ATARI3)
+def test_the_game_variable_reaches_both_envs(game):
+    cfg = _compose_game("mfec/clip", game)
+    assert cfg.environment.name == f"ALE/{game}-v5"
+    assert cfg.eval_environment.name == f"ALE/{game}-v5", (
+        "eval env did not follow `game` — training and evaluation would run "
+        "different games."
+    )
+
+
+def test_run_names_stay_distinct_across_a_game_sweep():
+    """The collision that makes a sweep silently overwrite itself.
+
+    run.name drives both the output directory and the W&B run; run.group is
+    what a seed sweep is averaged over. If either stopped tracking `game`, all
+    three Atari-3 games would land in one place.
+    """
+    names, groups = set(), set()
+    for game in _ATARI3:
+        cfg = _compose_game("mfec/clip", game)
+        names.add(cfg.run.name)
+        groups.add(cfg.run.group)
+    assert len(names) == len(_ATARI3), f"run.name collides across games: {names}"
+    assert len(groups) == len(_ATARI3), f"run.group collides across games: {groups}"
+
+
+def test_env_configs_still_load_standalone_outside_hydra():
+    """scripts/encoder_diagnostics.py does a bare OmegaConf.load on these.
+
+    A plain ${game} would raise InterpolationKeyError there; the oc.select
+    default is what keeps the diagnostics script working.
+    """
+    from pathlib import Path
+
+    from omegaconf import OmegaConf
+
+    for name in ["atari_mfec_train", "atari_mfec_eval",
+                 "atari_mfec_train_rgb", "atari_mfec_eval_rgb"]:
+        path = Path(CONFIGS_DIR) / "environment" / f"{name}.yaml"
+        cfg = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
+        assert cfg["name"] == "ALE/MsPacman-v5", (
+            f"{name} does not resolve standalone; encoder_diagnostics.py "
+            f"loads it outside Hydra and would crash."
         )

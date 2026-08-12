@@ -14,8 +14,22 @@ defaults:
 # same directory instead of creating a second TensorBoard run for one experiment.
 # Experiment configs should override `algorithm` and `game` with short names;
 # the defaults fall back to the selected config-group option.
+# ALE game id for the game-generic environment configs (configs/environment/
+# atari_mfec_*.yaml), which build `name: ALE/${game}-v5`.  One token per game,
+# so a whole suite is a sweep rather than a directory of near-duplicate files:
+#
+#     python src/train.py -m experiment=mfec/clip game=Assault,BankHeist,RoadRunner
+#
+# Only the MFEC Ms. Pac-Man/Atari-3 arms read it; the DQN/DDPG/A2C experiments
+# and the older mfec/{pong,qbert,breakout,hero} configs still name their env
+# explicitly and ignore this.
+game: MsPacman
+
 run:
   algorithm: ${hydra:runtime.choices.algorithm}
+  # Experiments on a game-generic env override this to ${game}; the rest fall
+  # back to the env config's own name.  It must track the real game or a sweep
+  # writes every arm to the same run.name and they collide.
   game: ${hydra:runtime.choices.environment}
   encoder: ${oc.select:algorithm.encoder_name,none}
   seed: ${trainer.seed}

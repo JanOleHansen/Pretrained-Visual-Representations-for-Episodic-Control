@@ -1,7 +1,7 @@
 # @package _global_
 # NEC on ALE/MsPacman-v5 (Pritzel et al. 2017).
 #
-# This is the NEC analogue of experiment/mfec/mspacman.yaml. Note there is only
+# This is the NEC analogue of experiment/mfec/rp_gray.yaml. Note there is only
 # ONE NEC Ms. Pac-Man config, whereas MFEC has three (mspacman / mspacman_vae /
 # mspacman_dinov2). NEC's embedding network IS swappable, but via its own config
 # group (configs/algorithm/embedding_network/) rather than per-experiment files:

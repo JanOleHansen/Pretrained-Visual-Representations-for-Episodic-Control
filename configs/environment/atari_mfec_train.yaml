@@ -1,4 +1,4 @@
-name: ALE/MsPacman-v5
+name: ALE/${oc.select:game,MsPacman}-v5
 gym_backend: gymnasium
 
 # Paper-faithful Atari setup for MFEC (Blundell et al. 2016, §4.1).

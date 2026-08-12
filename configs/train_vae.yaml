@@ -5,7 +5,7 @@
 # environment defaults to the single-frame variant (no CatFrames) to match
 # the paper's 84x84-single-frame VAE input -- see mspacman_train_singleframe.yaml.
 # Produces a state_dict checkpoint consumable via:
-#   python src/train.py experiment=mfec/mspacman_vae \
+#   python src/train.py experiment=mfec/vae \
 #       algorithm.vae_checkpoint=<checkpoint.save_path>
 defaults:
   - _self_
@@ -15,7 +15,7 @@ defaults:
   # than it encodes.  Both stacks yield the same 84x84 grayscale pixels, but
   # mspacman_train_singleframe truncates episodes at 4,500 decisions against
   # this one's 27,000, so its frames under-represent late-game states.
-  - environment: mspacman_mfec_train
+  - environment: atari_mfec_train
   - override hydra/job_logging: colorlog
   - override hydra/hydra_logging: colorlog
 

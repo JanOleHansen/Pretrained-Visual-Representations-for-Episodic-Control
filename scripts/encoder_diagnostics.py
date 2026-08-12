@@ -259,11 +259,11 @@ def build_encoders(args) -> list[tuple[str, object, str]]:
     """-> list of (label, encoder, env_config_name)."""
     out: list[tuple[str, object, str]] = []
 
-    # Random projection: 84x84 grayscale, as configs/environment/mspacman_mfec_train.yaml
+    # Random projection: 84x84 grayscale, as configs/environment/atari_mfec_train.yaml
     out.append((
         "random_projection (64-d)",
         RandomProjectionEncoder(84 * 84, 64, seed=args.seed),
-        "mspacman_mfec_train",
+        "atari_mfec_train",
     ))
 
     if args.dinov2_weights or args.dinov2_random_init:
@@ -307,7 +307,7 @@ def build_encoders(args) -> list[tuple[str, object, str]]:
             )
             label = f"DINOv2 {args.dinov2_model} ({enc.state_dim}-d)"
 
-        out.append((label, enc, "mspacman_mfec_train_dinov2"))
+        out.append((label, enc, "atari_mfec_train_rgb"))
 
     # NOTE: this block is deliberately at function scope, NOT nested inside the
     # DINOv2 branch above.  Nesting it there (as it was until this was caught)
@@ -346,7 +346,7 @@ def build_encoders(args) -> list[tuple[str, object, str]]:
             )
             label = f"ResNet {args.resnet_model} ({enc.state_dim}-d)"
 
-        out.append((label, enc, "mspacman_mfec_train_rgb"))
+        out.append((label, enc, "atari_mfec_train_rgb"))
 
 
     if args.clip or args.clip_weights or args.clip_random_init:
@@ -377,7 +377,7 @@ def build_encoders(args) -> list[tuple[str, object, str]]:
         if enc.normalize:
             label += " L2"
 
-        out.append((label, enc, "mspacman_mfec_train_rgb"))
+        out.append((label, enc, "atari_mfec_train_rgb"))
 
     if args.vae_checkpoint:
         from src.encoders.vae_encoder import VAEEncoder
@@ -385,7 +385,7 @@ def build_encoders(args) -> list[tuple[str, object, str]]:
         out.append((
             "VAE (64-d)",
             VAEEncoder(args.vae_checkpoint, 1, 64, torch.device("cpu")),
-            "mspacman_mfec_train",
+            "atari_mfec_train",
         ))
 
     return out

@@ -3,7 +3,7 @@ gym_backend: gymnasium
 
 # Paper-faithful MFEC setup (Blundell et al. 2016, §4.1) with a DINOv2 PVM as φ.
 #
-# This is mspacman_mfec_train.yaml with exactly two changes, both forced by the
+# This is atari_mfec_train.yaml with exactly two changes, both forced by the
 # encoder: GrayScale/Resize are dropped (DINOv2 needs 3 channels, and resizing
 # to its 224x224 grid happens inside DINOv2Encoder.embed()).  Everything that
 # affects the *task* — sticky actions, reward scale, episode boundaries — is

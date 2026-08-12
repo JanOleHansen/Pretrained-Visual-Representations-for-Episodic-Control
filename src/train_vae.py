@@ -9,12 +9,12 @@ Control"), Appendix D: 1M random-policy frames, RMSProp lr=1e-5, batch=100,
 
 Usage:
     python src/train_vae.py
-    python src/train_vae.py environment=mspacman_train_singleframe device=cuda:0
+    python src/train_vae.py device=cuda:0
     python src/train_vae.py collect.frames=50_000 train.steps=20_000  # quick run
     python src/train_vae.py collect.num_envs=8   # parallelize ALE frame collection
 
 Then feed the resulting checkpoint into an MFEC run:
-    python src/train.py experiment=mfec/mspacman_vae \\
+    python src/train.py experiment=mfec/vae \\
         algorithm.vae_checkpoint=<checkpoint.save_path printed above>
 """
 from __future__ import annotations

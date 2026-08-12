@@ -15,8 +15,9 @@ by ``test_bare_reset_is_deterministic`` below), so **the only** thing that
 distinguishes one episode's start state from another's is ``NoopResetEnv``'s
 ``torch.randint`` draw — which happens inside the worker. Measured before the
 fix: two runs after an identical ``seed_everything(42)`` produced different
-per-worker reset states. So ``experiment=mfec/mspacman_5seed`` with
-``seed: 42,43,44,45,46`` was not five controlled seeds; the environments and
+per-worker reset states. So a five-seed sweep
+(``-m experiment=mfec/rp_gray trainer.seed=42,43,44,45,46``) was not five
+controlled seeds; the environments and
 rollouts differed run to run no matter what the sweep said.
 """
 from __future__ import annotations

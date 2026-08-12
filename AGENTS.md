@@ -18,7 +18,7 @@ Implemented experiments:
 | MFEC      | ALE/Pong-v5      | `experiment=mfec/pong`         |
 | MFEC      | ALE/Breakout-v5  | `experiment=mfec/breakout`     |
 | MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`        |
-| MFEC      | ALE/MsPacman-v5  | `experiment=mfec/mspacman`     |
+| MFEC      | ALE/MsPacman-v5  | `experiment=mfec/rp_gray`     |
 | NEC       | ALE/Pong-v5      | `experiment=nec/pong`          |
 
 ## Design principles
@@ -405,18 +405,18 @@ configs/
   environment/mspacman_eval.yaml  — ALE/MsPacman-v5 (eval transforms)
   environment/mspacman_train_singleframe.yaml — same, minus CatFrames (paper-exact VAE encoder input)
   environment/mspacman_eval_singleframe.yaml  — eval counterpart, no CatFrames
-  environment/mspacman_mfec_train.yaml — ALE/MsPacman-v5, paper-faithful MFEC stack: single frame,
+  environment/atari_mfec_train.yaml — ALE/MsPacman-v5, paper-faithful MFEC stack: single frame,
                               no SignTransform, repeat_action_probability=0.0 (see "MFEC on Atari" below)
-  environment/mspacman_mfec_eval.yaml  — eval counterpart (identical by design; nothing to strip)
-  environment/mspacman_mfec_train_dinov2.yaml — the mspacman_mfec_train stack with GrayScale/Resize
+  environment/atari_mfec_eval.yaml  — eval counterpart (identical by design; nothing to strip)
+  environment/mspacman_mfec_train_dinov2.yaml — the atari_mfec_train stack with GrayScale/Resize
                               dropped (DINOv2 needs 3 channels and resizes internally); task
                               settings held identical so encoder is the only variable
   environment/mspacman_mfec_eval_dinov2.yaml  — eval counterpart (identical by design)
-  environment/mspacman_mfec_train_rgb.yaml — the generalised version of the two above, for ANY
+  environment/atari_mfec_train_rgb.yaml — the generalised version of the two above, for ANY
                               RGB PVM (dinov2, resnet, ...); byte-equivalent to the _dinov2
                               pair, which is kept only so existing runs stay reproducible.
                               Prefer this one for new encoder arms.
-  environment/mspacman_mfec_eval_rgb.yaml  — eval counterpart (identical by design)
+  environment/atari_mfec_eval_rgb.yaml  — eval counterpart (identical by design)
   environment/mspacman_nec_train.yaml — ALE/MsPacman-v5 for NEC: action-repeat 4, NO
                               SignTransform (paper §4 names Ms. Pac-Man as a game where
                               NEC's lack of reward clipping is what produces the result)
@@ -434,33 +434,33 @@ configs/
   experiment/mfec/pong.yaml    — MFEC on Pong (40M frames, num_envs=16)
   experiment/mfec/breakout.yaml — MFEC on Breakout (1M frames)
   experiment/mfec/qbert.yaml   — MFEC on Q*Bert (40M frames, num_envs=16)
-  experiment/mfec/mspacman.yaml — the PAPER BASELINE of the encoder ablation: random
+  experiment/mfec/rp_gray.yaml — the PAPER BASELINE of the encoder ablation: random
                               projection over a single 84x84 grayscale frame, Blundell et al.
                               §3's exact phi.  1M decisions = 4M emulator frames, num_envs=16.
                               See "The Ms. Pac-Man encoder ablation" for the other five arms;
                               every non-phi knob is held equal across them.
-  experiment/mfec/mspacman_vae.yaml — same env pair and budget, encoder_name=vae (the paper's
+  experiment/mfec/vae.yaml — same env pair and budget, encoder_name=vae (the paper's
                               OTHER phi, §3).  vae_checkpoint is required, no default.
-                              Uses mspacman_mfec_* — NOT mspacman_*_singleframe, which is a
+                              Uses atari_mfec_* — NOT mspacman_*_singleframe, which is a
                               DQN-style stack whose SignTransform would make its
                               episode_reward a pellet count rather than a game score.
-  experiment/mfec/mspacman_dinov2.yaml — same budget, encoder_name=dinov2 (frozen ViT-S/14,
-                              state_dim=384) on the shared mspacman_mfec_*_rgb env pair.
+  experiment/mfec/dinov2.yaml — same budget, encoder_name=dinov2 (frozen ViT-S/14,
+                              state_dim=384) on the shared atari_mfec_*_rgb env pair.
                               dinov2_weights is required and has no usable default — the
                               checked-in path is cluster-local.  NOTE: this config used the
                               DQN-style mspacman_train_dinov2 env pair until Aug 2026; runs
                               logged before that carry reward clipping, sticky actions and a
                               4,500-step cap, and are NOT comparable to mspacman.yaml.
-  experiment/mfec/mspacman_resnet.yaml — same, with encoder_name=resnet (frozen ImageNet
-                              resnet18, state_dim=512) + the mspacman_mfec_*_rgb env pair.
+  experiment/mfec/resnet.yaml — same, with encoder_name=resnet (frozen ImageNet
+                              resnet18, state_dim=512) + the atari_mfec_*_rgb env pair.
                               resnet_weights_path may be null (torchvision downloads
                               IMAGENET1K_V1); set a path on an offline cluster.
-  experiment/mfec/mspacman_rp_rgb.yaml — the ENCODER CONTROL: random projection over the
+  experiment/mfec/rp_rgb.yaml — the ENCODER CONTROL: random projection over the
                               same RGB observations the PVM arms get, state_dim=64.  Without
                               it, PVM-vs-baseline is confounded with grayscale-vs-RGB.
-  experiment/mfec/mspacman_clip.yaml — same, with encoder_name=clip (frozen CLIP ViT-B-32
+  experiment/mfec/clip.yaml — same, with encoder_name=clip (frozen CLIP ViT-B-32
                               vision tower, projected + L2-normalised, state_dim=512) + the
-                              mspacman_mfec_*_rgb env pair.  Needs the optional
+                              atari_mfec_*_rgb env pair.  Needs the optional
                               open_clip_torch package; clip_weights_path may be null
                               (open_clip downloads), set a path on an offline cluster.
   experiment/nec/pong.yaml     — NEC on Pong (10M agent steps = 40M raw frames, num_envs=16);
@@ -540,7 +540,7 @@ Concretely:
 | `qbert_train.yaml` | ✗ | MFEC Q*Bert |
 | `mspacman_train.yaml` | ✗ | MFEC Ms. Pac-Man |
 | `mspacman_train_singleframe.yaml` | ✗ | MFEC Ms. Pac-Man + VAE encoder (paper-exact) |
-| `mspacman_mfec_train.yaml` | ✗ | MFEC Ms. Pac-Man (paper-faithful; see "MFEC on Atari" below) |
+| `atari_mfec_train.yaml` | ✗ | MFEC Ms. Pac-Man (paper-faithful; see "MFEC on Atari" below) |
 | `mspacman_mfec_train_dinov2.yaml` | ✗ | MFEC Ms. Pac-Man + frozen DINOv2 encoder (paper-faithful) |
 
 The fixed random projection already compresses 28 k-pixel observations
@@ -558,7 +558,7 @@ that drops `SignTransform`. Set `trainer.eval_every_n_steps` to get
 `src/eval.py` separately after the fact — see "Periodic in-training
 evaluation" above.
 
-The exception is the `mspacman_mfec_*` pair, which has no `SignTransform` at
+The exception is the `atari_mfec_*` pair, which has no `SignTransform` at
 all (see below): there `train/episode_reward` and `eval/return_mean` measure
 the same thing, so a gap between them is a real train/eval discrepancy rather
 than a units mismatch.
@@ -566,7 +566,7 @@ than a units mismatch.
 ## MFEC on Atari — what a DQN-style env config gets wrong
 
 Reusing a DQN Atari transform stack for MFEC quietly breaks the algorithm.
-`mspacman_mfec_train.yaml` / `mspacman_mfec_eval.yaml` are the corrected
+`atari_mfec_train.yaml` / `atari_mfec_eval.yaml` are the corrected
 reference pair; `pong`, `breakout` and `qbert` have **not** been migrated yet.
 
 | Setting | DQN-style default | MFEC needs | Why |
@@ -626,7 +626,7 @@ nothing called `set_seed` anywhere, and two runs after an identical
 `seed_everything(42)` produced different per-worker start states — measured.
 A five-seed sweep (`seed: 42,43,44,45,46`) was therefore **not** five
 controlled seeds; only the random-projection matrix varied, and in
-`mfec/mspacman.yaml` (which left `algorithm.seed: null`) not even that.
+`mfec/rp_gray.yaml` (which left `algorithm.seed: null`) not even that.
 
 Multi-seed runs no longer need a dedicated config — the `*_5seed.yaml` files
 were deleted in `270e98a`. `configs/algorithm/mfec_atari.yaml` sets
@@ -635,7 +635,7 @@ with it, and `run.name` carries the seed so output dirs and W&B runs do not
 collide:
 
 ```shell
-python src/train.py -m experiment=mfec/mspacman trainer.seed=42,43,44,45,46
+python src/train.py -m experiment=mfec/rp_gray trainer.seed=42,43,44,45,46
 ```
 
 `run.group` (= `run.name` without the seed) is passed to the W&B logger, so the
@@ -799,8 +799,8 @@ Available: `random_projection` (default), `vae`, `dinov2`, `resnet`
 (frozen ImageNet ResNet, `src/encoders/resnet_encoder.py`; `state_dim` comes
 off `fc.in_features`, `fc` becomes `nn.Identity`, and `weights_path=None` is
 legal — torchvision downloads `IMAGENET1K_V1`), and `clip`. The RGB backbones
-(`dinov2`, `resnet`, `clip`) share the `mspacman_mfec_train_rgb` /
-`mspacman_mfec_eval_rgb` env pair.
+(`dinov2`, `resnet`, `clip`) share the `atari_mfec_train_rgb` /
+`atari_mfec_eval_rgb` env pair.
 
 ### `clip` — an OPTIONAL dependency, imported lazily
 
@@ -916,41 +916,71 @@ bucket-and-verify scheme (coarse key for the O(1) lookup, exact L2 check to
 reject collisions), not a finer or coarser `key_scale`. That is a real change
 to `QEC` and has not been made.
 
-### The Ms. Pac-Man encoder ablation — hold everything but φ equal
+### `game` — one token per Atari game, no per-game config files
 
-Six arms, **two** env pairs. Every non-φ knob is identical: 1M decisions,
+`configs/environment/atari_mfec_*.yaml` build `name: ALE/${game}-v5`, so a whole
+suite is a sweep rather than a directory of near-duplicates:
+
+```shell
+python src/train.py -m experiment=mfec/clip game=Assault,BankHeist,RoadRunner
+```
+
+Nothing else is game-specific: `|A|`, the QEC's shape and the random
+projection's input width all come off the env spec in `MFECAlgorithm.setup()`
+(verified on Assault = 7 actions and BankHeist = 18, no config change).
+
+Three things that must not regress:
+
+* **`run.game` follows `${game}`** for the six ablation arms. Hardcoded, every
+  game in a multirun would share one `run.name` and overwrite the previous
+  game's output directory and W&B run.
+* **The env id is `${oc.select:game,MsPacman}`, not `${game}`.**
+  `scripts/encoder_diagnostics.py` loads these files with a bare
+  `OmegaConf.load` outside Hydra, where a plain `${game}` raises
+  `InterpolationKeyError`.
+* **`buffer_size` is per action**, so an 18-action game (BankHeist, RoadRunner,
+  Jamesbond) allocates twice Ms. Pac-Man's QEC.  At an Atari-100k budget there
+  is an exact bound: total insertions cannot exceed `total_frames`, so
+  `buffer_size: 100_000` provably never evicts for any `|A|`.
+
+Guarded by `tests/test_encoder_factory.py` section 6.
+
+### The encoder ablation — hold everything but φ equal
+
+Six arms, **two** env pairs, on whichever `game` is selected.  Every non-φ
+knob is identical: 1M decisions,
 `num_envs: 16`, `eval_every_n_steps: 50_000`, `buffer_size: 300_000`.
 
 | experiment | env pair | φ | d |
 |---|---|---|---|
-| `mfec/mspacman` | `mspacman_mfec_*` (84×84 grayscale) | random projection | 64 |
-| `mfec/mspacman_vae` | `mspacman_mfec_*` | ConvVAE | 64 |
-| `mfec/mspacman_rp_rgb` | `mspacman_mfec_*_rgb` (210×160 RGB) | random projection | 64 |
-| `mfec/mspacman_dinov2` | `mspacman_mfec_*_rgb` | DINOv2 ViT-S/14 | 384 |
-| `mfec/mspacman_resnet` | `mspacman_mfec_*_rgb` | ResNet-18 | 512 |
-| `mfec/mspacman_clip` | `mspacman_mfec_*_rgb` | CLIP ViT-B-32 | 512 |
+| `mfec/rp_gray` | `atari_mfec_*` (84×84 grayscale) | random projection | 64 |
+| `mfec/vae` | `atari_mfec_*` | ConvVAE | 64 |
+| `mfec/rp_rgb` | `atari_mfec_*_rgb` (210×160 RGB) | random projection | 64 |
+| `mfec/dinov2` | `atari_mfec_*_rgb` | DINOv2 ViT-S/14 | 384 |
+| `mfec/resnet` | `atari_mfec_*_rgb` | ResNet-18 | 512 |
+| `mfec/clip` | `atari_mfec_*_rgb` | CLIP ViT-B-32 | 512 |
 
-`mspacman` → `mspacman_rp_rgb` isolates the observation; `mspacman_rp_rgb` →
-the PVM arms isolates the encoder. **`mspacman_rp_rgb` is not optional** — the
+`rp_gray` → `rp_rgb` isolates the observation; `rp_rgb` →
+the PVM arms isolates the encoder. **`rp_rgb` is not optional** — the
 PVM arms see RGB and the paper baseline sees grayscale, and on Ms. Pac-Man
 ghost identity is colour-coded (a blue ghost is edible, worth 200–1600), so a
-direct `mspacman` vs `mspacman_dinov2` comparison credits the representation
+direct `rp_gray` vs `dinov2` comparison credits the representation
 for information the baseline never received.
 
 Three traps this has already fallen into, now pinned by
 `tests/test_encoder_factory.py`:
 
-1. **`mspacman_resnet` ran 12.5M decisions** against everyone else's 1M, with
+1. **`resnet` ran 12.5M decisions** against everyone else's 1M, with
    `num_envs: 4` — a budget comparison wearing an encoder comparison's clothes.
-2. **`mspacman_vae` ran on `mspacman_train_singleframe`**, a DQN-style stack
+2. **`vae` ran on `mspacman_train_singleframe`**, a DQN-style stack
    carrying `SignTransform` (reward clipped to `{-1,0,+1}`, so its
    `episode_reward` was a pellet count, not a score — and MFEC argmaxes over
    raw Monte-Carlo returns, so a dot scored the same as a ghost),
    `EndOfLifeTransform`, and a 4,500-step cap instead of 27,000. It never
-   needed that file: `mspacman_mfec_train.yaml` is *already* a single 84×84
+   needed that file: `atari_mfec_train.yaml` is *already* a single 84×84
    grayscale frame, which is exactly the paper's VAE input (`x ∈ R^7056`).
    `mspacman_{train,eval}_singleframe.yaml` are now unused.
-3. **`mspacman_mfec_*_dinov2` duplicated `mspacman_mfec_*_rgb`** byte for byte.
+3. **`mspacman_mfec_*_dinov2` duplicated `atari_mfec_*_rgb`** byte for byte.
    Every RGB arm now shares the `_rgb` pair; the `_dinov2` env files are unused.
 
 Note the control keeps its exact-match hash: `RandomProjectionEncoder`'s
@@ -1206,7 +1236,7 @@ Two implementations:
   single-frame environment variant — see `mspacman_train_singleframe.yaml`
   / `mspacman_eval_singleframe.yaml` (drop `CatFrames` from
   `mspacman_train.yaml` / `mspacman_eval.yaml`) and
-  `experiment/mfec/mspacman_vae.yaml`, which composes them with
+  `experiment/mfec/vae.yaml`, which composes them with
   `encoder_name=vae`. This is a deliberate, paper-faithful trade-off: MFEC
   loses temporal (velocity) information when using this encoder, vs. the
   `random_projection` variant which keeps `CatFrames`. Only replicate the
@@ -1220,7 +1250,7 @@ Two implementations:
 
   ```shell
   python src/train_vae.py
-  python src/train.py experiment=mfec/mspacman_vae \
+  python src/train.py experiment=mfec/vae \
       algorithm.vae_checkpoint=<checkpoint.save_path printed above>
   ```
 
@@ -2118,8 +2148,8 @@ python src/train.py experiment=ddpg/halfcheetah    # DDPG continuous control (1M
 python src/train.py experiment=a2c/halfcheetah     # A2C on-policy continuous control (1M frames)
 python src/train.py experiment=mfec/pong           # MFEC on Pong (40M frames, GPU)
 python src/train.py experiment=mfec/qbert          # MFEC on Q*Bert (40M frames, GPU)
-python src/train.py experiment=mfec/mspacman       # MFEC on Ms. Pac-Man (40M frames, GPU)
-python src/train.py experiment=mfec/mspacman_vae algorithm.vae_checkpoint=<path>  # + paper-exact VAE encoder
+python src/train.py experiment=mfec/rp_gray       # MFEC on Ms. Pac-Man (40M frames, GPU)
+python src/train.py experiment=mfec/vae algorithm.vae_checkpoint=<path>  # + paper-exact VAE encoder
 python src/train_vae.py                            # pretrain the MFEC "vae" encoder (see above)
 pytest tests/test_smoke.py -v
 ```

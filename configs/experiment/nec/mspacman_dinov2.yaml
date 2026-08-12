@@ -8,7 +8,7 @@
 # pair, gamma, n_step, reward scale, episode boundaries, exploration schedule —
 # is held identical, so the encoder is the only variable.
 #
-# Difference from the MFEC DINOv2 arm (experiment/mfec/mspacman_dinov2.yaml),
+# Difference from the MFEC DINOv2 arm (experiment/mfec/dinov2.yaml),
 # and the reason this file exists at all:
 #
 #   * MFEC's DINOv2 is FROZEN, so it must be fed RGB single frames directly
@@ -38,7 +38,7 @@ algorithm:
     # No usable default: the .pth is a 90 MB download that does not belong in
     # the repo. Override on the CLI if your copy lives elsewhere:
     #   algorithm.embedding_network.weights_path=/path/dinov2_vits14_pretrain.pth
-    # Same file the MFEC arm uses (experiment/mfec/mspacman_dinov2.yaml).
+    # Same file the MFEC arm uses (experiment/mfec/dinov2.yaml).
     weights_path: /datahome/rschwinger/models/dinov2_vits14_pretrain.pth
     # Set repo_dir to a local clone of facebookresearch/dinov2 on a host with
     # no outbound network. torch.hub also reuses an already-downloaded

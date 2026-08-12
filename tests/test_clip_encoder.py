@@ -406,7 +406,7 @@ def test_mfec_end_to_end_with_the_clip_encoder(stub_open_clip):
     from src.algorithms.mfec import MFECAlgorithm
     from src.environments.factory import make_env
 
-    cfg = OmegaConf.load("configs/environment/mspacman_mfec_train_rgb.yaml")
+    cfg = OmegaConf.load("configs/environment/atari_mfec_train_rgb.yaml")
     kwargs = {
         k: v
         for k, v in OmegaConf.to_container(cfg, resolve=True).items()

@@ -43,7 +43,7 @@ Two derived rules:
 | MFEC      | ALE/Pong-v5      | `experiment=mfec/pong`          |
 | MFEC      | ALE/Breakout-v5  | `experiment=mfec/breakout`      |
 | MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`         |
-| MFEC      | ALE/MsPacman-v5  | `experiment=mfec/mspacman` (see the encoder ablation below) |
+| MFEC      | any ALE game     | `experiment=mfec/<encoder> game=<Game>` (see the encoder ablation) |
 | NEC       | ALE/Pong-v5      | `experiment=nec/pong`           |
 | NEC       | ALE/Hero-v5      | `experiment=nec/hero`           |
 | NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman`       |
@@ -428,7 +428,7 @@ dict the loggers see), `WandBLogger`, `TensorBoardLogger`.
 
 ## Reproducing MFEC on Atari
 
-`experiment=mfec/mspacman` is set up to be read directly against Figure 1 of
+`experiment=mfec/rp_gray` is set up to be read directly against Figure 1 of
 Blundell et al. (2016). Getting a comparable curve depends on four things that
 a DQN-style Atari config gets wrong for episodic control:
 
@@ -532,26 +532,58 @@ trajectories. Real Q-values are never perturbed, so a populated QEC evaluates
 deterministically. See "Optimistic init must be tie-broken RANDOMLY" in
 AGENTS.md.
 
-## The Ms. Pac-Man encoder ablation
+## Choosing the game: the `game` variable
 
-Six arms over **two** env pairs. Everything that is not φ is held equal —
+The MFEC Atari environment configs (`configs/environment/atari_mfec_*.yaml`)
+build their env id as `ALE/${game}-v5`, so a game is **one token** and a whole
+suite is a sweep rather than a directory of near-duplicate files:
+
+```shell
+python src/train.py experiment=mfec/clip game=Assault
+python src/train.py -m experiment=mfec/clip game=Assault,BankHeist,RoadRunner
+```
+
+Nothing else is game-specific: `|A|`, the QEC's shape and the random
+projection's input width are all read from the env spec in
+`MFECAlgorithm.setup()`. Verified on Assault (7 actions) and BankHeist (18)
+without touching a config.
+
+Two consequences worth knowing:
+
+- `run.game` follows `${game}` for these arms, so `run.name` / `run.group`
+  stay distinct across a sweep. Without that, every game in a multirun would
+  write to the same directory and the same W&B run.
+- `buffer_size` is **per action**, so an 18-action game allocates twice
+  Ms. Pac-Man's QEC. At the Atari-100k budget there is an exact rule: you
+  cannot insert more than `total_frames` entries in total, so
+  `buffer_size: 100_000` provably never evicts whatever `|A|` is — worst case
+  18 × 100k × 512 × 4 = 3.7 GB.
+
+The default is `MsPacman`, and it is written as `${oc.select:game,MsPacman}`
+rather than `${game}` on purpose: `scripts/encoder_diagnostics.py` loads these
+env configs with a bare `OmegaConf.load` outside Hydra, where a plain `${game}`
+would raise.
+
+## The encoder ablation
+
+Six arms over **two** env pairs, on whichever `game` you select. Everything that is not φ is held equal —
 1M decisions, `num_envs: 16`, `eval_every: 50_000`, `buffer_size: 300_000` —
 so a between-arm difference is an encoder difference and nothing else.
 Pinned by `tests/test_encoder_factory.py`.
 
 | experiment | observations | φ | d | role |
 |---|---|---|---|---|
-| `mfec/mspacman` | 84×84 **grayscale** | random projection | 64 | **paper baseline** — Blundell et al. §3's exact φ, readable against Figure 1 |
-| `mfec/mspacman_vae` | 84×84 grayscale | frozen ConvVAE | 64 | the paper's *other* φ; first half of C1 |
-| `mfec/mspacman_rp_rgb` | 210×160 **RGB** | random projection | 64 | **encoder control** for the PVM arms |
-| `mfec/mspacman_dinov2` | 210×160 RGB | DINOv2 ViT-S/14 | 384 | self-supervised PVM |
-| `mfec/mspacman_resnet` | 210×160 RGB | ImageNet ResNet-18 | 512 | supervised PVM |
-| `mfec/mspacman_clip` | 210×160 RGB | CLIP ViT-B-32 | 512 | contrastive PVM |
+| `mfec/rp_gray` | 84×84 **grayscale** | random projection | 64 | **paper baseline** — Blundell et al. §3's exact φ, readable against Figure 1 |
+| `mfec/vae` | 84×84 grayscale | frozen ConvVAE | 64 | the paper's *other* φ; first half of C1 |
+| `mfec/rp_rgb` | 210×160 **RGB** | random projection | 64 | **encoder control** for the PVM arms |
+| `mfec/dinov2` | 210×160 RGB | DINOv2 ViT-S/14 | 384 | self-supervised PVM |
+| `mfec/resnet` | 210×160 RGB | ImageNet ResNet-18 | 512 | supervised PVM |
+| `mfec/clip` | 210×160 RGB | CLIP ViT-B-32 | 512 | contrastive PVM |
 
 Read it as two independent steps:
 
-- `mspacman` → `mspacman_rp_rgb` isolates the **observation** (colour + resolution),
-- `mspacman_rp_rgb` → `dinov2`/`resnet`/`clip` isolates the **encoder**.
+- `rp_gray` → `rp_rgb` isolates the **observation** (colour + resolution),
+- `rp_rgb` → `dinov2`/`resnet`/`clip` isolates the **encoder**.
 
 That second step is what C1 actually asks, and it needs the control arm: on
 Ms. Pac-Man ghost identity is colour-coded and a *blue* ghost is edible and
@@ -574,24 +606,24 @@ MFEC's state embedding is pluggable (`algorithm.encoder_name`):
   a single 84×84 grayscale frame in, embedding = `mean ⊕ log-std` of a
   32-dim latent (64 values total). Because the input is a single frame (not
   this repo's usual 4-frame stack), it needs a "singleframe" environment
-  variant — see `experiment/mfec/mspacman_vae.yaml`. Pretrain a checkpoint
+  variant — see `experiment/mfec/vae.yaml`. Pretrain a checkpoint
   with `src/train_vae.py` (defaults: 1M random-policy frames, RMSProp,
   lr=1e-5, batch=100, 400,000 steps — also matching the paper), then run:
 
   ```shell
   python src/train_vae.py
-  python src/train.py experiment=mfec/mspacman_vae \
+  python src/train.py experiment=mfec/vae \
       algorithm.vae_checkpoint=<checkpoint.save_path printed above>
   ```
 - `dinov2` — a frozen DINOv2 ViT (`src/encoders/dino_v2_encoder.py`); see
-  `experiment/mfec/mspacman_dinov2.yaml`.
+  `experiment/mfec/dinov2.yaml`.
 - `resnet` — a frozen ImageNet ResNet (`src/encoders/resnet_encoder.py`), the
   supervised counterpart to `dinov2`. `state_dim` is fixed by the backbone
   (512 for resnet18/34, 2048 for resnet50+) and read off `fc.in_features`;
   `fc` is replaced with `nn.Identity` so `embed()` returns pooled features.
   Unlike `dinov2_weights_path`, `resnet_weights_path` may be `null` —
   torchvision then downloads `IMAGENET1K_V1` into `~/.cache/torch`, so set a
-  path on an offline cluster. See `experiment/mfec/mspacman_resnet.yaml`.
+  path on an offline cluster. See `experiment/mfec/resnet.yaml`.
 
   The backbone is kept in `eval()` mode, which matters more here than for
   DINOv2: in `train()` mode BatchNorm normalises with *batch* statistics, so
@@ -599,7 +631,7 @@ MFEC's state embedding is pluggable (`algorithm.encoder_name`):
   batch and the QEC exact-hit path would never fire.
 - `clip` — a frozen CLIP vision tower (`src/encoders/clip_encoder.py`), the
   contrastive counterpart to `dinov2` and `resnet`. See
-  `experiment/mfec/mspacman_clip.yaml`.
+  `experiment/mfec/clip.yaml`.
 
   **Needs the optional `open_clip_torch` package** — it is a
   `[project.optional-dependencies]` extra, so install it with
@@ -645,7 +677,7 @@ MFEC's state embedding is pluggable (`algorithm.encoder_name`):
   architecture it is loaded into is what must match.
 
 The RGB encoders (`dinov2`, `resnet`, `clip`) share one env pair,
-`mspacman_mfec_train_rgb` / `mspacman_mfec_eval_rgb`: single RGB frame, no
+`atari_mfec_train_rgb` / `atari_mfec_eval_rgb`: single RGB frame, no
 GrayScale/Resize (each encoder resizes and ImageNet-normalises inside
 `embed()`), and otherwise identical to the paper-faithful MFEC stack so the
 encoder is the only variable across arms.

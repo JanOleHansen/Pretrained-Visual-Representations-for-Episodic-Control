@@ -9,13 +9,13 @@
 # definition, which is what makes phi the only variable between them.
 defaults:
   - override /algorithm: mfec_atari
-  - override /environment: mspacman_mfec_train_rgb
-  - override /environment@eval_environment: mspacman_mfec_eval_rgb
+  - override /environment: atari_mfec_train_rgb
+  - override /environment@eval_environment: atari_mfec_eval_rgb
   - _self_
 
 run:
   algorithm: mfec
-  game: mspacman
+  game: ${game}
 
 algorithm:
   encoder_name: dinov2
