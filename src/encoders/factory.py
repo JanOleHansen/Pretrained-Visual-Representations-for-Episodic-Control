@@ -7,6 +7,8 @@ from .resnet_encoder import ResNetEncoder
 # inside CLIPEncoder.__init__.  A top-level import there would make the missing
 # optional dependency break *every* MFEC run, not just the clip arm.
 from .clip_encoder import CLIPEncoder
+# Same deal: mae_encoder.py imports `timm` inside MAEEncoder.__init__.
+from .mae_encoder import MAEEncoder
 
 
 def make_encoder(
@@ -34,6 +36,11 @@ def make_encoder(
         clip_image_size: int | None = None,
         clip_normalize: bool = True,
         clip_interpolation: str = "bicubic",
+        # mae
+        mae_weights_path: str | None = None,
+        mae_model_name: str = "vit_base_patch16_224.mae",
+        mae_image_size: int = 224,
+        mae_pooling: str = "mean",
 ):
     """Build MFEC's φ.
 
@@ -80,5 +87,16 @@ def make_encoder(
             device=device,
             normalize=clip_normalize,
             interpolation=clip_interpolation,
+        )
+    if name == "mae":
+        # weights_path=None is legal (like resnet and clip, unlike dinov2):
+        # timm resolves mae_model_name from the HuggingFace hub, which needs
+        # network access.  Pass a path on an offline cluster.
+        return MAEEncoder(
+            weights_path=mae_weights_path,
+            model_name=mae_model_name,
+            image_size=mae_image_size,
+            pooling=mae_pooling,
+            device=device,
         )
     raise ValueError(f"Unknown encoder name: {name}")

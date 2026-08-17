@@ -1,0 +1,100 @@
+# @package _global_
+# MFEC with a frozen MAE ViT-B/16 as φ — the RECONSTRUCTION arm of the encoder
+# ablation, against rp_gray.yaml (random projection), vae.yaml (paper-exact
+# VAE), rp_rgb.yaml (encoder control), dinov2.yaml (self-distilled ViT),
+# resnet.yaml (supervised ResNet) and clip.yaml (contrastive ViT).
+#
+# WHY MAE IS THE ARM THAT MAKES THE ABLATION A STUDY.  The other three PVR arms
+# all optimise for semantic discriminability — ImageNet labels, self-distilled
+# view agreement, image-text cosine similarity — so as a test of "what does the
+# pretraining objective do to the geometry of an episodic-memory key" they are
+# three flavours of one answer.  MAE's objective is masked *pixel
+# reconstruction*: nothing in its loss ever compares two images.  It is
+# therefore the only arm that varies the causal variable, and the only one that
+# can tell you whether MFEC's kNN needs a representation trained to place
+# similar things nearby or merely one that retains information.
+#
+# MAE scoring BELOW the other PVRs is the hypothesis under test, not a defect.
+#
+# REQUIRES `timm`, which is an optional dependency:
+#     uv sync --extra mae
+# and a local checkpoint on an offline cluster (see algorithm.mae_weights_path).
+defaults:
+  - override /algorithm: mfec_atari
+  - override /environment: atari_mfec_train_rgb
+  - override /environment@eval_environment: atari_mfec_eval_rgb
+  - _self_
+
+run:
+  algorithm: mfec
+  game: ${game}
+
+algorithm:
+  encoder_name: mae
+
+  # null -> timm downloads `mae_model_name` from the HuggingFace hub, which
+  # needs network access.  On an offline node, fetch the checkpoint once
+  # elsewhere and point this at the local file, exactly as dinov2_weights does.
+  # The path is handed to timm as pretrained_cfg_overlay=dict(file=...), so a
+  # raw facebookresearch/mae release (mae_pretrain_vit_base.pth) works as well
+  # as a timm-format .safetensors — timm's checkpoint_filter_fn remaps it.
+  mae_weights_path: null
+
+  # timm's tag spelling: <architecture>.<pretrained tag>.  The `.mae` tag is
+  # the He et al. (2022) self-supervised checkpoint — NOT `.mae_ft_in1k`, which
+  # is MAE pre-training followed by ImageNet-1k supervised fine-tuning and would
+  # quietly turn this into a second supervised arm.
+  #
+  # COST: ViT-B/16 at 224 px is 196 patch tokens + 1 CLS = 197, against the CLIP
+  # arm's ViT-B/32 50.  Same depth and width, so this is ~4x the CLIP arm's φ
+  # cost per frame and φ is the pipeline's bottleneck — this is the slowest arm
+  # in the study.  There is no ViT-B/32 MAE checkpoint to trade down to.
+  mae_model_name: vit_base_patch16_224.mae
+  mae_image_size: 224
+
+  # POOLING — the choice that decides whether this arm measures MAE or measures
+  # our pooling.  MAE's CLS token is effectively undertrained: the
+  # reconstruction loss is computed on patch tokens and never supervises CLS
+  # directly, which is why MAE feature evaluation conventionally uses global
+  # average pooling over the PATCH tokens.  "mean" does that (prefix tokens
+  # dropped via timm's num_prefix_tokens); "cls" ablates it and is expected to
+  # score worse.  Note timm's own default for this tag would be CLS — see
+  # src/encoders/mae_encoder.py for that and for why global_pool='avg' is not
+  # the fix.
+  mae_pooling: mean
+
+  # Informational only — MAEEncoder overwrites state_dim from a real forward
+  # pass (768 for ViT-B/16, 1024 for ViT-L/16).  Keep it truthful anyway: it
+  # sizes the zero-length fallback tensor in MFECAlgorithm._embed_observations,
+  # and the QEC memory arithmetic below.
+  #
+  # 768 is the widest φ in the ablation, so this is also the largest eager QEC
+  # allocation: 0.46 GB per action at buffer_size 150_000, i.e. 4.15 GB on
+  # 9-action Ms. Pac-Man and 8.29 GB on 18-action Frostbite, on the same device
+  # as the backbone.  Frostbite needs a >=16 GB card for this arm.
+  state_dim: 768
+
+  # QEC MEMORY.  Held identical across every arm and every game so the encoder
+  # ablation differs only in phi — see rp_gray.yaml for the sizing arithmetic,
+  # the measured peak (~72k entries on the busiest action at 1M decisions on
+  # 9-action Ms. Pac-Man) and why eviction must never fire.  Do NOT shrink it
+  # for this arm to buy back the memory above: buffer_size is pinned equal
+  # across the whole grid, and an arm-specific value would make a between-arm
+  # read a comparison of memory budgets rather than of encoders.
+  buffer_size: 150_000
+
+trainer:
+  # UNITS: total_frames counts agent *decisions*; the paper's x-axis counts ALE
+  # emulator frames at 4 per decision.  1M decisions = 4M emulator frames.
+  # Matches every other arm so the encoder arms share an x-axis.
+  total_frames: 1_000_000
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  num_envs: 4
+  log_every_n_steps: 10_000
+  eval_every_n_steps: 50_000
+  # eval_eps=0.0 (see configs/algorithm/mfec_atari.yaml) makes every eval
+  # episode identical on a deterministic ALE, so N>1 buys N copies of one
+  # number at N times the cost.
+  num_eval_episodes: 1

@@ -57,14 +57,21 @@ Usage
     python scripts/encoder_diagnostics.py                       # random projection only
     python scripts/encoder_diagnostics.py \
         --dinov2-weights /datahome/rschwinger/models/dinov2_vits14_pretrain.pth
-    python scripts/encoder_diagnostics.py --clip --resnet       # every PVM arm
+    python scripts/encoder_diagnostics.py --clip --resnet --mae  # every PVM arm
     python scripts/encoder_diagnostics.py --clip --device cuda  # key stability!
+    python scripts/encoder_diagnostics.py --mae --mae-pooling cls  # pooling ablation
 
-The CLIP arm needs the optional ``open_clip_torch`` package
-(``uv sync --extra clip``); nothing else here does.  Its ``--clip-model``
-default carries the ``-quickgelu`` suffix, which is mandatory with the
-``openai`` tag — see "Checkpoint / architecture pairing" in
-``src/encoders/clip_encoder.py``.
+Two arms need optional packages: ``--clip`` needs ``open_clip_torch``
+(``uv sync --extra clip``) and ``--mae`` needs ``timm`` (``uv sync --extra
+mae``); nothing else here does.  The CLIP ``--clip-model`` default carries the
+``-quickgelu`` suffix, which is mandatory with the ``openai`` tag — see
+"Checkpoint / architecture pairing" in ``src/encoders/clip_encoder.py``.
+
+The MAE arm's ``--mae-pooling`` is worth running both ways.  MAE's CLS token is
+never directly supervised by its reconstruction loss, so ``mean`` (over patch
+tokens) is the conventional and expected-better choice; a ``cls`` row that
+scores far worse is a property of MAE's objective, not of this code.  See
+``src/encoders/mae_encoder.py``.
 
 ``--dinov2-random-init`` builds the ViT architecture with *untrained* weights.
 That tells you nothing about representation quality, but the numerics (and
@@ -379,6 +386,32 @@ def build_encoders(args) -> list[tuple[str, object, str]]:
 
         out.append((label, enc, "atari_mfec_train_rgb"))
 
+    if args.mae or args.mae_weights or args.mae_random_init:
+        from src.encoders.mae_encoder import MAEEncoder
+
+        # No _RandomInit subclass is needed here, unlike DINOv2/ResNet:
+        # MAEEncoder takes `pretrained`, which timm passes straight through, so
+        # the untrained build reuses the real preprocessing rather than
+        # duplicating it (the duplication is what left _RandomInitDINOv2 with
+        # its own copy of the ImageNet constants).  Same caveat applies —
+        # valid for the key-stability columns ONLY, not for AUC or contrast.
+        enc = MAEEncoder(
+            weights_path=args.mae_weights,
+            model_name=args.mae_model,
+            image_size=args.mae_image_size,
+            pooling=args.mae_pooling,
+            pretrained=not args.mae_random_init,
+        )
+        label = f"MAE {args.mae_model}"
+        if args.mae_random_init:
+            label += " RANDOM-INIT"
+        # The pooling is in the label because it is the arm's load-bearing
+        # choice: MAE's CLS token is undertrained, so a 'cls' row is measuring
+        # something quite different from a 'mean' row.
+        label += f" [{args.mae_pooling}] ({enc.state_dim}-d)"
+
+        out.append((label, enc, "atari_mfec_train_rgb"))
+
     if args.vae_checkpoint:
         from src.encoders.vae_encoder import VAEEncoder
 
@@ -444,6 +477,31 @@ def main() -> int:
                    help="skip the L2 normalisation, i.e. do NOT put MFEC's "
                         "Euclidean kNN on CLIP's cosine metric (ablation)")
 
+    # mae -- needs the optional `timm` package (uv sync --extra mae)
+    p.add_argument("--mae", action="store_true",
+                   help="add a frozen MAE ViT arm (timm downloads the weights "
+                        "from the HuggingFace hub unless --mae-weights is given)")
+    p.add_argument("--mae-weights", default=None,
+                   help="local checkpoint for offline boxes; implies --mae. "
+                        "Handed to timm as pretrained_cfg_overlay=dict(file=...), "
+                        "so a raw mae_pretrain_vit_base.pth works too")
+    p.add_argument("--mae-random-init", action="store_true",
+                   help="build the MAE ViT untrained: valid for key stability "
+                        "ONLY, but needs no network and no 350MB download")
+    p.add_argument("--mae-model", default="vit_base_patch16_224.mae",
+                   help="timm tag: vit_base_patch16_224.mae (768-d) or "
+                        "vit_large_patch16_224.mae (1024-d). NOT .mae_ft_in1k, "
+                        "which is MAE + supervised ImageNet finetuning and would "
+                        "be a second supervised arm.")
+    p.add_argument("--mae-image-size", type=int, default=224,
+                   help="224 is the pretraining resolution; smaller cuts the "
+                        "token count but interpolates the positional embeddings")
+    p.add_argument("--mae-pooling", default="mean", choices=["mean", "cls"],
+                   help="'mean' averages the PATCH tokens (what MAE evaluation "
+                        "conventionally does — its CLS token is never directly "
+                        "supervised by the reconstruction loss); 'cls' ablates "
+                        "that and is expected to look worse")
+
     p.add_argument("--vae-checkpoint", default=None)
     p.add_argument("--device", default="cpu",
                    help="device to embed on (default cpu). RUN THIS ON 'cuda' "
@@ -466,8 +524,8 @@ def main() -> int:
     encoders = build_encoders(args)
     if len(encoders) == 1:
         print("NOTE: only the random-projection baseline was built. Pass "
-              "--dinov2-weights, --resnet or --clip (or their *-random-init "
-              "variants) to compare arms.\n")
+              "--dinov2-weights, --resnet, --clip or --mae (or their "
+              "*-random-init variants) to compare arms.\n")
 
     frame_cache: dict[str, torch.Tensor] = {}
     rows = []

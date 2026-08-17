@@ -2,13 +2,15 @@ _target_: src.algorithms.mfec.MFECAlgorithm
 
 # Atari defaults from Blundell et al. (2016) §4.1.  The Labyrinth settings in
 # §4.2 differ (k=50, gamma=0.99) — do not mix them up.
-encoder_name: random_projection   # "random_projection" | "vae"
+# "random_projection" | "vae" | "dinov2" | "resnet" | "clip" | "mae"
+# ("clip" needs `uv sync --extra clip`, "mae" needs `uv sync --extra mae`)
+encoder_name: random_projection
 vae_checkpoint: null              # required when encoder_name=vae
 # Encoder init seed — the only thing that fixes the random projection matrix.
 # Tied to trainer.seed so one knob controls the whole run: leaving it null
 # draws phi from OS entropy, so two runs with the same trainer.seed still use a
 # different embedding space and are not comparable. Only affects
-# encoder_name=random_projection; vae/dinov2/resnet load fixed weights.
+# encoder_name=random_projection; vae/dinov2/resnet/clip/mae load fixed weights.
 seed: ${trainer.seed}
 obs_key: pixels
 buffer_size: 1_000_000            # §4.1: "limited to one million entries" per action

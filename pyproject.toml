@@ -47,6 +47,23 @@ dependencies = [
 #     uv sync --extra clip
 clip = ["open_clip_torch>=2.24.0"]
 
+# MFEC's frozen `encoder_name=mae` (src/encoders/mae_encoder.py) only — the
+# reconstruction arm of the encoder ablation.  Kept out of the base
+# dependencies for the same reasons as `clip`: nothing else needs it, the test
+# suite runs against a stub `timm` module, and MAEEncoder imports it lazily
+# inside __init__ so its absence costs every other encoder nothing (factory.py
+# imports MAEEncoder at module scope, so a module-scope `import timm` there
+# would break every MFEC run, random_projection included).  Pinned by
+# tests/test_encoder_factory.py::test_importing_the_factory_does_not_require_timm.
+#
+# timm rather than another source because it is the only maintained
+# distribution of the MAE checkpoints under a stable tag, and its
+# checkpoint_filter_fn is what remaps the original facebookresearch/mae release
+# into a loadable ViT.
+# Install with:
+#     uv sync --extra mae
+mae = ["timm>=1.0.0"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

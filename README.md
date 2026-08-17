@@ -81,8 +81,9 @@ source .venv/bin/activate
 python src/train.py experiment=dqn/cartpole
 ```
 
-`uv sync` covers everything except MFEC's `clip` encoder, whose backbone
-package is an opt-in extra: `uv sync --extra clip` (see "MFEC encoders").
+`uv sync` covers everything except MFEC's `clip` and `mae` encoders, whose
+backbone packages are opt-in extras: `uv sync --extra clip` (open_clip) and
+`uv sync --extra mae` (timm). See "MFEC encoders".
 
 A full training run (500k frames, ~7 minutes on CPU) reproduces the torchrl SOTA
 reference for DQN-CartPole.
@@ -554,15 +555,15 @@ python src/train.py -m experiment=mfec/clip game=Assault,BankHeist,RoadRunner
 ```
 
 **MFEC on Frostbite is this and nothing else** — there is no
-`experiment=mfec/frostbite`, and there should not be one. The six arms below are
-game-generic, so the Frostbite ablation is the same six configs with the token
+`experiment=mfec/frostbite`, and there should not be one. The seven arms below are
+game-generic, so the Frostbite ablation is the same seven configs with the token
 swapped:
 
 ```shell
 python src/train.py experiment=mfec/rp_gray game=Frostbite
-# the whole 6-arm ablation on the three recommended games (18 runs):
+# the whole 7-arm ablation on the three recommended games (21 runs):
 python src/train.py -m \
-    experiment=mfec/rp_gray,mfec/rp_rgb,mfec/vae,mfec/dinov2,mfec/resnet,mfec/clip \
+    experiment=mfec/rp_gray,mfec/rp_rgb,mfec/vae,mfec/dinov2,mfec/resnet,mfec/clip,mfec/mae \
     game=MsPacman,Qbert,Frostbite
 ```
 
@@ -600,12 +601,12 @@ would raise.
 
 ## The encoder ablation
 
-Six arms over **two** env pairs, on whichever `game` you select. Everything that is not φ is held equal —
+Seven arms over **two** env pairs, on whichever `game` you select. Everything that is not φ is held equal —
 1M decisions, `num_envs: 4`, `eval_every: 50_000`, `buffer_size: 150_000` —
 so a between-arm difference is an encoder difference and nothing else.
 Pinned by `tests/test_encoder_factory.py`.
 
-The same six arms cover every game; the recommended set for a joint MFEC/NEC
+The same seven arms cover every game; the recommended set for a joint MFEC/NEC
 study is **Ms. Pac-Man, Q\*bert, Frostbite** (see "Choosing the game" above for
 the sweep command and why no `mfec/frostbite.yaml` exists).
 
@@ -617,11 +618,21 @@ the sweep command and why no `mfec/frostbite.yaml` exists).
 | `mfec/dinov2` | 210×160 RGB | DINOv2 ViT-S/14 | 384 | self-supervised PVM |
 | `mfec/resnet` | 210×160 RGB | ImageNet ResNet-18 | 512 | supervised PVM |
 | `mfec/clip` | 210×160 RGB | CLIP ViT-B-32 | 512 | contrastive PVM |
+| `mfec/mae` | 210×160 RGB | MAE ViT-B/16 | 768 | **reconstruction** PVM — the only non-similarity objective |
 
 Read it as two independent steps:
 
 - `rp_gray` → `rp_rgb` isolates the **observation** (colour + resolution),
-- `rp_rgb` → `dinov2`/`resnet`/`clip` isolates the **encoder**.
+- `rp_rgb` → `dinov2`/`resnet`/`clip`/`mae` isolates the **encoder**.
+
+Within that second step, `mae` is what turns a list of backbones into a study.
+ImageNet supervision, DINOv2's self-distillation and CLIP's contrastive loss all
+optimise for **semantic discriminability** — as a test of "what does the
+pretraining objective do to the geometry of a memory key" they are three
+flavours of one answer. MAE's objective is masked *pixel reconstruction*;
+nothing in its loss ever compares two images. It is the only arm that varies
+that causal variable, and MAE scoring *below* the other PVMs is the hypothesis,
+not a defect.
 
 That second step is what C1 actually asks, and it needs the control arm: on
 Ms. Pac-Man ghost identity is colour-coded and a *blue* ghost is edible and
@@ -713,8 +724,47 @@ MFEC's state embedding is pluggable (`algorithm.encoder_name`):
 
   It applies to a locally-cached OpenAI checkpoint too — the file is right, the
   architecture it is loaded into is what must match.
+- `mae` — a frozen MAE ViT-B/16 (`src/encoders/mae_encoder.py`), the
+  **reconstruction** counterpart to the three similarity-trained arms and the
+  reason the ablation is a study rather than a leaderboard. See
+  `experiment/mfec/mae.yaml`.
 
-The RGB encoders (`dinov2`, `resnet`, `clip`) share one env pair,
+  **Needs the optional `timm` package** — `uv sync --extra mae`. Imported
+  lazily inside `MAEEncoder.__init__`, so leaving it uninstalled costs the
+  other encoders nothing. `mae_weights_path` may be `null` (timm pulls
+  `vit_base_patch16_224.mae` from the HuggingFace hub); on an offline cluster
+  set a path, which is handed to timm as `pretrained_cfg_overlay=dict(file=…)`
+  so the original `mae_pretrain_vit_base.pth` release loads as well as a
+  timm-format file.
+
+  **`mae_pooling` is the load-bearing knob, and its default is not timm's.**
+  MAE's CLS token is never directly supervised — the reconstruction loss is
+  computed on patch tokens — so MAE feature evaluation conventionally uses
+  global average pooling over the **patch** tokens. `mae_pooling: mean`
+  (default) does that, dropping the model's `num_prefix_tokens` prefix entries;
+  `cls` ablates it and is expected to score worse. Two traps this avoids:
+  timm's own default for the `.mae` tag is `global_pool='token'`, i.e. CLS; and
+  "just pass `global_pool='avg'`" would flip timm's `use_fc_norm`, replacing the
+  pretrained final LayerNorm with a freshly initialised `fc_norm` the MAE
+  checkpoint does not contain. `MAEEncoder` therefore pools from
+  `forward_features` itself and never delegates. Pinned by
+  `tests/test_mae_encoder.py`.
+
+  **It does not L2-normalise**, unlike `clip`. CLIP normalises because cosine
+  is the metric its contrastive loss was computed under; MAE has no metric
+  objective, and `dinov2`/`resnet` leave their output raw too — so `clip` stays
+  the only arm on the unit sphere and the other three differ only in backbone.
+
+  Two costs to plan for. It is **the slowest arm**: ViT-B/16 at 224 px is 197
+  tokens against the CLIP arm's ViT-B/32 50, same depth and width, so ≈4× the φ
+  cost per frame, and there is no ViT-B/32 MAE checkpoint to trade down to. And
+  at `state_dim: 768` it is the **widest** φ, so the eager QEC allocation is
+  0.46 GB per action — 4.15 GB on 9-action Ms. Pac-Man and **8.29 GB on
+  18-action Frostbite**, alongside the backbone on the same device. Frostbite
+  wants a ≥16 GB card. Do not shrink `buffer_size` for this arm alone; it is
+  held equal across the whole grid on purpose.
+
+The RGB encoders (`dinov2`, `resnet`, `clip`, `mae`) share one env pair,
 `atari_mfec_train_rgb` / `atari_mfec_eval_rgb`: single RGB frame, no
 GrayScale/Resize (each encoder resizes and ImageNet-normalises inside
 `embed()`), and otherwise identical to the paper-faithful MFEC stack so the
@@ -731,7 +781,7 @@ encoder is the only variable across arms.
 
 ```shell
 python scripts/encoder_diagnostics.py --device cuda \
-    --dinov2-weights /path/dinov2_vits14_pretrain.pth --resnet --clip
+    --dinov2-weights /path/dinov2_vits14_pretrain.pth --resnet --clip --mae
 ```
 
 Screen encoders here **before** committing GPU-days to them: this needs no
@@ -767,6 +817,11 @@ key stability, and it is not fixable by tuning:
 | `dinov2` ViT-S/14 | 384 | **0.000** | 0.991 | 0.697 |
 | `resnet` resnet18 | 512 | **0.000** | 0.991 | 0.690 |
 | `clip` ViT-B-32-quickgelu | 512 | **0.000** | 0.990 | 0.728 |
+
+(`mae` is not in this table because it was added after the measurement and has
+not been run on a GPU yet — run `--mae` on the training card before trusting it.
+Expect `key b/s = 0.000` for the same reason as the other float32 ViTs; that is
+documented, not a defect.)
 
 cuBLAS picks float32 GEMM kernels by batch size, so `φ(x)` in a 16-row batch
 differs from `φ(x)` alone in the last bits, and a key survives only if all `d`

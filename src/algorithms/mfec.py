@@ -225,6 +225,18 @@ class MFECAlgorithm(BaseAlgorithm):
             # ablate that choice.
             clip_normalize: bool = True,
             clip_interpolation: str = "bicubic",
+            # mae — needs the optional `timm` package, imported lazily so the
+            # other encoders do not depend on it.  The one arm of the ablation
+            # whose pretraining objective is NOT a similarity objective
+            # (masked pixel reconstruction), which is why it is in the study.
+            mae_weights_path: str | None = None,
+            mae_model_name: str = "vit_base_patch16_224.mae",
+            mae_image_size: int = 224,
+            # "mean" pools the PATCH tokens (what MAE evaluation conventionally
+            # does — MAE's CLS token is never directly supervised by the
+            # reconstruction loss).  "cls" ablates that choice and is expected
+            # to score worse; see src/encoders/mae_encoder.py.
+            mae_pooling: str = "mean",
 
     ) -> None:
 
@@ -260,6 +272,11 @@ class MFECAlgorithm(BaseAlgorithm):
         self.clip_image_size = clip_image_size
         self.clip_normalize = clip_normalize
         self.clip_interpolation = clip_interpolation
+        #mae
+        self.mae_weights_path = mae_weights_path
+        self.mae_model_name = mae_model_name
+        self.mae_image_size = mae_image_size
+        self.mae_pooling = mae_pooling
 
         self._collected_frames = 0
 
@@ -305,6 +322,11 @@ class MFECAlgorithm(BaseAlgorithm):
             clip_image_size=self.clip_image_size,
             clip_normalize=self.clip_normalize,
             clip_interpolation=self.clip_interpolation,
+            #mae
+            mae_weights_path=self.mae_weights_path,
+            mae_model_name=self.mae_model_name,
+            mae_image_size=self.mae_image_size,
+            mae_pooling=self.mae_pooling,
         )
 
         # Detect number of parallel envs from the proof env's batch_size.

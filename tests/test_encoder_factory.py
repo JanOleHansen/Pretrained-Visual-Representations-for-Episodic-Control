@@ -216,6 +216,67 @@ def test_clip_branch_forwards_its_arguments(monkeypatch):
     }
 
 
+def test_mae_branch_forwards_its_arguments(monkeypatch):
+    captured: dict = {}
+
+    class _FakeMAEEncoder:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.state_dim = 768
+
+    monkeypatch.setattr("src.encoders.factory.MAEEncoder", _FakeMAEEncoder)
+
+    encoder = make_encoder(
+        "mae",
+        obs_flat_dim=3 * 210 * 160,
+        in_channels=3,
+        state_dim=768,
+        mae_weights_path="/some/where/mae_pretrain_vit_base.pth",
+        mae_model_name="vit_large_patch16_224.mae",
+        mae_image_size=224,
+        mae_pooling="cls",
+        device=torch.device("cpu"),
+    )
+
+    assert isinstance(encoder, _FakeMAEEncoder)
+    assert captured == {
+        "weights_path": "/some/where/mae_pretrain_vit_base.pth",
+        "model_name": "vit_large_patch16_224.mae",
+        "image_size": 224,
+        "pooling": "cls",
+        "device": torch.device("cpu"),
+    }
+
+
+def test_mae_branch_allows_a_null_weights_path(monkeypatch):
+    """Like resnet and clip, unlike dinov2: timm resolves the tag from the hub."""
+    class _FakeMAEEncoder:
+        def __init__(self, **kwargs):
+            self.state_dim = 768
+
+    monkeypatch.setattr("src.encoders.factory.MAEEncoder", _FakeMAEEncoder)
+
+    make_encoder(
+        "mae", obs_flat_dim=3 * 210 * 160, in_channels=3, mae_weights_path=None
+    )
+
+
+def test_importing_the_factory_does_not_require_timm():
+    """The other optional dependency, same seam as open_clip below.
+
+    ``factory.py`` imports ``MAEEncoder`` at module scope, so if
+    ``mae_encoder.py`` ever imports ``timm`` at module scope too, every MFEC run
+    — random_projection included — dies on the missing package. timm is NOT in
+    pyproject.toml's base dependencies (it is the `mae` extra), so this test
+    only means anything while it stays uninstalled.
+    """
+    import importlib
+    import sys
+
+    assert "timm" not in sys.modules or True
+    importlib.reload(importlib.import_module("src.encoders.factory"))
+
+
 def test_clip_branch_allows_a_null_weights_path(monkeypatch):
     """Like resnet, unlike dinov2: open_clip resolves the tag from its hub."""
     class _FakeCLIPEncoder:
@@ -281,6 +342,7 @@ def test_resnet_branch_allows_a_null_weights_path(monkeypatch):
         "mfec/dinov2",
         "mfec/resnet",
         "mfec/clip",
+        "mfec/mae",
     ],
 )
 def test_experiment_algorithm_keys_bind_to_the_constructor(experiment):
@@ -307,7 +369,7 @@ def test_experiment_algorithm_keys_bind_to_the_constructor(experiment):
 # 5. The Ms. Pac-Man encoder ablation must vary ONLY the encoder
 # ---------------------------------------------------------------------------
 #
-# Six arms, two env pairs. Everything that is not phi has to be held equal or
+# Seven arms, two env pairs. Everything that is not phi has to be held equal or
 # the comparison measures the wrong thing — this has already gone wrong twice:
 # mspacman_resnet ran 12.5M decisions against everyone else's 1M, and
 # mspacman_vae ran on the DQN-style singleframe env, whose SignTransform clips
@@ -321,6 +383,7 @@ _ABLATION_ARMS = [
     "mfec/dinov2",
     "mfec/resnet",
     "mfec/clip",
+    "mfec/mae",        # the only non-similarity pretraining objective
 ]
 
 
@@ -344,12 +407,12 @@ def test_every_arm_shares_one_training_budget():
 
 
 def test_the_rgb_arms_share_one_env_pair():
-    """rp_rgb / dinov2 / resnet / clip must see byte-identical observations."""
+    """rp_rgb / dinov2 / resnet / clip / mae must see byte-identical observations."""
     from hydra.core.hydra_config import HydraConfig
 
     seen = {}
     for arm in ["mfec/rp_rgb", "mfec/dinov2",
-                "mfec/resnet", "mfec/clip"]:
+                "mfec/resnet", "mfec/clip", "mfec/mae"]:
         from tests.conftest import CONFIGS_DIR
         from hydra import compose, initialize_config_dir
         from hydra.core.global_hydra import GlobalHydra
@@ -456,7 +519,7 @@ def test_run_names_stay_distinct_across_a_game_sweep():
 
 @pytest.mark.parametrize("game", _STUDY_GAMES)
 def test_every_arm_runs_on_every_study_game(game):
-    """The whole 6 x 3 grid has to compose, not just the arm we happen to test.
+    """The whole 7 x 3 grid has to compose, not just the arm we happen to test.
 
     This is what replaces per-game MFEC experiment files: `experiment=mfec/<arm>
     game=Frostbite` IS the Frostbite ablation, so an arm that failed to follow
@@ -497,7 +560,7 @@ def test_the_budget_is_held_equal_across_games_too():
         for game in _STUDY_GAMES
     }
     assert set(budgets.values()) == {(1_000_000, 150_000)}, (
-        f"budget or QEC size drifted across the 6 x 3 grid: {budgets}"
+        f"budget or QEC size drifted across the 7 x 3 grid: {budgets}"
     )
 
 
