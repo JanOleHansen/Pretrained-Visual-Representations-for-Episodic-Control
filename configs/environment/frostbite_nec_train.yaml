@@ -1,0 +1,71 @@
+name: ALE/Frostbite-v5
+gym_backend: gymnasium
+gym_kwargs:
+  # TorchRL does NOT stack a second action repeat on top of ALE's: GymEnv
+  # forwards this straight into `gym.make(..., frameskip=N)` and only falls back
+  # to a wrapper-level repeat if gym.make REJECTS the kwarg — which ALE-v5 does
+  # not. So this value IS the ALE action repeat, and 4 is what Pritzel et al.
+  # (2017) §4 specifies ("repeating each action four times"). One agent step ==
+  # 4 raw ALE frames. See the longer note in mspacman_nec_train.yaml.
+  frame_skip: 4
+  # ALE v5 defaults to 0.25 sticky actions (Machado et al. 2018). The 2017 paper
+  # predates that protocol, so disable it for comparable results.
+  repeat_action_probability: 0.0
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# NEC training env for ALE/Frostbite-v5. There is no clipped `frostbite_train`
+# counterpart — this game is new to the repo and only reaches it through the
+# episodic-control arms, so only the unclipped pair exists. Mirrors
+# mspacman_nec_train.yaml; read that file for the full reasoning.
+#
+# NO SignTransform (no reward clipping). Pritzel et al. (2017) §4: "NEC and MFEC
+# do not require reward clipping, which results in qualitative changes in
+# behaviour and better performance relative to other algorithms on games
+# requiring clipping (Bowling, Frostbite, H.E.R.O., Ms. Pac-Man, Alien out of
+# the seven shown)." Frostbite is named EXPLICITLY, and the game is the clearest
+# case of the mechanism: walking an ice floe pays 10 points, completing an igloo
+# and entering it pays several hundred plus the remaining-time bonus. Clipping
+# makes those identical, so a clipped agent has no gradient toward the igloo —
+# the exact behaviour the paper credits for NEC's result here.
+#
+# EndOfLifeTransform is kept for parity with the other Atari configs, but it is
+# INERT for NEC and MFEC: it writes a separate `end-of-life` key and does not
+# touch `done`, and nothing in src/ reads that key. Episodes here are whole
+# games or StepCounter truncations, not per-life segments.
+#
+# VecNorm is omitted for the same reason as the other episodic-control configs:
+# its running statistics drift, so the same raw observation encodes differently
+# over time, which degrades the DND's exact-match hit rate.
+#
+# NOTE — reward scale: because clipping is dropped, train/episode_reward here is
+# the TRUE Frostbite score and is directly comparable to eval/return_mean.
+#
+# Frostbite has 18 actions (the full action set) — the most of the three
+# ablation games. No hyperparameter changes are needed (num_actions is read off
+# the env spec in NECAlgorithm.setup()), but note two consequences: the DND holds
+# 18 tables rather than Ms. Pac-Man's 9, and the per-batch cost is
+# num_updates x |A| exact kNN scans, so this game is ~2x Ms. Pac-Man and ~3x
+# Q*bert per gradient step. Measured raw-frame repeat rate is 22% (AGENTS.md,
+# "Which games MFEC can work on at all"), i.e. the same as Ms. Pac-Man, so the
+# DND has plenty to retrieve.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.EndOfLifeTransform
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.GrayScale
+  - _target_: torchrl.envs.Resize
+    w: 84
+    h: 84
+  - _target_: torchrl.envs.CatFrames
+    N: 4
+    dim: -3
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    # 27,000 decisions x 4 emulator frames = the standard 108,000-frame (30 min)
+    # ALE episode cap, matching the other NEC and MFEC Atari configs.
+    max_steps: 27_000
+  - _target_: torchrl.envs.DoubleToFloat

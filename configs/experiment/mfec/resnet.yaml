@@ -28,8 +28,8 @@ algorithm:
   # ResNetEncoder reads the true value off fc.in_features; this only sizes the
   # zero-length fallback tensor in MFECAlgorithm, but keep it consistent.
   state_dim: 512
-  # Held identical across every Ms. Pac-Man arm — see mspacman.yaml.
-  buffer_size: 300_000
+  # Held identical across every arm and every game — see rp_gray.yaml.
+  buffer_size: 150_000
 
 trainer:
   # UNITS: total_frames counts agent *decisions* (StepTrainer does

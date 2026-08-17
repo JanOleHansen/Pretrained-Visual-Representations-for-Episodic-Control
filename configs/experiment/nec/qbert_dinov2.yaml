@@ -1,0 +1,71 @@
+# @package _global_
+# NEC on ALE/Qbert-v5 with a FINETUNED DINOv2 ViT-S/14 as the embedding network
+# — the self-supervised PVM arm of the Q*bert encoder ablation, against
+# nec/qbert.yaml (NatureEmbedding, the paper's ConvNet) and nec/qbert_clip.yaml
+# (contrastive ViT).
+#
+# This is nec/qbert.yaml with the embedding-network group swapped and the
+# trainer sized for the ViT. Everything that defines the *task* — the env pair,
+# gamma, n_step, reward scale, episode boundaries, exploration schedule — is
+# held identical, so the encoder is the only variable. It is also the exact
+# counterpart of nec/mspacman_dinov2.yaml with the game swapped.
+#
+# NEC's DINOv2 is FINETUNED, so it keeps the standard NEC env — 4 stacked 84x84
+# grayscale frames — and adapts them inside the module with a trainable 1x1
+# conv. That is what makes this a clean ablation against nec/qbert.yaml, and it
+# preserves the frame stack, NEC's only source of velocity information. (MFEC's
+# DINOv2 arm is frozen and therefore needs an RGB single-frame env pair.)
+defaults:
+  - override /algorithm: nec_atari
+  - override /environment: qbert_nec_train
+  - override /environment@eval_environment: qbert_nec_eval
+  - override /algorithm/embedding_network: dinov2_finetune
+  - _self_
+
+run:
+  algorithm: nec
+  game: qbert
+  # `run.encoder` defaults to ${oc.select:algorithm.encoder_name,none}, which is
+  # an MFEC-only key — without this override the run directory would be
+  # nec_qbert_none_seed42, colliding with the NatureEmbedding arm.
+  encoder: dinov2
+
+algorithm:
+  embedding_network:
+    # No usable default: the .pth is a 90 MB download that does not belong in
+    # the repo. Override on the CLI if your copy lives elsewhere:
+    #   algorithm.embedding_network.weights_path=/path/dinov2_vits14_pretrain.pth
+    # Same file the Ms. Pac-Man and MFEC arms use.
+    weights_path: /datahome/rschwinger/models/dinov2_vits14_pretrain.pth
+    # Set repo_dir to a local clone of facebookresearch/dinov2 on a host with no
+    # outbound network. torch.hub also reuses an already-downloaded
+    # ~/.cache/torch/hub/facebookresearch_dinov2_main without touching the
+    # network, so this is only needed on a cold offline box.
+    repo_dir: null
+
+  # Held identical to nec/qbert.yaml and every other arm of the ablation.
+  num_updates: 100
+  eps_end: 0.001
+  annealing_frames: 50_000
+  init_random_frames: 12_500
+  eval_eps: 0.005
+
+trainer:
+  # Same units and budget as nec/qbert.yaml: agent steps, action repeat 4, so
+  # 4M raw ALE frames.
+  total_frames: 1_000_000
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  # 8, not the 16 of nec/qbert.yaml. The ViT is resident on the same device as
+  # the DND and every collector step runs a forward pass at batch=num_envs, so
+  # num_envs sets the ViT's inference batch as well as the process count.
+  # Halving it keeps peak activation memory clear of the 11.3 GB replay buffer
+  # and the per-env raw-pixel carry.
+  num_envs: 8
+  log_every_n_steps: 10_000
+  # Every 200k raw frames, per paper §4.
+  eval_every_n_steps: 50_000
+  # 5 rather than nec/qbert.yaml's 10. Each eval episode is up to 27,000 ViT
+  # forwards at batch 1, the least amortised inference in the whole run.
+  num_eval_episodes: 5

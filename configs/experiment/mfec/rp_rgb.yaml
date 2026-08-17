@@ -45,8 +45,8 @@ algorithm:
   # matrix, ~51 MB. RandomProjectionEncoder reads the input width from the env
   # spec, so nothing else needs to change.
   state_dim: 64
-  # Held identical across every Ms. Pac-Man arm — see mspacman.yaml.
-  buffer_size: 300_000
+  # Held identical across every arm and every game — see rp_gray.yaml.
+  buffer_size: 150_000
 
 trainer:
   # UNITS: total_frames counts agent *decisions*; the paper's x-axis counts ALE

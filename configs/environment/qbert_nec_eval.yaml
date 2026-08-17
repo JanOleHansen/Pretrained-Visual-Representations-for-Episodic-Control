@@ -1,0 +1,44 @@
+name: ALE/Qbert-v5
+gym_backend: gymnasium
+gym_kwargs:
+  # Must match qbert_nec_train.yaml exactly. This value is forwarded into
+  # `gym.make(..., frameskip=N)` and IS the ALE action repeat — TorchRL does not
+  # stack a second one on top; see the longer note in mspacman_nec_train.yaml.
+  frame_skip: 4
+  repeat_action_probability: 0.0   # sticky actions off (2017 protocol)
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# NEC eval variant of qbert_eval.yaml. Pairs with qbert_nec_train.yaml and
+# mirrors mspacman_nec_eval.yaml.
+#
+# Differs from qbert_eval.yaml in two ways: sticky actions are disabled so the
+# policy is evaluated under the same dynamics it was trained on, and the episode
+# cap is the full 30-minute ALE cap rather than 5 minutes.
+#
+# Eval drops EndOfLifeTransform so episodes end on game-over rather than life
+# loss, giving a full-game score. It carries no SignTransform (the NEC training
+# env has none either — see qbert_nec_train.yaml), and no VecNorm, whose running
+# stats are not checkpointed and would distort a fresh eval env.
+#
+# eval/return_mean from this env is the number to compare against the paper's
+# Atari appendix.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.GrayScale
+  - _target_: torchrl.envs.Resize
+    w: 84
+    h: 84
+  - _target_: torchrl.envs.CatFrames
+    N: 4
+    dim: -3
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    # 27,000 decisions x 4 emulator frames = the standard 108,000-frame (30 min)
+    # ALE episode cap, matching qbert_nec_train.yaml.
+    max_steps: 27_000
+  - _target_: torchrl.envs.DoubleToFloat

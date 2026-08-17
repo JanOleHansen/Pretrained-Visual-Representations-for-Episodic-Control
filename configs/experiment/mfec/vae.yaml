@@ -36,8 +36,8 @@ algorithm:
   vae_checkpoint: ???   # required: algorithm.vae_checkpoint=<path from src/train_vae.py>
   # embed() returns mean ++ log-std of a 32-dim latent = 64 values.
   state_dim: 64
-  # Held identical across every Ms. Pac-Man arm — see mspacman.yaml.
-  buffer_size: 300_000
+  # Held identical across every arm and every game — see rp_gray.yaml.
+  buffer_size: 150_000
 
 trainer:
   # 1M decisions = 4M emulator frames, matching every other Ms. Pac-Man arm.

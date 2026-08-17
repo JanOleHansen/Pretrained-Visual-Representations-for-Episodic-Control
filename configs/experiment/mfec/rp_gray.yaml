@@ -18,28 +18,36 @@ run:
   game: ${game}
 
 algorithm:
-  # QEC MEMORY — held IDENTICAL across every Ms. Pac-Man arm, so the encoder
+  # QEC MEMORY — held IDENTICAL across every arm AND every game, so the encoder
   # ablation differs only in phi.  This is the canonical comment; the other arms
   # point back here.
   #
   # QEC._init_states allocates (num_actions, buffer_size, state_dim) float32
-  # eagerly, before a single frame is collected.  With 9 Ms. Pac-Man actions:
+  # eagerly, before a single frame is collected — so the cost scales with |A|,
+  # which is a property of the GAME, not of the arm:
   #
-  #     state_dim  buffer 1e6   buffer 3e5
-  #     64  (rp)      2.3 GB      0.69 GB
-  #     384 (dinov2) 13.8 GB      4.15 GB
-  #     512 (resnet/clip) 18.4 GB 5.53 GB
+  #     state_dim          |A|=9 (MsPacman)   |A|=18 (Frostbite)
+  #     64  (rp)              0.35 GB              0.69 GB
+  #     384 (dinov2)          2.07 GB              4.15 GB
+  #     512 (resnet/clip)     2.76 GB              5.53 GB
   #
-  # 3e5 is chosen to sit safely ABOVE the peak, not to be tight: LRU eviction
-  # must never fire, or the algorithm changes mid-run — and would change at a
-  # different moment in each arm, which would silently break the ablation.
-  # Measured at 1M decisions: train/qec_size (the MEAN over actions) tops out
-  # ~40k, and the busiest action runs ~1.8x the mean, so the real peak is ~72k.
-  # 3e5 is >4x that.
+  # 1.5e5 sits safely ABOVE the peak, not tight: LRU eviction must never fire,
+  # or the algorithm changes mid-run — and would change at a different moment in
+  # each arm, which would silently break the ablation.  Measured at 1M decisions
+  # on Ms. Pac-Man: train/qec_size (the MEAN over actions) tops out ~40k, and the
+  # busiest action runs ~1.8x the mean, so the real peak is ~72k.  1.5e5 is >2x
+  # that, and the bound is looser on an 18-action game, not tighter: total
+  # insertions cannot exceed total_frames, and they spread over twice as many
+  # tables, so the per-action peak FALLS as |A| rises.
+  #
+  # It was 3e5 while the ablation was Ms. Pac-Man only.  Halved when Frostbite
+  # (18 actions) joined, so the 18-action allocation is what 9 actions used to
+  # cost rather than double it — the resnet/clip arms would otherwise eagerly
+  # take 11.1 GB on Frostbite before collecting a frame.
   #
   # WATCH train/qec_size on a longer budget.  It logs the mean, so treat
-  # mean ~150k as the ceiling; past that, raise buffer_size (and the GPU).
-  buffer_size: 300_000
+  # mean ~75k as the ceiling; past that, raise buffer_size (and the GPU).
+  buffer_size: 150_000
 
 trainer:
   # UNITS: total_frames counts agent *decisions* (StepTrainer does

@@ -1,0 +1,74 @@
+# @package _global_
+# NEC on ALE/Qbert-v5 (Pritzel et al. 2017) with the paper's ConvNet encoder.
+#
+# The Q*bert arm of the three-game NEC encoder ablation. The other two games are
+# nec/mspacman.yaml and nec/frostbite.yaml; the other two encoders for this game
+# are nec/qbert_dinov2.yaml and nec/qbert_clip.yaml. Every learning-relevant
+# setting below is held IDENTICAL across all nine arms so that game and encoder
+# are the only variables — do not tune one arm in isolation.
+#
+# Game choice: AGENTS.md ("Which games MFEC can work on at all") measures Q*bert
+# at a 13% raw-frame repeat rate and exact_hit_rate 0.60, the highest of the
+# three. MFEC is the binding constraint on game choice for a joint MFEC/NEC
+# study; NEC's kernel-weighted read degrades gracefully where MFEC collapses,
+# so a game MFEC can work on is always safe for NEC.
+#
+# Q*bert has 6 actions, so the nec_atari defaults (dnd_capacity=5e4 per action,
+# k=50, embedding_dim=64, kernel_delta=1e-3, n_step=100, gamma=0.99) apply
+# without change. It is also the cheapest of the three games per gradient step:
+# the dominant cost is num_updates x |A| exact kNN scans.
+#
+# Uses the dedicated qbert_nec_* environments rather than qbert_train /
+# qbert_eval, which clip rewards, cap episodes at 5 minutes and leave v5's
+# sticky actions on — see the header of qbert_nec_train.yaml.
+defaults:
+  - override /algorithm: nec_atari
+  - override /environment: qbert_nec_train
+  - override /environment@eval_environment: qbert_nec_eval
+  - _self_
+
+run:
+  algorithm: nec
+  game: qbert
+
+algorithm:
+  # Held identical to nec/mspacman.yaml — that file carries the measurements
+  # behind each of these four. Repeated rather than inherited because Hydra
+  # experiment configs do not compose with each other.
+  #
+  # num_updates deviates from paper §4's rate of 400 per 1600 agent steps. Kept
+  # on two grounds: the only run of this repo to reach ~3000 on Ms. Pac-Man used
+  # 100, and it cuts the dominant per-batch cost by 4x. Declare the deviation
+  # alongside any comparison to the paper's curves.
+  num_updates: 100
+  eps_end: 0.001
+  # The anneal deliberately outlasts the random warm-up: NEC only writes to the
+  # DND at episode end, and while an action's table holds <= k entries its Q is
+  # +inf (mapped to 1e9), so argmax degenerates.
+  annealing_frames: 50_000
+  init_random_frames: 12_500
+  # Large enough to decorrelate eval episodes on a deterministic ALE, small
+  # enough to stay within 10x of eps_end so train/* and eval/* describe the same
+  # policy.
+  eval_eps: 0.005
+
+trainer:
+  # total_frames counts AGENT STEPS. The paper's x-axis counts RAW ALE FRAMES,
+  # and action repeat is 4, so paper_frames = 4 x total_frames. 1M agent steps
+  # = 4M raw frames, matching nec/mspacman.yaml. The paper's own table is at
+  # 10M raw frames, i.e. total_frames: 2_500_000.
+  total_frames: 1_000_000
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  # NEC holds a 100k-transition float32 replay buffer (~11.3 GB, preallocated by
+  # LazyTensorStorage) plus a per-env raw-pixel carry buffer for the in-flight
+  # episode, and spawns one worker process per env. If this run dies with
+  # `EOFError: proc <pid> failed, last command: step_and_maybe_reset`, that is
+  # the OOM killer taking a ParallelEnv worker — drop to 8.
+  num_envs: 16
+  log_every_n_steps: 10_000
+  # 50_000 agent steps == every 200k raw frames, per paper §4 ("We evaluate
+  # MFEC and NEC every 200.000 frames").
+  eval_every_n_steps: 50_000
+  num_eval_episodes: 10

@@ -1,0 +1,71 @@
+name: ALE/Qbert-v5
+gym_backend: gymnasium
+gym_kwargs:
+  # TorchRL does NOT stack a second action repeat on top of ALE's: GymEnv
+  # forwards this straight into `gym.make(..., frameskip=N)` and only falls back
+  # to a wrapper-level repeat if gym.make REJECTS the kwarg — which ALE-v5 does
+  # not. So this value IS the ALE action repeat, and 4 is what Pritzel et al.
+  # (2017) §4 specifies ("repeating each action four times"). One agent step ==
+  # 4 raw ALE frames. See the longer note in mspacman_nec_train.yaml.
+  frame_skip: 4
+  # ALE v5 defaults to 0.25 sticky actions (Machado et al. 2018). The 2017 paper
+  # predates that protocol, so disable it for comparable results. NOTE this is
+  # the one place this file differs from qbert_train.yaml beyond the transform
+  # list — qbert_train.yaml leaves v5's 0.25 in place.
+  repeat_action_probability: 0.0
+  from_pixels: true
+  pixels_only: false
+  categorical_action_encoding: true
+
+# NEC variant of qbert_train.yaml. Mirrors mspacman_nec_train.yaml exactly
+# except for the game id; read that file for the full reasoning.
+#
+# KEY DIFFERENCE from qbert_train.yaml — no SignTransform (no reward clipping).
+# Pritzel et al. (2017) §4: "NEC and MFEC do not require reward clipping, which
+# results in qualitative changes in behaviour and better performance relative to
+# other algorithms on games requiring clipping". Q*bert is NOT in the paper's
+# named list (Bowling, Frostbite, H.E.R.O., Ms. Pac-Man, Alien) — that list is
+# the subset of the seven shown where clipping-freedom is what produces the
+# result, not a statement that NEC clips elsewhere. NEC never clips, and Q*bert
+# has a graded reward structure (25 for a cube, 100/500/1000 for discs, coily,
+# and round completion) that clipping would flatten, so dropping SignTransform
+# is both paper-faithful and the right call for the game.
+#
+# EndOfLifeTransform is kept for parity with the other Atari configs, but be
+# aware it is INERT for NEC and MFEC: it writes a separate `end-of-life` key and
+# deliberately does NOT touch `done`, and nothing in src/ reads that key. NEC
+# episodes here are whole games (or StepCounter truncations), NOT per-life
+# segments.
+#
+# VecNorm is omitted for the same reason as the other episodic-control configs:
+# its running statistics drift, so the same raw observation encodes differently
+# over time, which degrades the DND's exact-match hit rate.
+#
+# NOTE — reward scale: because clipping is dropped, train/episode_reward here is
+# the TRUE Q*bert score and is directly comparable to eval/return_mean.
+#
+# Q*bert has 6 actions, the smallest of the three ablation games, so the
+# nec_atari defaults apply without change and the per-batch kNN cost (which
+# scales with |A|) is the lowest of the set.
+transforms:
+  - _target_: torchrl.envs.NoopResetEnv
+    noops: 30
+    random: true
+  - _target_: torchrl.envs.EndOfLifeTransform
+  - _target_: torchrl.envs.ToTensorImage
+  - _target_: torchrl.envs.GrayScale
+  - _target_: torchrl.envs.Resize
+    w: 84
+    h: 84
+  - _target_: torchrl.envs.CatFrames
+    N: 4
+    dim: -3
+  - _target_: torchrl.envs.RewardSum
+  - _target_: torchrl.envs.StepCounter
+    # 27,000 decisions x 4 emulator frames = the standard 108,000-frame (30 min)
+    # ALE episode cap, matching the MFEC and NEC Ms. Pac-Man configs. The 4,500
+    # in qbert_train.yaml (5 min) is inherited from the DQN-style configs and
+    # cuts a competent agent off mid-game, capping the return the DND can ever
+    # observe.
+    max_steps: 27_000
+  - _target_: torchrl.envs.DoubleToFloat

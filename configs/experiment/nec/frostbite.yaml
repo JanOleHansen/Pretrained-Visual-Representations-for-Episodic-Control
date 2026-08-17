@@ -1,0 +1,83 @@
+# @package _global_
+# NEC on ALE/Frostbite-v5 (Pritzel et al. 2017) with the paper's ConvNet encoder.
+#
+# The Frostbite arm of the three-game NEC encoder ablation. The other two games
+# are nec/mspacman.yaml and nec/qbert.yaml; the other two encoders for this game
+# are nec/frostbite_dinov2.yaml and nec/frostbite_clip.yaml. Every
+# learning-relevant setting below is held IDENTICAL across all nine arms so that
+# game and encoder are the only variables — do not tune one arm in isolation.
+#
+# Game choice: Frostbite is one of the five games of Blundell et al. §4.1, is
+# named explicitly in Pritzel et al. §4 as a game where NEC's lack of reward
+# clipping is what produces the result, and AGENTS.md ("Which games MFEC can
+# work on at all") measures it at a 22% raw-frame repeat rate with
+# exact_hit_rate 0.41 — the intersection of "MFEC demonstrably works" and "in
+# the Atari-100k 26", together with Ms. Pac-Man and Q*bert.
+#
+# Frostbite has 18 actions, the most of the three games. Nothing needs to
+# change — num_actions is read off the env spec in NECAlgorithm.setup() — but
+# it is the most expensive of the three per gradient step, because the dominant
+# cost is num_updates x |A| exact kNN scans, and the DND holds 18 tables rather
+# than Ms. Pac-Man's 9. At dnd_capacity=5e4 that is 18 x 5e4 x 64 x 4 B = 230 MB
+# of keys, which is not a memory concern; the throughput hit is the real one.
+#
+# Uses the dedicated frostbite_nec_* environments — there is no clipped
+# `frostbite_train` in this repo, and there should not be one for NEC: see the
+# header of frostbite_nec_train.yaml for why clipping would remove the exact
+# behaviour the paper credits on this game.
+defaults:
+  - override /algorithm: nec_atari
+  - override /environment: frostbite_nec_train
+  - override /environment@eval_environment: frostbite_nec_eval
+  - _self_
+
+run:
+  algorithm: nec
+  game: frostbite
+
+algorithm:
+  # Held identical to nec/mspacman.yaml — that file carries the measurements
+  # behind each of these four. Repeated rather than inherited because Hydra
+  # experiment configs do not compose with each other.
+  #
+  # num_updates deviates from paper §4's rate of 400 per 1600 agent steps. Kept
+  # on two grounds: the only run of this repo to reach ~3000 on Ms. Pac-Man used
+  # 100, and it cuts the dominant per-batch cost by 4x — which matters most on
+  # this game, with twice Ms. Pac-Man's action count. Declare the deviation
+  # alongside any comparison to the paper's curves.
+  num_updates: 100
+  eps_end: 0.001
+  # The anneal deliberately outlasts the random warm-up: NEC only writes to the
+  # DND at episode end, and while an action's table holds <= k entries its Q is
+  # +inf (mapped to 1e9), so argmax degenerates. This matters more here than on
+  # the other two games: with 18 actions the same number of episodes spreads
+  # over twice as many tables, so each one fills at roughly half the rate. Watch
+  # train/dnd_size early — if the tables are still under k=50 when the anneal
+  # ends, raise annealing_frames and init_random_frames together.
+  annealing_frames: 50_000
+  init_random_frames: 12_500
+  # Large enough to decorrelate eval episodes on a deterministic ALE, small
+  # enough to stay within 10x of eps_end so train/* and eval/* describe the same
+  # policy.
+  eval_eps: 0.005
+
+trainer:
+  # total_frames counts AGENT STEPS. The paper's x-axis counts RAW ALE FRAMES,
+  # and action repeat is 4, so paper_frames = 4 x total_frames. 1M agent steps
+  # = 4M raw frames, matching nec/mspacman.yaml. The paper's own table is at
+  # 10M raw frames, i.e. total_frames: 2_500_000.
+  total_frames: 1_000_000
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  # NEC holds a 100k-transition float32 replay buffer (~11.3 GB, preallocated by
+  # LazyTensorStorage) plus a per-env raw-pixel carry buffer for the in-flight
+  # episode, and spawns one worker process per env. If this run dies with
+  # `EOFError: proc <pid> failed, last command: step_and_maybe_reset`, that is
+  # the OOM killer taking a ParallelEnv worker — drop to 8.
+  num_envs: 16
+  log_every_n_steps: 10_000
+  # 50_000 agent steps == every 200k raw frames, per paper §4 ("We evaluate
+  # MFEC and NEC every 200.000 frames").
+  eval_every_n_steps: 50_000
+  num_eval_episodes: 10

@@ -402,8 +402,15 @@ def test_the_paper_arms_use_the_paper_faithful_env():
 # suite (e.g. the Atari-3 subset: Assault / BankHeist / RoadRunner) is a sweep
 # rather than a directory of near-duplicate files. Two things have to hold or
 # the sweep is silently wrong.
+#
+# The three STUDY games (MsPacman / Qbert / Frostbite) are in this list on
+# purpose: MFEC has no `experiment=mfec/frostbite` and is not supposed to grow
+# one, so `game=Frostbite` over the generic arms IS the Frostbite ablation and
+# these assertions are the only thing standing behind it. Frostbite is also the
+# 18-action case, i.e. the one that doubles the QEC allocation.
 
-_ATARI3 = ["Assault", "BankHeist", "RoadRunner", "Jamesbond", "MsPacman"]
+_STUDY_GAMES = ["MsPacman", "Qbert", "Frostbite"]
+_ATARI3 = ["Assault", "BankHeist", "RoadRunner", "Jamesbond"] + _STUDY_GAMES
 
 
 def _compose_game(arm: str, game: str):
@@ -445,6 +452,53 @@ def test_run_names_stay_distinct_across_a_game_sweep():
         groups.add(cfg.run.group)
     assert len(names) == len(_ATARI3), f"run.name collides across games: {names}"
     assert len(groups) == len(_ATARI3), f"run.group collides across games: {groups}"
+
+
+@pytest.mark.parametrize("game", _STUDY_GAMES)
+def test_every_arm_runs_on_every_study_game(game):
+    """The whole 6 x 3 grid has to compose, not just the arm we happen to test.
+
+    This is what replaces per-game MFEC experiment files: `experiment=mfec/<arm>
+    game=Frostbite` IS the Frostbite ablation, so an arm that failed to follow
+    `game` — a hardcoded env name, a stale `run.game` — would silently run
+    Ms. Pac-Man under a Frostbite run directory.
+    """
+    seen = {}
+    for arm in _ABLATION_ARMS:
+        cfg = _compose_game(arm, game)
+        assert cfg.environment.name == f"ALE/{game}-v5", f"{arm} ignored game"
+        assert cfg.eval_environment.name == f"ALE/{game}-v5", f"{arm} eval env ignored game"
+        assert cfg.run.game == game, (
+            f"{arm} has run.game={cfg.run.game!r} on game={game!r}; the output "
+            f"directory would not name the game it actually ran."
+        )
+        seen[arm] = cfg.run.name
+    assert len(set(seen.values())) == len(_ABLATION_ARMS), (
+        f"two arms share one run.name on {game}, so the second would overwrite "
+        f"the first: {seen}"
+    )
+
+
+def test_the_budget_is_held_equal_across_games_too():
+    """`buffer_size` is per ACTION, so it is tempting to tune it per game.
+
+    Don't: Frostbite has 18 actions against Ms. Pac-Man's 9, but total
+    insertions are bounded by `total_frames` regardless of |A|, so spreading
+    them over more tables lowers the per-action peak rather than raising it. A
+    per-game `buffer_size` would make a cross-game read a comparison of memory
+    budgets. The value is 150_000 for every arm on every game.
+    """
+    budgets = {
+        (arm, game): (
+            _compose_game(arm, game).trainer.total_frames,
+            _compose_game(arm, game).algorithm.buffer_size,
+        )
+        for arm in _ABLATION_ARMS
+        for game in _STUDY_GAMES
+    }
+    assert set(budgets.values()) == {(1_000_000, 150_000)}, (
+        f"budget or QEC size drifted across the 6 x 3 grid: {budgets}"
+    )
 
 
 def test_env_configs_still_load_standalone_outside_hydra():

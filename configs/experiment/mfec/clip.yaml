@@ -67,11 +67,11 @@ algorithm:
   # MFECAlgorithm._embed_observations, and the QEC memory arithmetic below.
   state_dim: 512
 
-  # QEC MEMORY.  Held identical across every Ms. Pac-Man arm so the encoder
-  # ablation differs only in phi — see mspacman.yaml for the sizing
-  # arithmetic, the measured peak (~72k entries on the busiest action at
-  # 1M decisions) and why eviction must never fire.
-  buffer_size: 300_000
+  # QEC MEMORY.  Held identical across every arm and every game so the encoder
+  # ablation differs only in phi — see rp_gray.yaml for the sizing arithmetic,
+  # the measured peak (~72k entries on the busiest action at 1M decisions on
+  # 9-action Ms. Pac-Man) and why eviction must never fire.
+  buffer_size: 150_000
 
 trainer:
   # UNITS: total_frames counts agent *decisions*; the paper's x-axis counts ALE

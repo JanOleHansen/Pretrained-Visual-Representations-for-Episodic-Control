@@ -1,0 +1,80 @@
+# @package _global_
+# NEC on ALE/Frostbite-v5 with a FINETUNED CLIP ViT-B-32 vision tower as the
+# embedding network — the contrastive-PVM arm of the Frostbite encoder ablation,
+# against nec/frostbite.yaml (NatureEmbedding, the paper's ConvNet) and
+# nec/frostbite_dinov2.yaml (self-supervised ViT).
+#
+# This is nec/frostbite.yaml with the embedding-network group swapped, and the
+# exact counterpart of nec/mspacman_clip.yaml with the game swapped. The env
+# pair, gamma, n_step, reward scale, episode boundaries and exploration schedule
+# are all held identical, so the encoder is the only variable.
+#
+# WHY CLIP. MFEC's arm has a sharp a-priori argument for CLIP: phi IS the memory
+# key there, so L2-normalising it makes MFEC's Euclidean kNN exactly the cosine
+# kNN CLIP's contrastive objective was trained under. THAT ARGUMENT DOES NOT
+# CARRY OVER HERE, and it should not be repeated in the writeup as if it did:
+# NEC puts a learned Linear(512, embedding_dim) head between CLIP and the DND
+# and normalises the head's output, so the DND's metric is cosine distance in
+# the head's space, not CLIP's. The reason to run this arm on NEC is the plainer
+# one — whether contrastive image-text features are a better starting point for
+# a finetuned episodic-control encoder than self-supervised (DINOv2) or random
+# (nature) ones.
+#
+# NEC's CLIP is FINETUNED, so it keeps the standard NEC env — 4 stacked 84x84
+# grayscale frames — and adapts them inside the module with a trainable 1x1
+# conv. (MFEC's CLIP arm is frozen and must be fed RGB single frames directly.)
+#
+# COST WARNING: 18 actions against the largest of the three encoders. Together
+# with nec/frostbite_dinov2.yaml this is the heaviest pair in the study.
+#
+# REQUIRES `open_clip_torch`, an optional dependency:
+#     uv sync --extra clip
+defaults:
+  - override /algorithm: nec_atari
+  - override /environment: frostbite_nec_train
+  - override /environment@eval_environment: frostbite_nec_eval
+  - override /algorithm/embedding_network: clip_finetune
+  - _self_
+
+run:
+  algorithm: nec
+  game: frostbite
+  # See the note in nec/frostbite_dinov2.yaml — without this the run directory
+  # would be nec_frostbite_none_seed42 and collide with the NatureEmbedding arm.
+  encoder: clip
+
+algorithm:
+  embedding_network:
+    # null -> open_clip resolves `pretrained_tag` from its hub (needs network).
+    # On an offline node, fetch the checkpoint once and point this at the file.
+    weights_path: null
+    model_name: ViT-B-32-quickgelu
+    pretrained_tag: openai
+
+  # Held identical to nec/frostbite.yaml and every other arm of the ablation.
+  num_updates: 100
+  eps_end: 0.001
+  annealing_frames: 50_000
+  init_random_frames: 12_500
+  eval_eps: 0.005
+
+trainer:
+  # Same units and budget as nec/frostbite.yaml: agent steps, action repeat 4,
+  # so 4M raw ALE frames.
+  total_frames: 1_000_000
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  # 8, matching nec/frostbite_dinov2.yaml. num_envs sets the ViT's inference
+  # batch as well as the process count, and the tower is resident on the same
+  # device as the DND and the replay buffer.
+  num_envs: 8
+  log_every_n_steps: 10_000
+  # Every 200k raw frames, per paper §4.
+  eval_every_n_steps: 50_000
+  # DISK: CLIP ViT-B-32's vision tower is 87.8M params (4x DINOv2 ViT-S/14's
+  # 22M), so each checkpoint is ~820 MB — weights, an equal-sized RMSProp
+  # square_avg, and the DND. At the default checkpoint.save_every_n_steps of
+  # 50_000 a 1M-step run writes 20 of them, i.e. ~16 GB. Raise the interval or
+  # prune if that does not fit.
+  num_eval_episodes: 5

@@ -18,8 +18,20 @@ Implemented experiments:
 | MFEC      | ALE/Pong-v5      | `experiment=mfec/pong`         |
 | MFEC      | ALE/Breakout-v5  | `experiment=mfec/breakout`     |
 | MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`        |
-| MFEC      | ALE/MsPacman-v5  | `experiment=mfec/rp_gray`     |
+| MFEC      | any ALE game     | `experiment=mfec/{rp_gray,rp_rgb,vae,dinov2,resnet,clip} game=<Game>` |
 | NEC       | ALE/Pong-v5      | `experiment=nec/pong`          |
+| NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman{,_dinov2,_clip}` |
+| NEC       | ALE/Qbert-v5     | `experiment=nec/qbert{,_dinov2,_clip}`    |
+| NEC       | ALE/Frostbite-v5 | `experiment=nec/frostbite{,_dinov2,_clip}` |
+
+The last three rows are the **NEC encoder ablation**: 3 games x 3 encoders, nine
+arms, all learning-relevant settings held identical. See "The NEC encoder
+ablation" below before touching any of them.
+
+The MFEC row is the **MFEC encoder ablation**: 6 encoders x whichever `game` is
+passed, run over the same three games (Ms. Pac-Man, Q\*bert, Frostbite). It has
+no per-game files by design — see "`game` — one token per Atari game" below,
+which also spells out the Frostbite invocations.
 
 ## Design principles
 
@@ -424,6 +436,20 @@ configs/
                               SignTransform (paper §4 names Ms. Pac-Man as a game where
                               NEC's lack of reward clipping is what produces the result)
   environment/mspacman_nec_eval.yaml  — eval counterpart (drops EndOfLife)
+  environment/qbert_nec_train.yaml — ALE/Qbert-v5 for NEC: the mspacman_nec_train stack
+                              with the game swapped. NO SignTransform (Q*bert's graded
+                              25/100/500/1000 rewards would be flattened by it), sticky
+                              actions off, 27,000-step episode cap. NOT the same as
+                              qbert_train.yaml, which clips, caps at 4,500 and leaves
+                              v5's 0.25 sticky actions on
+  environment/qbert_nec_eval.yaml  — eval counterpart (drops EndOfLife)
+  environment/frostbite_nec_train.yaml — ALE/Frostbite-v5 for NEC: same stack again.
+                              Paper §4 names Frostbite in the no-clipping list, and the
+                              game is the clearest case (an ice floe pays 10, an igloo
+                              several hundred plus time bonus). 18 actions. There is no
+                              clipped `frostbite_train.yaml` — this game reaches the repo
+                              only through the episodic-control arms
+  environment/frostbite_nec_eval.yaml  — eval counterpart (drops EndOfLife)
   environment/hero_nec_train.yaml — ALE/Hero-v5 for NEC: same idea, NO SignTransform
                               (paper §4 names H.E.R.O. in the same list). Use this rather
                               than hero_train.yaml for any NEC H.E.R.O. run.
@@ -439,9 +465,11 @@ configs/
   experiment/mfec/qbert.yaml   — MFEC on Q*Bert (40M frames, num_envs=16)
   experiment/mfec/rp_gray.yaml — the PAPER BASELINE of the encoder ablation: random
                               projection over a single 84x84 grayscale frame, Blundell et al.
-                              §3's exact phi.  1M decisions = 4M emulator frames, num_envs=16.
-                              See "The Ms. Pac-Man encoder ablation" for the other five arms;
-                              every non-phi knob is held equal across them.
+                              §3's exact phi.  1M decisions = 4M emulator frames, num_envs=4.
+                              Game-generic: pass `game=Frostbite` (or Qbert, MsPacman, ...).
+                              Carries the CANONICAL buffer_size comment — the other five arms
+                              point back at it.  See "The encoder ablation" for those arms;
+                              every non-phi knob is held equal across them AND across games.
   experiment/mfec/vae.yaml — same env pair and budget, encoder_name=vae (the paper's
                               OTHER phi, §3).  vae_checkpoint is required, no default.
                               Uses atari_mfec_* — NOT mspacman_*_singleframe, which is a
@@ -488,6 +516,18 @@ configs/
                               `open_clip_torch` extra; weights_path defaults to null
                               (open_clip downloads the `openai` tag — set a local
                               path on an offline node)
+  experiment/nec/qbert.yaml, qbert_dinov2.yaml, qbert_clip.yaml — the Q*bert arms of
+                              the same three-encoder ablation, on qbert_nec_train/eval.
+                              6 actions, the cheapest of the three games per gradient
+                              step (cost is num_updates x |A| exact kNN scans)
+  experiment/nec/frostbite.yaml, frostbite_dinov2.yaml, frostbite_clip.yaml — the
+                              Frostbite arms, on frostbite_nec_train/eval. 18 actions,
+                              the most expensive of the three; the ViT arms here are the
+                              heaviest runs in the study
+                              ALL NINE ablation files repeat their shared settings
+                              verbatim (Hydra experiment configs do not compose with
+                              each other) — a change that belongs to the comparison has
+                              to land in all nine
   logger/{wandb,tensorboard}.yaml
   paths/default.yaml
   train.yaml, eval.yaml, train_vae.yaml
@@ -559,6 +599,10 @@ Concretely:
 | `mspacman_train_singleframe.yaml` | ✗ | MFEC Ms. Pac-Man + VAE encoder (paper-exact) |
 | `atari_mfec_train.yaml` | ✗ | MFEC Ms. Pac-Man (paper-faithful; see "MFEC on Atari" below) |
 | `mspacman_mfec_train_dinov2.yaml` | ✗ | MFEC Ms. Pac-Man + frozen DINOv2 encoder (paper-faithful) |
+| `mspacman_nec_train.yaml` | ✗ | NEC Ms. Pac-Man (also: no SignTransform) |
+| `qbert_nec_train.yaml` | ✗ | NEC Q*bert (also: no SignTransform) |
+| `frostbite_nec_train.yaml` | ✗ | NEC Frostbite (also: no SignTransform) |
+| `hero_nec_train.yaml` | ✗ | NEC H.E.R.O. (also: no SignTransform) |
 
 The fixed random projection already compresses 28 k-pixel observations
 adequately without online whitening.
@@ -975,6 +1019,11 @@ The recommended set for a joint MFEC/NEC study is the intersection of "MFEC
 demonstrably works" and "in the Atari-100k 26": **Ms. Pac-Man, Q*bert,
 Frostbite**.
 
+The NEC side of that set is implemented: `experiment/nec/{mspacman,qbert,
+frostbite}{,_dinov2,_clip}.yaml` over `{mspacman,qbert,frostbite}_nec_{train,
+eval}.yaml`. See "The NEC encoder ablation" below. The MFEC side takes the game
+as a variable instead (`experiment=mfec/<encoder> game=<Game>`).
+
 ### `game` — one token per Atari game, no per-game config files
 
 `configs/environment/atari_mfec_*.yaml` build `name: ALE/${game}-v5`, so a whole
@@ -988,6 +1037,31 @@ Nothing else is game-specific: `|A|`, the QEC's shape and the random
 projection's input width all come off the env spec in `MFECAlgorithm.setup()`
 (verified on Assault = 7 actions and BankHeist = 18, no config change).
 
+**There is deliberately no `experiment/mfec/frostbite.yaml`** (nor a Q\*bert or
+Ms. Pac-Man one — `mfec/qbert.yaml` is the deprecated pre-`game` file, see its
+header). MFEC on Frostbite is:
+
+```shell
+python src/train.py experiment=mfec/rp_gray game=Frostbite
+python src/train.py -m \
+    experiment=mfec/rp_gray,mfec/rp_rgb,mfec/vae,mfec/dinov2,mfec/resnet,mfec/clip \
+    game=MsPacman,Qbert,Frostbite            # the full 6 x 3 grid, 18 runs
+```
+
+Verified end to end: all six arms compose under `game=Frostbite` with
+`environment.name == eval_environment.name == ALE/Frostbite-v5` and
+`run.name == mfec_Frostbite_<encoder>_seed42`. Guarded by
+`test_the_game_variable_reaches_both_envs`, which parametrises over the three
+study games as well as the Atari-3 set.
+
+If you are tempted to add a per-game MFEC file because the NEC side has them,
+note the asymmetry is forced, not stylistic: NEC's env pair carries
+`EndOfLifeTransform` and a `CatFrames` stack and is written per game, while
+MFEC's is a single frame with no reward clipping and could therefore be made
+generic. Adding `mfec/frostbite*.yaml` would fork the ablation's shared
+settings across twice as many files, which is exactly the failure mode
+"The encoder ablation" below exists to prevent.
+
 Three things that must not regress:
 
 * **`run.game` follows `${game}`** for the six ablation arms. Hardcoded, every
@@ -997,9 +1071,11 @@ Three things that must not regress:
   `scripts/encoder_diagnostics.py` loads these files with a bare
   `OmegaConf.load` outside Hydra, where a plain `${game}` raises
   `InterpolationKeyError`.
-* **`buffer_size` is per action**, so an 18-action game (BankHeist, RoadRunner,
-  Jamesbond) allocates twice Ms. Pac-Man's QEC.  At an Atari-100k budget there
-  is an exact bound: total insertions cannot exceed `total_frames`, so
+* **`buffer_size` is per action**, so an 18-action game (Frostbite, BankHeist,
+  RoadRunner, Jamesbond) allocates twice Ms. Pac-Man's QEC.  This is why the
+  arms sit at `150_000` rather than the `300_000` they carried while the study
+  was Ms. Pac-Man only — see the sizing note below.  At an Atari-100k budget
+  there is an exact bound: total insertions cannot exceed `total_frames`, so
   `buffer_size: 100_000` provably never evicts for any `|A|`.
 
 Guarded by `tests/test_encoder_factory.py` section 6.
@@ -1008,7 +1084,10 @@ Guarded by `tests/test_encoder_factory.py` section 6.
 
 Six arms, **two** env pairs, on whichever `game` is selected.  Every non-φ
 knob is identical: 1M decisions,
-`num_envs: 16`, `eval_every_n_steps: 50_000`, `buffer_size: 300_000`.
+`num_envs: 4`, `eval_every_n_steps: 50_000`, `buffer_size: 150_000`.  Identical
+across **games** too, not just arms — the grid is 6 encoders x
+{Ms. Pac-Man, Q\*bert, Frostbite}, and a knob that moved with the game would make
+a cross-game read something other than a game comparison.
 
 | experiment | env pair | φ | d |
 |---|---|---|---|
@@ -1063,13 +1142,31 @@ On Ms. Pac-Man's 9 actions at the `mfec_atari` default `buffer_size: 1_000_000`:
 
 Measured at 1M decisions: `train/qec_size` (the **mean** over actions) tops
 out ~40 k, and the busiest action runs ~1.8x the mean, so the real peak is
-~72 k. Every Ms. Pac-Man arm therefore sets `buffer_size: 300_000` — >4x the
-peak, at 0.69 / 4.15 / 5.53 GB for d = 64 / 384 / 512.
+~72 k. Every ablation arm therefore sets `buffer_size: 150_000` — >2x the peak.
 
-It is sized to sit safely **above** the peak rather than tightly: LRU eviction
-must never fire, or the algorithm changes mid-run — and would change at a
-different moment in each arm, silently breaking the ablation. On a longer
-budget watch `train/qec_size` and treat a mean of ~150 k as the ceiling.
+**`|A|` is the other multiplier, and it belongs to the game.** At
+`buffer_size: 150_000`:
+
+| encoder | d | 9 actions (Ms. Pac-Man) | 6 (Q\*bert) | 18 (Frostbite) |
+|---|---|---|---|---|
+| `random_projection` / `vae` | 64 | 0.35 GB | 0.23 GB | 0.69 GB |
+| `dinov2` ViT-S/14 | 384 | 2.07 GB | 1.38 GB | 4.15 GB |
+| `resnet` / `clip` | 512 | 2.76 GB | 1.84 GB | 5.53 GB |
+
+The arms carried `300_000` while the study was Ms. Pac-Man only. It was halved
+when Frostbite joined, so that the 18-action allocation is what 9 actions used
+to cost rather than double it — at `300_000` the `resnet` / `clip` arms would
+eagerly take 11.1 GB on Frostbite, on the same device as the encoder.
+
+The halving does not bring eviction closer, it pushes it away: total insertions
+are bounded by `total_frames` regardless of `|A|`, so spreading them over 18
+tables instead of 9 **halves** the per-action peak. Frostbite's headroom at
+150 k is therefore wider than Ms. Pac-Man's, not narrower.
+
+It is still sized to sit safely **above** the peak rather than tightly: LRU
+eviction must never fire, or the algorithm changes mid-run — and would change at
+a different moment in each arm, silently breaking the ablation. On a longer
+budget watch `train/qec_size` and treat a mean of ~75 k as the ceiling.
 
 ### Adding an encoder keyword is a THREE-file change
 
@@ -1974,8 +2071,59 @@ Options:
 | option | factory | status |
 |---|---|---|
 | `nature` (default) | `src.networks.NatureEmbedding` | the paper's network; used by every `experiment/nec/*.yaml` |
-| `dinov2_finetune` | `src.networks.DINOv2Embedding` | finetuned DINOv2 ViT-S/14; bundled as `experiment/nec/mspacman_dinov2.yaml` — see below |
-| `clip_finetune` | `src.networks.CLIPEmbedding` | finetuned CLIP ViT-B-32; bundled as `experiment/nec/mspacman_clip.yaml`. Needs the optional `open_clip_torch` extra — see below |
+| `dinov2_finetune` | `src.networks.DINOv2Embedding` | finetuned DINOv2 ViT-S/14; bundled as `experiment/nec/{mspacman,qbert,frostbite}_dinov2.yaml` — see below |
+| `clip_finetune` | `src.networks.CLIPEmbedding` | finetuned CLIP ViT-B-32; bundled as `experiment/nec/{mspacman,qbert,frostbite}_clip.yaml`. Needs the optional `open_clip_torch` extra — see below |
+
+#### The NEC encoder ablation — 3 games x 3 encoders
+
+Nine bundled arms: `experiment=nec/{mspacman,qbert,frostbite}` (nature),
+`..._dinov2`, `..._clip`.
+
+| game | env pair | \|A\| | raw-frame repeat | MFEC `exact_hit_rate` |
+|---|---|---|---|---|
+| Ms. Pac-Man | `mspacman_nec_{train,eval}` | 9 | 22 % | 0.53 |
+| Q*bert | `qbert_nec_{train,eval}` | 6 | 13 % | 0.60 |
+| Frostbite | `frostbite_nec_{train,eval}` | 18 | 22 % | 0.41 |
+
+The game set is the recommendation derived in "Which games MFEC can work on at
+all" above — the intersection of "MFEC demonstrably works" and "in the
+Atari-100k 26" — so the same three serve an MFEC comparison. NEC does not share
+MFEC's exact-match constraint, so it is safe on all three by construction.
+
+**Held identical across all nine, by design:** `total_frames: 1_000_000` agent
+steps (4M raw frames), `num_updates: 100`, `eps_end: 0.001`,
+`annealing_frames: 50_000`, `init_random_frames: 12_500`, `eval_eps: 0.005`,
+`eval_every_n_steps: 50_000`, `seed: 42`, and the six env configs (all unclipped,
+no VecNorm, sticky actions off, 27,000-step cap). The measurements justifying
+each value live in `experiment/nec/mspacman.yaml`; the other eight files repeat
+them with a pointer rather than re-arguing them.
+
+**Only resource knobs vary by arm:** the ViT arms use `num_envs: 8` and
+`num_eval_episodes: 5` where the nature arms use 16 and 10, because `num_envs`
+is also the ViT's collector-side inference batch.
+
+Three failure modes to avoid when editing these:
+
+* **Tuning one arm.** Any change to a learning-relevant knob has to land in all
+  nine or the comparison is void. Hydra experiment configs do not compose with
+  each other, so there is no inheritance to lean on — it is nine edits.
+* **Dropping `run.game` / `run.encoder`.** Both are set explicitly in every file.
+  `run.encoder` defaults to `${oc.select:algorithm.encoder_name,none}`, an
+  MFEC-only key, so without the override every encoder arm of a game resolves to
+  `nec_<game>_none_seed42` and they overwrite each other.
+* **Reaching for `qbert_train.yaml`.** It clips rewards, caps episodes at 4,500
+  agent steps and leaves v5's 0.25 sticky actions on. Use `qbert_nec_train.yaml`.
+  (`frostbite` has no clipped variant at all, so that mistake is unreachable
+  there.)
+
+```shell
+# One arm:
+python src/train.py experiment=nec/frostbite
+
+# Game sweep for one encoder, five seeds — run.group makes these one mean curve:
+python src/train.py -m experiment=nec/mspacman,nec/qbert,nec/frostbite \
+    trainer.seed=42,43,44,45,46
+```
 
 **Do not confuse this with MFEC's encoders** (`src/encoders/`, selected by the
 `algorithm.encoder_name` *string*, not a config group). The two systems are

@@ -49,6 +49,12 @@ Two derived rules:
 | NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman`       |
 | NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman_dinov2` (finetuned DINOv2 ViT-S/14) |
 | NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman_clip` (finetuned CLIP ViT-B-32) |
+| NEC       | ALE/Qbert-v5     | `experiment=nec/qbert{,_dinov2,_clip}` |
+| NEC       | ALE/Frostbite-v5 | `experiment=nec/frostbite{,_dinov2,_clip}` |
+
+The last three rows are the **NEC encoder ablation**: three games x three
+encoders, nine arms, every learning-relevant setting held identical so that game
+and encoder are the only variables. See "The NEC encoder ablation" below.
 
 ## Main technologies
 
@@ -361,7 +367,9 @@ configs/
     └── nec/
         ├── pong.yaml       <- NEC on Pong (40M raw frames)
         ├── hero.yaml       <- NEC on H.E.R.O. (40M raw frames; unclipped rewards)
-        └── mspacman.yaml   <- NEC on Ms. Pac-Man (40M raw frames; unclipped rewards)
+        ├── mspacman{,_dinov2,_clip}.yaml  <- encoder ablation, Ms. Pac-Man (4M raw frames)
+        ├── qbert{,_dinov2,_clip}.yaml     <- encoder ablation, Q*bert (4M raw frames)
+        └── frostbite{,_dinov2,_clip}.yaml <- encoder ablation, Frostbite (4M raw frames)
 ```
 
 > **Frames vs. agent steps.** Every count in these configs (`total_frames`,
@@ -545,6 +553,25 @@ python src/train.py experiment=mfec/clip game=Assault
 python src/train.py -m experiment=mfec/clip game=Assault,BankHeist,RoadRunner
 ```
 
+**MFEC on Frostbite is this and nothing else** — there is no
+`experiment=mfec/frostbite`, and there should not be one. The six arms below are
+game-generic, so the Frostbite ablation is the same six configs with the token
+swapped:
+
+```shell
+python src/train.py experiment=mfec/rp_gray game=Frostbite
+# the whole 6-arm ablation on the three recommended games (18 runs):
+python src/train.py -m \
+    experiment=mfec/rp_gray,mfec/rp_rgb,mfec/vae,mfec/dinov2,mfec/resnet,mfec/clip \
+    game=MsPacman,Qbert,Frostbite
+```
+
+`run.name` comes out as `mfec_Frostbite_<encoder>_seed42`, so the arms and games
+do not collide on disk or in W&B. Note this is the *opposite* layout from the
+NEC ablation, whose nine arms are nine files (`experiment=nec/frostbite`, …)
+because its env configs are per-game — NEC needs `EndOfLifeTransform` and a
+frame stack, MFEC does not, so only MFEC's env pair could be made generic.
+
 Nothing else is game-specific: `|A|`, the QEC's shape and the random
 projection's input width are all read from the env spec in
 `MFECAlgorithm.setup()`. Verified on Assault (7 actions) and BankHeist (18)
@@ -555,11 +582,16 @@ Two consequences worth knowing:
 - `run.game` follows `${game}` for these arms, so `run.name` / `run.group`
   stay distinct across a sweep. Without that, every game in a multirun would
   write to the same directory and the same W&B run.
-- `buffer_size` is **per action**, so an 18-action game allocates twice
-  Ms. Pac-Man's QEC. At the Atari-100k budget there is an exact rule: you
-  cannot insert more than `total_frames` entries in total, so
-  `buffer_size: 100_000` provably never evicts whatever `|A|` is — worst case
-  18 × 100k × 512 × 4 = 3.7 GB.
+- `buffer_size` is **per action**, so an 18-action game (Frostbite, BankHeist,
+  RoadRunner, Jamesbond) allocates twice Ms. Pac-Man's QEC. That is why the
+  ablation arms sit at `150_000` rather than the `300_000` they used while the
+  study was Ms. Pac-Man only: 18 × 150k × 512 × 4 = 5.5 GB, i.e. Frostbite now
+  costs what Ms. Pac-Man used to. Eviction still cannot fire — the measured peak
+  is ~72k on the busiest action at 1M decisions with 9 actions, and it *falls*
+  as `|A|` rises, because the same insertions spread over more tables. At the
+  Atari-100k budget there is an exact rule: you cannot insert more than
+  `total_frames` entries in total, so `buffer_size: 100_000` provably never
+  evicts whatever `|A|` is.
 
 The default is `MsPacman`, and it is written as `${oc.select:game,MsPacman}`
 rather than `${game}` on purpose: `scripts/encoder_diagnostics.py` loads these
@@ -569,9 +601,13 @@ would raise.
 ## The encoder ablation
 
 Six arms over **two** env pairs, on whichever `game` you select. Everything that is not φ is held equal —
-1M decisions, `num_envs: 16`, `eval_every: 50_000`, `buffer_size: 300_000` —
+1M decisions, `num_envs: 4`, `eval_every: 50_000`, `buffer_size: 150_000` —
 so a between-arm difference is an encoder difference and nothing else.
 Pinned by `tests/test_encoder_factory.py`.
+
+The same six arms cover every game; the recommended set for a joint MFEC/NEC
+study is **Ms. Pac-Man, Q\*bert, Frostbite** (see "Choosing the game" above for
+the sweep command and why no `mfec/frostbite.yaml` exists).
 
 | experiment | observations | φ | d | role |
 |---|---|---|---|---|
@@ -754,8 +790,8 @@ separate systems that should not be merged. NEC's φ is a Hydra config group,
 | option | factory | status |
 |---|---|---|
 | `nature` (default) | `src.networks.NatureEmbedding` — NatureDQN conv trunk + one dense layer to `embedding_dim` | the paper's network; used by every `experiment/nec/*.yaml` |
-| `dinov2_finetune` | `src.networks.DINOv2Embedding` — DINOv2 ViT-S/14, backbone **not** frozen | the self-supervised PVM arm; bundled as `experiment/nec/mspacman_dinov2.yaml` (see below) |
-| `clip_finetune` | `src.networks.CLIPEmbedding` — CLIP ViT-B-32 vision tower, **not** frozen | the contrastive PVM arm; bundled as `experiment/nec/mspacman_clip.yaml`. Needs `uv sync --extra clip` (see below) |
+| `dinov2_finetune` | `src.networks.DINOv2Embedding` — DINOv2 ViT-S/14, backbone **not** frozen | the self-supervised PVM arm; bundled as `experiment/nec/{mspacman,qbert,frostbite}_dinov2.yaml` (see below) |
+| `clip_finetune` | `src.networks.CLIPEmbedding` — CLIP ViT-B-32 vision tower, **not** frozen | the contrastive PVM arm; bundled as `experiment/nec/{mspacman,qbert,frostbite}_clip.yaml`. Needs `uv sync --extra clip` (see below) |
 
 ```shell
 # Standard encoder (this is what every experiment/nec/*.yaml already does):
@@ -765,6 +801,45 @@ python src/train.py experiment=nec/pong algorithm/embedding_network=nature   # e
 # Swap in another one — no YAML editing:
 python src/train.py experiment=nec/pong algorithm/embedding_network=<name>
 ```
+
+### The NEC encoder ablation — three games x three encoders
+
+The nine bundled arms are `experiment=nec/{mspacman,qbert,frostbite}` (the
+paper's ConvNet), `..._dinov2` and `..._clip`. Each one is a complete config;
+they do not compose with each other, which is why the shared settings are
+repeated verbatim in all nine files.
+
+| game | env pair | \|A\| | raw-frame repeat | MFEC `exact_hit_rate` |
+|---|---|---|---|---|
+| Ms. Pac-Man | `mspacman_nec_{train,eval}` | 9 | 22 % | 0.53 |
+| Q*bert | `qbert_nec_{train,eval}` | 6 | 13 % | 0.60 |
+| Frostbite | `frostbite_nec_{train,eval}` | 18 | 22 % | 0.41 |
+
+The three games are the intersection of "MFEC demonstrably works" (measured — see
+AGENTS.md, *Which games MFEC can work on at all*) and "in the Atari-100k 26", so
+the same set also serves an MFEC comparison. All six `*_nec_*` env configs drop
+`SignTransform` (NEC does not clip rewards), drop `VecNorm`, disable v5 sticky
+actions, and cap episodes at the full 27,000 agent steps (30 min).
+
+Held identical across all nine: `total_frames: 1_000_000` agent steps (= 4M raw
+frames), `num_updates: 100`, `eps_end: 0.001`, `annealing_frames: 50_000`,
+`init_random_frames: 12_500`, `eval_eps: 0.005`, `eval_every_n_steps: 50_000`,
+`seed: 42`. Only the resource knobs differ by arm — the ViT arms run
+`num_envs: 8` and `num_eval_episodes: 5` against the ConvNet's 16 and 10, because
+`num_envs` is also the ViT's inference batch. **Do not tune a single arm in
+isolation**; a change that belongs to the comparison has to land in all nine.
+
+```shell
+# One arm:
+python src/train.py experiment=nec/frostbite
+
+# The whole game sweep for one encoder, five seeds each:
+python src/train.py -m experiment=nec/mspacman,nec/qbert,nec/frostbite \
+    trainer.seed=42,43,44,45,46
+```
+
+Run directories are `nec_{game}_{encoder}_seed{n}`, and `run.game` / `run.encoder`
+are set explicitly in every file so a multirun cannot collide.
 
 ### The contract
 
