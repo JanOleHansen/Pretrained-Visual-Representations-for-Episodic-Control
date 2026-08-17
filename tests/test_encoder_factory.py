@@ -549,7 +549,9 @@ def test_the_budget_is_held_equal_across_games_too():
     insertions are bounded by `total_frames` regardless of |A|, so spreading
     them over more tables lowers the per-action peak rather than raising it. A
     per-game `buffer_size` would make a cross-game read a comparison of memory
-    budgets. The value is 150_000 for every arm on every game.
+    budgets. `buffer_size` is pinned equal to `total_frames` (the shared probe
+    budget) for every arm on every game, which makes the no-eviction bound
+    structural: a run inserts at most one entry per decision.
     """
     budgets = {
         (arm, game): (
@@ -559,7 +561,7 @@ def test_the_budget_is_held_equal_across_games_too():
         for arm in _ABLATION_ARMS
         for game in _STUDY_GAMES
     }
-    assert set(budgets.values()) == {(1_000_000, 150_000)}, (
+    assert set(budgets.values()) == {(100_000, 100_000)}, (
         f"budget or QEC size drifted across the 7 x 3 grid: {budgets}"
     )
 

@@ -63,10 +63,11 @@ algorithm:
 
 trainer:
   # total_frames counts AGENT STEPS. The paper's x-axis counts RAW ALE FRAMES,
-  # and action repeat is 4, so paper_frames = 4 x total_frames. 1M agent steps
-  # = 4M raw frames, matching nec/mspacman.yaml. The paper's own table is at
-  # 10M raw frames, i.e. total_frames: 2_500_000.
-  total_frames: 1_000_000
+  # and action repeat is 4, so paper_frames = 4 x total_frames. 100k agent steps
+  # = 400k raw frames — the shared probe budget, held identical across every
+  # experiment in this repo. The paper's own table is at 10M raw frames, i.e.
+  # total_frames: 2_500_000, so scores here are not comparable to it.
+  total_frames: 100_000
   seed: 42
   accelerator: gpu
   devices: [0]
@@ -76,8 +77,9 @@ trainer:
   # `EOFError: proc <pid> failed, last command: step_and_maybe_reset`, that is
   # the OOM killer taking a ParallelEnv worker — drop to 8.
   num_envs: 16
-  log_every_n_steps: 10_000
-  # 50_000 agent steps == every 200k raw frames, per paper §4 ("We evaluate
-  # MFEC and NEC every 200.000 frames").
-  eval_every_n_steps: 50_000
+  log_every_n_steps: 5_000
+  # 10_000 agent steps == every 40k raw frames.  Paper §4 ("We evaluate MFEC and
+  # NEC every 200.000 frames") is every 50_000 agent steps; shortened in
+  # proportion to the 100k-step probe budget so a run still yields ten points.
+  eval_every_n_steps: 10_000
   num_eval_episodes: 10

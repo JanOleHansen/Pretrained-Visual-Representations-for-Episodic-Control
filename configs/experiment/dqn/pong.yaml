@@ -10,12 +10,21 @@ defaults:
   - override /logger: wandb
   - _self_
 
+algorithm:
+  # Replay capacity pinned to the 100k frame budget below — DQN/DDPG spell it
+  # `replay_buffer.storage.max_size`, not MFEC's `buffer_size`.  At capacity ==
+  # total_frames nothing is ever evicted, and LazyTensorStorage preallocates,
+  # so the old 1e6 also committed 10x the RAM this run can fill.
+  replay_buffer:
+    storage:
+      max_size: 100_000
+
 trainer:
-  total_frames: 40_000_100
+  total_frames: 100_000
   seed: 42
   accelerator: gpu
   devices: [3]
   num_envs: 16
-  log_every_n_steps: 10_000
-  eval_every_n_steps: 1_000_000   # paper §4: baselines evaluated every million frames
+  log_every_n_steps: 5_000
+  eval_every_n_steps: 10_000
   num_eval_episodes: 5

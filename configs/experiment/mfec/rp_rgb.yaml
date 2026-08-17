@@ -45,19 +45,22 @@ algorithm:
   # matrix, ~51 MB. RandomProjectionEncoder reads the input width from the env
   # spec, so nothing else needs to change.
   state_dim: 64
-  # Held identical across every arm and every game — see rp_gray.yaml.
-  buffer_size: 150_000
+  # Held identical across every arm and every game, and pinned equal to
+  # trainer.total_frames — see rp_gray.yaml.
+  buffer_size: 100_000
 
 trainer:
   # UNITS: total_frames counts agent *decisions*; the paper's x-axis counts ALE
-  # emulator frames at 4 per decision. 1M decisions = 4M emulator frames.
-  total_frames: 1_000_000
+  # emulator frames at 4 per decision.  100k decisions = 400k emulator frames —
+  # the shared probe budget, held identical across every experiment in this
+  # repo, and a fortieth of Figure 1's 50M-frame x-range.
+  total_frames: 100_000
   seed: 42
   accelerator: gpu
   devices: [0]
   num_envs: 4
-  log_every_n_steps: 10_000
-  eval_every_n_steps: 50_000
+  log_every_n_steps: 5_000
+  eval_every_n_steps: 10_000
   # eval_eps=0.0 (see configs/algorithm/mfec_atari.yaml) makes every eval
   # episode identical on a deterministic ALE, so N>1 buys N copies of one
   # number at N times the cost.

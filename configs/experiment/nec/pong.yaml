@@ -19,10 +19,11 @@ defaults:
   - _self_
 
 trainer:
-  # Agent steps, not raw frames: with action-repeat 4 this is 40M raw ALE
-  # frames, matching the paper's x-axis. Was 40_000_100 until review, which
-  # would have been 160M raw frames — 4x the paper's budget.
-  total_frames: 10_000_100
+  # Agent steps, not raw frames: with action-repeat 4 this is 400k raw ALE
+  # frames — the shared probe budget, held identical across every experiment in
+  # this repo. The paper's x-axis runs to 40M raw frames (total_frames:
+  # 10_000_000), so scores off this budget are not comparable to its curves.
+  total_frames: 100_000
   seed: 42
   accelerator: gpu
   devices: [0]
@@ -33,8 +34,9 @@ trainer:
   # `EOFError: proc <pid> failed, last command: step_and_maybe_reset`, that is
   # the OOM killer taking a ParallelEnv worker — set num_envs: 8.
   num_envs: 16
-  log_every_n_steps: 10_000
-  # 50_000 agent steps == every 200k raw frames, per paper §4 ("We evaluate
-  # MFEC and NEC every 200.000 frames").
-  eval_every_n_steps: 50_000
+  log_every_n_steps: 5_000
+  # 10_000 agent steps == every 40k raw frames.  Paper §4 ("We evaluate MFEC and
+  # NEC every 200.000 frames") is every 50_000 agent steps; shortened in
+  # proportion to the 100k-step probe budget so a run still yields ten points.
+  eval_every_n_steps: 10_000
   num_eval_episodes: 5

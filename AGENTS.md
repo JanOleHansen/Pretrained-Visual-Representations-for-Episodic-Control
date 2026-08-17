@@ -304,17 +304,47 @@ Atari (see "Reward scale for Atari MFEC runs" below — the same clipping
 applies to any Atari algorithm whose train env includes `SignTransform`,
 not just MFEC) and are **not** comparable to paper-reported scores.
 
-Set `trainer.eval_every_n_steps` (opt-in; `null` by default in
-`configs/train.yaml`) to also run evaluation periodically during training and
-have `eval/return_mean` land in the normal training logs (TensorBoard/W&B)
-next to `train/*`, with no separate `src/eval.py` invocation needed:
+`trainer.eval_every_n_steps` runs evaluation periodically during training and
+lands `eval/return_mean` in the normal training logs (TensorBoard/W&B) next to
+`train/*`, with no separate `src/eval.py` invocation needed. Set it to `null`
+to disable:
 
 ```yaml
 # configs/experiment/nec/pong.yaml
 trainer:
-  eval_every_n_steps: 200_000   # paper §4 cadence for MFEC/NEC; baselines use 1_000_000
+  eval_every_n_steps: 10_000   # shared probe cadence -- see below
   num_eval_episodes: 5
 ```
+
+#### The shared probe budget
+
+`configs/train.yaml` and **every** config under `configs/experiment/` hold these
+identical, so any two runs are read off the same x-axis at the same sample
+points. Do not change one config in isolation:
+
+| knob | value | note |
+|---|---|---|
+| `trainer.total_frames`       | `100_000` | agent steps = 400k raw ALE frames at action repeat 4 |
+| `trainer.log_every_n_steps`  | `5_000`   | 20 logged points per run |
+| `trainer.eval_every_n_steps` | `10_000`  | 10 eval points per run |
+| memory capacity              | `100_000` | `algorithm.buffer_size` (MFEC); `algorithm.replay_buffer.storage.max_size` (DQN/DDPG/NEC) |
+
+Capacity is **pinned equal to `total_frames`**. That makes the no-eviction bound
+structural rather than empirical — a run inserts at most one entry per decision,
+so capacity can never bind on any `|A|`. **Move the four together:** raising
+`total_frames` without raising capacity reintroduces eviction mid-run, which
+changes the algorithm partway through and at a different moment in each arm.
+
+This budget is an Atari-100k-style probe, far short of the papers' 40M-frame
+runs, so scores off it are **not** comparable to published tables. Two knobs are
+deliberately *not* rescaled with it and are worth knowing about: NEC's
+`annealing_frames: 50_000` now spans half the run, and `nec/{hero,pong}.yaml`
+inherit `init_random_frames: 50_000` from `nec_atari.yaml`, i.e. half the run is
+pure random exploration. Override them if a short run needs to be informative.
+
+Parity is guarded by `tests/test_encoder_factory.py`
+(`test_every_arm_shares_one_training_budget`,
+`test_the_budget_is_held_equal_across_games_too`).
 
 `build_callbacks` (`src/utils/instantiate.py`) only adds `EvalCallback` when
 `eval_every_n_steps` is truthy, and places it **before** the logger callbacks
@@ -474,7 +504,7 @@ configs/
   experiment/mfec/qbert.yaml   — MFEC on Q*Bert (40M frames, num_envs=16)
   experiment/mfec/rp_gray.yaml — the PAPER BASELINE of the encoder ablation: random
                               projection over a single 84x84 grayscale frame, Blundell et al.
-                              §3's exact phi.  1M decisions = 4M emulator frames, num_envs=4.
+                              §3's exact phi.  100k decisions = 400k emulator frames, num_envs=4.
                               Game-generic: pass `game=Frostbite` (or Qbert, MsPacman, ...).
                               Carries the CANONICAL buffer_size comment — the other five arms
                               point back at it.  See "The encoder ablation" for those arms;
@@ -713,7 +743,8 @@ action repeat on top of it. Consequences:
 `trainer.total_frames` and the logged step count are agent **decisions**
 (`StepTrainer` does `self._step += batch.numel()`). The paper's x-axis is ALE
 emulator frames at 4 per decision (§4.1: "An hour of game play corresponds to
-approximately 200,000 frames"). So **paper frames = 4 × logged step**, and
+approximately 200,000 frames"). So **paper frames = 4 × logged step**: the
+shared probe budget of `total_frames: 100_000` is 400k emulator frames, and
 `total_frames: 12_500_000` covers Figure 1's full 50M-frame range.
 
 ### QEC eviction is LRU, not FIFO
@@ -1195,19 +1226,18 @@ Three things that must not regress:
   `OmegaConf.load` outside Hydra, where a plain `${game}` raises
   `InterpolationKeyError`.
 * **`buffer_size` is per action**, so an 18-action game (Frostbite, BankHeist,
-  RoadRunner, Jamesbond) allocates twice Ms. Pac-Man's QEC.  This is why the
-  arms sit at `150_000` rather than the `300_000` they carried while the study
-  was Ms. Pac-Man only — see the sizing note below.  At an Atari-100k budget
-  there is an exact bound: total insertions cannot exceed `total_frames`, so
-  `buffer_size: 100_000` provably never evicts for any `|A|`.
+  RoadRunner, Jamesbond) allocates twice Ms. Pac-Man's QEC — see the sizing note
+  below.  It is pinned equal to `total_frames`, which gives an exact bound
+  rather than measured headroom: total insertions cannot exceed `total_frames`,
+  so `buffer_size: 100_000` provably never evicts for any `|A|`.
 
 Guarded by `tests/test_encoder_factory.py` section 6.
 
 ### The encoder ablation — hold everything but φ equal
 
 Seven arms, **two** env pairs, on whichever `game` is selected.  Every non-φ
-knob is identical: 1M decisions,
-`num_envs: 4`, `eval_every_n_steps: 50_000`, `buffer_size: 150_000`.  Identical
+knob is identical: 100k decisions,
+`num_envs: 4`, `eval_every_n_steps: 10_000`, `buffer_size: 100_000`.  Identical
 across **games** too, not just arms — the grid is 7 encoders x
 {Ms. Pac-Man, Q\*bert, Frostbite}, and a knob that moved with the game would make
 a cross-game read something other than a game comparison.
@@ -1274,47 +1304,41 @@ On Ms. Pac-Man's 9 actions at the `mfec_atari` default `buffer_size: 1_000_000`:
 | `resnet` resnet18 / `clip` ViT-B-32 | 512 | 18.4 GB |
 | `dinov2` ViT-B/14, `clip` ViT-L-14 | 768 | 27.6 GB |
 
-Measured at 1M decisions: `train/qec_size` (the **mean** over actions) tops
-out ~40 k, and the busiest action runs ~1.8x the mean, so the real peak is
-~72 k. Every ablation arm therefore sets `buffer_size: 150_000` — >2x the peak.
+Every ablation arm sets `buffer_size: 100_000`, **pinned equal to
+`trainer.total_frames`** (the shared probe budget). That is a structural bound,
+not measured headroom: a run inserts at most one QEC entry per decision, so
+total insertions cannot exceed `total_frames`, and they spread over `|A|`
+per-action tables — the per-action peak therefore *falls* as `|A|` rises, and
+LRU eviction can never fire on any game. (The earlier `150_000` was sized off a
+measurement against a 1M-decision budget: `train/qec_size`, the mean over
+actions, topped out ~40 k with the busiest action ~1.8x that, so a real peak of
+~72 k. The pin supersedes that argument.)
 
 **`|A|` is the other multiplier, and it belongs to the game.** At
-`buffer_size: 150_000`:
+`buffer_size: 100_000`:
 
 | encoder | d | 9 actions (Ms. Pac-Man) | 6 (Q\*bert) | 18 (Frostbite) |
 |---|---|---|---|---|
-| `random_projection` / `vae` | 64 | 0.35 GB | 0.23 GB | 0.69 GB |
-| `dinov2` ViT-S/14 | 384 | 2.07 GB | 1.38 GB | 4.15 GB |
-| `resnet` / `clip` | 512 | 2.76 GB | 1.84 GB | 5.53 GB |
-| `mae` ViT-B/16 | 768 | 4.15 GB | 2.76 GB | **8.29 GB** |
+| `random_projection` / `vae` | 64 | 0.23 GB | 0.15 GB | 0.46 GB |
+| `dinov2` ViT-S/14 | 384 | 1.38 GB | 0.92 GB | 2.76 GB |
+| `resnet` / `clip` | 512 | 1.84 GB | 1.23 GB | 3.69 GB |
+| `mae` ViT-B/16 | 768 | 2.76 GB | 1.84 GB | **5.53 GB** |
 
 **`mae` on Frostbite is the largest allocation in the study** and the one to
-check before queueing it: 8.29 GB of QEC states, plus ~0.34 GB of ViT-B/16
+check before queueing it: 5.53 GB of QEC states, plus ~0.34 GB of ViT-B/16
 weights and ~0.3–1 GB of transient activations (`_EMBED_CHUNK_BYTES` is 64 MB of
-raw observation ≈ 158 RGB frames per forward), i.e. **~9–9.7 GB** on the same
-device. That does not fit an 11 GB card and is tight on 12 GB; use ≥16 GB. Note
-where it sits relative to the halving described below — at the old `300_000` the
-512-d arms would have taken 11.1 GB on Frostbite, which is why the value was
-halved, and `mae` at 150 k lands under that ceiling rather than re-crossing it.
-**Do not shrink `buffer_size` for the `mae` arm alone** to buy the memory back:
+raw observation ≈ 158 RGB frames per forward), i.e. **~6.2–6.9 GB** on the same
+device — it fits an 8 GB card with little room, comfortably on 11 GB.
+**Do not shrink `buffer_size` for the `mae` arm alone** to buy memory back:
 it is pinned equal across the whole 7 x 3 grid by
 `test_the_budget_is_held_equal_across_games_too`, and an arm-specific value would
 turn a between-arm read into a comparison of memory budgets.
 
-The arms carried `300_000` while the study was Ms. Pac-Man only. It was halved
-when Frostbite joined, so that the 18-action allocation is what 9 actions used
-to cost rather than double it — at `300_000` the `resnet` / `clip` arms would
-eagerly take 11.1 GB on Frostbite, on the same device as the encoder.
-
-The halving does not bring eviction closer, it pushes it away: total insertions
-are bounded by `total_frames` regardless of `|A|`, so spreading them over 18
-tables instead of 9 **halves** the per-action peak. Frostbite's headroom at
-150 k is therefore wider than Ms. Pac-Man's, not narrower.
-
-It is still sized to sit safely **above** the peak rather than tightly: LRU
-eviction must never fire, or the algorithm changes mid-run — and would change at
-a different moment in each arm, silently breaking the ablation. On a longer
-budget watch `train/qec_size` and treat a mean of ~75 k as the ceiling.
+**RAISE IT IN LOCKSTEP WITH `total_frames`.** The whole no-eviction argument is
+the pin; leaving `buffer_size` at 1e5 against a longer run reintroduces
+eviction mid-run, at a different moment in each arm, silently breaking the
+ablation. Watch `train/qec_size` either way — it logs the mean over actions, and
+the busiest action runs ~1.8x it.
 
 ### Adding an encoder keyword is a THREE-file change
 
@@ -1831,7 +1855,7 @@ Everything §4 actually publishes, checked against the composed config:
 | "repeating each action four times" | 4 | `gym_kwargs.frame_skip: 4` | ok |
 | "RMSProp algorithm" | — | `torch.optim.RMSprop` | ok |
 | "NEC and MFEC do not require reward clipping" | — | no `SignTransform` in `mspacman_nec_train` | ok |
-| "evaluate MFEC and NEC every 200.000 frames" | 200k raw | `eval_every_n_steps: 50_000` agent steps | ok |
+| "evaluate MFEC and NEC every 200.000 frames" | 200k raw | `eval_every_n_steps: 10_000` agent steps (40k raw) | deviation — shortened in proportion to the 100k-step probe budget |
 | Eq. 3 N-step, bootstrap = `max_a Q(s_{t+N},a)` over **all** memories | — | `_compute_n_step_returns` + `_max_finite_q` | ok |
 | §3.3 "earliest such values can be added is N steps after" | — | the sliding window in `step()` | ok |
 | Eq. 4 `Q_i <- Q_i + α(Q^(N) - Q_i)` | — | `write_batch` blend | ok |
@@ -2245,10 +2269,11 @@ all" above — the intersection of "MFEC demonstrably works" and "in the
 Atari-100k 26" — so the same three serve an MFEC comparison. NEC does not share
 MFEC's exact-match constraint, so it is safe on all three by construction.
 
-**Held identical across all twelve, by design:** `total_frames: 1_000_000` agent
-steps (4M raw frames), `num_updates: 100`, `eps_end: 0.001`,
-`annealing_frames: 50_000`, `init_random_frames: 12_500`, `eval_eps: 0.005`,
-`eval_every_n_steps: 50_000`, `seed: 42`, and the six env configs (all unclipped,
+**Held identical across all twelve, by design:** `total_frames: 100_000` agent
+steps (400k raw frames — the shared probe budget), `num_updates: 100`,
+`eps_end: 0.001`, `annealing_frames: 50_000`, `init_random_frames: 12_500`,
+`eval_eps: 0.005`, `log_every_n_steps: 5_000`, `eval_every_n_steps: 10_000`,
+`seed: 42`, and the six env configs (all unclipped,
 no VecNorm, sticky actions off, 27,000-step cap). The measurements justifying
 each value live in `experiment/nec/mspacman.yaml`; the other eleven files repeat
 them with a pointer rather than re-arguing them.

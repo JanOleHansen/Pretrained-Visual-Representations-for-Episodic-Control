@@ -29,12 +29,19 @@ defaults:
   - override /environment@eval_environment: breakout_eval
   - _self_
 
+algorithm:
+  # QEC MEMORY — pinned to the 100k frame budget below, so capacity can never
+  # bind: total insertions cannot exceed total_frames, and they spread over
+  # |A| per-action tables, so LRU eviction never fires.
+  buffer_size: 100_000
+
 trainer:
-  total_frames: 1_000_000
+  total_frames: 100_000
   accelerator: gpu
   devices: [0]
   num_envs: 1
-  eval_every_n_steps: 200_000   # paper §4: "evaluate MFEC and NEC every 200,000 frames"
+  log_every_n_steps: 5_000
+  eval_every_n_steps: 10_000
   # eval_eps=0.0 (see configs/algorithm/mfec_atari.yaml) makes every eval
   # episode identical on a deterministic ALE, so N>1 buys N copies of one
   # number at N times the cost.

@@ -65,8 +65,8 @@ algorithm:
 
 trainer:
   # Same units and budget as nec/frostbite.yaml: agent steps, action repeat 4,
-  # so 4M raw ALE frames.
-  total_frames: 1_000_000
+  # so 400k raw ALE frames.
+  total_frames: 100_000
   seed: 42
   accelerator: gpu
   devices: [0]
@@ -74,13 +74,15 @@ trainer:
   # sets the ViT's inference batch as well as the process count, and the
   # backbone is resident on the same device as the DND and the replay buffer.
   num_envs: 8
-  log_every_n_steps: 10_000
-  # Every 200k raw frames, per paper §4.
-  eval_every_n_steps: 50_000
+  log_every_n_steps: 5_000
+  # 10_000 agent steps == every 40k raw frames.  Paper §4 evaluates every 200k
+  # raw frames; shortened in proportion to the 100k-step probe budget so a run
+  # still yields ten eval points.
+  eval_every_n_steps: 10_000
   # DISK: MAE ViT-B/16 is 85.7M params, so each checkpoint is 686 MB early and
   # ~915 MB once the DND fills — weights, an equal-sized RMSProp square_avg,
   # and the DND's filled entries (18 actions x 50_000 x 64 f32 = 230 MB at
   # capacity, double the 9-action games'). At the default
-  # checkpoint.save_every_n_steps of 50_000 a 1M-step run writes 20 of them,
-  # i.e. ~17 GB. Raise the interval or prune if that does not fit.
+  # checkpoint.save_every_n_steps of 50_000 a 100k-step run writes 2 of them,
+  # i.e. ~1.7 GB — re-check it before lengthening the run.
   num_eval_episodes: 5

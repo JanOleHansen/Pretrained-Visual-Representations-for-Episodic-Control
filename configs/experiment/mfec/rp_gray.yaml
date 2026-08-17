@@ -27,27 +27,25 @@ algorithm:
   # which is a property of the GAME, not of the arm:
   #
   #     state_dim          |A|=9 (MsPacman)   |A|=18 (Frostbite)
-  #     64  (rp)              0.35 GB              0.69 GB
-  #     384 (dinov2)          2.07 GB              4.15 GB
-  #     512 (resnet/clip)     2.76 GB              5.53 GB
+  #     64  (rp)              0.23 GB              0.46 GB
+  #     384 (dinov2)          1.38 GB              2.76 GB
+  #     512 (resnet/clip)     1.84 GB              3.69 GB
   #
-  # 1.5e5 sits safely ABOVE the peak, not tight: LRU eviction must never fire,
-  # or the algorithm changes mid-run — and would change at a different moment in
-  # each arm, which would silently break the ablation.  Measured at 1M decisions
-  # on Ms. Pac-Man: train/qec_size (the MEAN over actions) tops out ~40k, and the
-  # busiest action runs ~1.8x the mean, so the real peak is ~72k.  1.5e5 is >2x
-  # that, and the bound is looser on an 18-action game, not tighter: total
-  # insertions cannot exceed total_frames, and they spread over twice as many
-  # tables, so the per-action peak FALLS as |A| rises.
+  # PINNED EQUAL TO trainer.total_frames.  That makes the bound structural
+  # rather than empirical: a run inserts at most one QEC entry per decision, so
+  # total insertions cannot exceed total_frames, and they spread over |A|
+  # per-action tables — the per-action peak therefore FALLS as |A| rises, and
+  # capacity can never bind on any game.  This matters because LRU eviction
+  # firing would change the algorithm mid-run, at a different moment in each
+  # arm, silently breaking the ablation.
   #
-  # It was 3e5 while the ablation was Ms. Pac-Man only.  Halved when Frostbite
-  # (18 actions) joined, so the 18-action allocation is what 9 actions used to
-  # cost rather than double it — the resnet/clip arms would otherwise eagerly
-  # take 11.1 GB on Frostbite before collecting a frame.
+  # (It was 1.5e5 against a 1M-decision budget, sized off a measurement:
+  # train/qec_size, the MEAN over actions, topped out ~40k with the busiest
+  # action ~1.8x that.  The pin supersedes that headroom argument.)
   #
-  # WATCH train/qec_size on a longer budget.  It logs the mean, so treat
-  # mean ~75k as the ceiling; past that, raise buffer_size (and the GPU).
-  buffer_size: 150_000
+  # RAISE THIS IN LOCKSTEP if trainer.total_frames goes up — leaving it at 1e5
+  # against a longer run reintroduces eviction.  Watch train/qec_size either way.
+  buffer_size: 100_000
 
 trainer:
   # UNITS: total_frames counts agent *decisions* (StepTrainer does
@@ -57,11 +55,12 @@ trainer:
   #
   #     paper frames = 4 x (this axis)
   #
-  # 1M decisions = 4M emulator frames.  Figure 1's full x-range is 50M emulator
-  # frames = 12.5M decisions; this is a tenth of that, held identical across
-  # every arm so the encoder ablation shares an x-axis.  For the Atari-100k
-  # protocol override to 100_000 (see README, "Choosing the game").
-  total_frames: 1_000_000
+  # 100k decisions = 400k emulator frames — the Atari-100k protocol (see README,
+  # "Choosing the game"), and the SHARED PROBE BUDGET held identical across every
+  # experiment in this repo so the encoder ablation shares an x-axis.  Figure 1's
+  # full x-range is 50M emulator frames = 12.5M decisions, so curves off this
+  # budget cover its first ~1% and are not comparable to the paper's scores.
+  total_frames: 100_000
   seed: 42
   accelerator: gpu
   devices: [0]
@@ -76,18 +75,19 @@ trainer:
   #        4            13          1,676  (20%)          5,159
   #       16             7          5,041  (62%)          2,829
   #
-  # At the 1M budget below that same absolute loss is only ~0.5% for 4 envs and
-  # ~2% for 16 — but the second column does not recover: 16 envs kept 39% fewer
-  # unique states at equal frames, because they share one QEC and eps=0.005, so
-  # they largely retread the same trajectory.
+  # The loss is ABSOLUTE, so at the 100k budget below it is ~1.7% for 4 envs and
+  # ~5% for 16 — small, but ten times what it was at the old 1M budget, which is
+  # the cost of the short probe.  The second column does not recover either: 16
+  # envs kept 39% fewer unique states at equal frames, because they share one QEC
+  # and eps=0.005, so they largely retread the same trajectory.
   #
   # 4 is the compromise the paper's Algorithm 1 (a single sequential stream)
   # trades against GPU efficiency: enough to keep a ViT forward batched for the
   # PVM arms, few enough that stranding and QEC staleness stay small.  Raise it
   # only if wall-clock hurts more than sample efficiency.
   num_envs: 4
-  log_every_n_steps: 10_000
-  eval_every_n_steps: 50_000   # 50k decisions = 200k emulator frames
+  log_every_n_steps: 5_000
+  eval_every_n_steps: 10_000
   # eval_eps=0.0 (see configs/algorithm/mfec_atari.yaml) makes every eval
   # episode identical on a deterministic ALE, so N>1 buys N copies of one
   # number at N times the cost.

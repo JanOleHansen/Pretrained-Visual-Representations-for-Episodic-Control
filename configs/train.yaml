@@ -47,10 +47,16 @@ trainer:
   accelerator: cpu        # "cpu" | "gpu" | "mps"
   devices: [0]            # GPU indices; ignored when accelerator=cpu
   seed: 42
-  total_frames: 1_000_000
+  # SHARED PROBE BUDGET.  total_frames / log_every_n_steps / eval_every_n_steps
+  # are held identical here and in every configs/experiment/**.yaml, so any two
+  # runs are read off the same x-axis at the same sample points.  Change them as
+  # a set, and raise algorithm.buffer_size (MFEC) or
+  # algorithm.replay_buffer.storage.max_size (DQN/DDPG/NEC) in lockstep with
+  # total_frames — those are pinned equal to it so memory capacity never binds.
+  total_frames: 100_000
   num_envs: 1             # number of parallel environments
-  log_every_n_steps: 1_000
-  eval_every_n_steps: null  # set to enable periodic greedy-policy eval (see EvalCallback)
+  log_every_n_steps: 5_000
+  eval_every_n_steps: 10_000  # periodic greedy-policy eval (see EvalCallback); null disables
   num_eval_episodes: 5       # episodes averaged per evaluation, when enabled
 
 checkpoint:

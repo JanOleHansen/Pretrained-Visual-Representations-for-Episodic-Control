@@ -89,13 +89,16 @@ trainer:
   # and action repeat is 4, so paper_frames = 4 x total_frames.
   #
   #   total_frames    paper x-axis   NEC Ms. Pac-Man (Fig. 6 / Table 3)
+  #     100_000        400k frames     below the paper's first plotted point
   #     250_000          1M frames     ~1500-2000
-  #   1_000_000          4M frames     ~2500-3000   <- this run
+  #   1_000_000          4M frames     ~2500-3000
   #   2_500_000         10M frames      4142.8      (Table 3, directly comparable)
   #
-  # (An earlier comment here claimed 1_000_000 agent steps == 40M raw frames.
-  # That is wrong by 10x: it is 4M. The 2_500_100 figure for 10M was correct.)
-  total_frames: 1_000_000
+  # 100_000 is the SHARED PROBE BUDGET held identical across every experiment in
+  # this repo (see AGENTS.md) — short enough to run the whole encoder grid, and
+  # far short of the paper's. Scores off this budget are NOT comparable to
+  # Table 3; raise it to 2_500_000 for that.
+  total_frames: 100_000
   seed: 42
   accelerator: gpu
   devices: [0]
@@ -106,8 +109,9 @@ trainer:
   # OOM killer then takes out a ParallelEnv worker, which surfaces as
   # `EOFError: proc <pid> failed, last command: step_and_maybe_reset`.
   num_envs: 16
-  log_every_n_steps: 10_000
-  # 50_000 agent steps == every 200k raw frames, per paper §4 ("We evaluate
-  # MFEC and NEC every 200.000 frames").
-  eval_every_n_steps: 50_000
+  log_every_n_steps: 5_000
+  # 10_000 agent steps == every 40k raw frames.  Paper §4 ("We evaluate MFEC and
+  # NEC every 200.000 frames") is every 50_000 agent steps; shortened in
+  # proportion to the 100k-step probe budget so a run still yields ten points.
+  eval_every_n_steps: 10_000
   num_eval_episodes: 10

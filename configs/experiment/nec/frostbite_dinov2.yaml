@@ -56,8 +56,8 @@ algorithm:
 
 trainer:
   # Same units and budget as nec/frostbite.yaml: agent steps, action repeat 4,
-  # so 4M raw ALE frames.
-  total_frames: 1_000_000
+  # so 400k raw ALE frames.
+  total_frames: 100_000
   seed: 42
   accelerator: gpu
   devices: [0]
@@ -67,9 +67,11 @@ trainer:
   # Halving it keeps peak activation memory clear of the 11.3 GB replay buffer
   # and the per-env raw-pixel carry.
   num_envs: 8
-  log_every_n_steps: 10_000
-  # Every 200k raw frames, per paper §4.
-  eval_every_n_steps: 50_000
+  log_every_n_steps: 5_000
+  # 10_000 agent steps == every 40k raw frames.  Paper §4 evaluates every 200k
+  # raw frames; shortened in proportion to the 100k-step probe budget so a run
+  # still yields ten eval points.
+  eval_every_n_steps: 10_000
   # 5 rather than nec/frostbite.yaml's 10. Each eval episode is up to 27,000 ViT
   # forwards at batch 1, the least amortised inference in the whole run.
   num_eval_episodes: 5

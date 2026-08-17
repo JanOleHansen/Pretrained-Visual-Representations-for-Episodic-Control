@@ -26,26 +26,24 @@ algorithm:
   state_dim: 384
 
   # QEC MEMORY.  Held identical across every arm and every game so the encoder
-  # ablation differs only in phi — see rp_gray.yaml for the sizing arithmetic,
-  # the measured peak (~72k entries on the busiest action at 1M decisions on
-  # 9-action Ms. Pac-Man) and why eviction must never fire.
-  buffer_size: 150_000
+  # ablation differs only in phi — see rp_gray.yaml for the sizing arithmetic
+  # and why eviction must never fire.  Pinned equal to trainer.total_frames, so
+  # capacity cannot bind: total insertions over the run cannot exceed the frame
+  # budget, and they spread over |A| per-action tables.
+  buffer_size: 100_000
 
 trainer:
-  # UNITS: total_frames counts agent *decisions* (StepTrainer does
-  # `self._step += batch.numel()`), while the paper's x-axis counts ALE
-  # emulator frames at 4 per decision.  So paper frames = 4 x (this axis), and
-  # 12.5M decisions = 50M emulator frames = the full x-range of Figure 1 —
-  # matching mspacman.yaml so the encoder arms share an x-axis.
-  # (The previous 40_000_100 here was a units slip: that is 160M emulator
-  # frames, 4x the paper budget.)
-  total_frames: 1_000_000
+  # UNITS: total_frames counts agent *decisions*; the paper's x-axis counts ALE
+  # emulator frames at 4 per decision.  100k decisions = 400k emulator frames —
+  # the shared probe budget, held identical across every experiment in this
+  # repo, and a fortieth of Figure 1's 50M-frame x-range.
+  total_frames: 100_000
   seed: 42
   accelerator: gpu
   devices: [0]
   num_envs: 4
-  log_every_n_steps: 10_000
-  eval_every_n_steps: 50_000
+  log_every_n_steps: 5_000
+  eval_every_n_steps: 10_000
   # eval_eps=0.0 (see configs/algorithm/mfec_atari.yaml) makes every eval
   # episode identical on a deterministic ALE, so N>1 buys N copies of one
   # number at N times the cost.

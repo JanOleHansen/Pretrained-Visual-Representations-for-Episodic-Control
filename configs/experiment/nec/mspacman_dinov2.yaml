@@ -57,8 +57,8 @@ algorithm:
 
 trainer:
   # Same units and same budget as nec/mspacman.yaml: total_frames counts AGENT
-  # STEPS, action repeat is 4, so this is 4M raw ALE frames.
-  total_frames: 1_000_000
+  # STEPS, action repeat is 4, so this is 400k raw ALE frames.
+  total_frames: 100_000
   seed: 42
   accelerator: gpu
   devices: [0]
@@ -70,9 +70,11 @@ trainer:
   # target box — an OOM-killed ParallelEnv worker surfaces as
   # `EOFError: proc <pid> failed, last command: step_and_maybe_reset`.
   num_envs: 8
-  log_every_n_steps: 10_000
-  # Every 200k raw frames, per paper §4.
-  eval_every_n_steps: 50_000
+  log_every_n_steps: 5_000
+  # 10_000 agent steps == every 40k raw frames.  Paper §4 evaluates every 200k
+  # raw frames; shortened in proportion to the 100k-step probe budget so a run
+  # still yields ten eval points.
+  eval_every_n_steps: 10_000
   # 10 in nec/mspacman.yaml. Each eval episode is up to 27,000 ViT forwards at
   # batch 1, which is the least amortised inference in the whole run; 5 still
   # averages over eval_eps=0.005's episode-to-episode variance.

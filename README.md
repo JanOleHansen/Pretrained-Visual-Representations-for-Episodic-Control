@@ -311,9 +311,33 @@ for batch in self.collector:
 
 Trainer config knobs (`total_frames`, `seed`, `accelerator`, `devices`,
 `num_envs`, `log_every_n_steps`, `eval_every_n_steps`, `num_eval_episodes`)
-only control how training runs, never what is learned. `eval_every_n_steps`
-is `null` (disabled) by default; set it to a frame count to enable periodic
-evaluation (see `EvalCallback` below).
+only control how training runs, never what is learned. Set `eval_every_n_steps`
+to `null` to disable periodic evaluation (see `EvalCallback` below).
+
+**Shared probe budget.** `configs/train.yaml` and *every* config under
+`configs/experiment/` hold these three identical, so any two runs are read off
+the same x-axis at the same sample points:
+
+| knob | value |
+|------|-------|
+| `trainer.total_frames`      | `100_000` agent steps (= 400k raw ALE frames at action repeat 4) |
+| `trainer.log_every_n_steps` | `5_000` |
+| `trainer.eval_every_n_steps`| `10_000` (10 eval points per run) |
+
+Memory capacity is **pinned equal to `total_frames`** alongside it —
+`algorithm.buffer_size: 100_000` for MFEC, `algorithm.replay_buffer.storage.max_size:
+100_000` for DQN / DDPG / NEC. That makes the no-eviction bound structural
+rather than empirical: a run inserts at most one entry per decision, so
+capacity can never bind. **Change the four as a set** — raising `total_frames`
+without raising capacity reintroduces eviction mid-run.
+
+This budget is an Atari-100k-style probe, far short of the papers' 40M-frame
+runs; scores off it are not comparable to published tables. Override per run:
+
+```bash
+python src/train.py experiment=nec/mspacman \
+  trainer.total_frames=2_500_000 algorithm.replay_buffer.storage.max_size=2_500_000
+```
 
 ## Configuration
 
@@ -372,16 +396,17 @@ configs/
     └── nec/
         ├── pong.yaml       <- NEC on Pong (40M raw frames)
         ├── hero.yaml       <- NEC on H.E.R.O. (40M raw frames; unclipped rewards)
-        ├── mspacman{,_dinov2,_clip,_mae}.yaml  <- encoder ablation, Ms. Pac-Man (4M raw frames)
-        ├── qbert{,_dinov2,_clip,_mae}.yaml     <- encoder ablation, Q*bert (4M raw frames)
-        └── frostbite{,_dinov2,_clip,_mae}.yaml <- encoder ablation, Frostbite (4M raw frames)
+        ├── mspacman{,_dinov2,_clip,_mae}.yaml  <- encoder ablation, Ms. Pac-Man (400k raw frames)
+        ├── qbert{,_dinov2,_clip,_mae}.yaml     <- encoder ablation, Q*bert (400k raw frames)
+        └── frostbite{,_dinov2,_clip,_mae}.yaml <- encoder ablation, Frostbite (400k raw frames)
 ```
 
 > **Frames vs. agent steps.** Every count in these configs (`total_frames`,
 > `frames_per_batch`, `eval_every_n_steps`, `annealing_frames`) is in **agent
 > steps**, while the papers count **raw ALE frames**. With action repeat 4
 > (`gym_kwargs.frame_skip: 4`) the conversion is `raw = agent_steps * 4`, so
-> `total_frames: 10_000_100` is the paper's 40M-frame budget. Note that
+> `total_frames: 100_000` (the shared probe budget) is 400k raw frames, and the
+> paper's 40M-frame budget would be `total_frames: 10_000_000`. Note that
 > `frame_skip` here *is* the ALE action repeat — TorchRL forwards it into
 > `gym.make(..., frameskip=N)` rather than stacking a second repeat on top.
 
@@ -460,7 +485,8 @@ Plus: the observation is a **single** 84×84 frame (§3, D = 7056), not a
 **Units.** `trainer.total_frames` counts agent *decisions*, but the paper's
 x-axis counts ALE emulator frames at 4 per decision (§4.1: "An hour of game
 play corresponds to approximately 200,000 frames"). So **paper frames = 4 ×
-the logged step count**, and `total_frames: 12_500_000` covers Figure 1's full
+the logged step count**: the shared probe budget of `total_frames: 100_000` is
+400k emulator frames, and `total_frames: 12_500_000` covers Figure 1's full
 50M-frame range.
 
 `frame_skip` is a trap worth knowing about: `GymEnv._build_env` forwards it to
@@ -588,15 +614,14 @@ Two consequences worth knowing:
   stay distinct across a sweep. Without that, every game in a multirun would
   write to the same directory and the same W&B run.
 - `buffer_size` is **per action**, so an 18-action game (Frostbite, BankHeist,
-  RoadRunner, Jamesbond) allocates twice Ms. Pac-Man's QEC. That is why the
-  ablation arms sit at `150_000` rather than the `300_000` they used while the
-  study was Ms. Pac-Man only: 18 × 150k × 512 × 4 = 5.5 GB, i.e. Frostbite now
-  costs what Ms. Pac-Man used to. Eviction still cannot fire — the measured peak
-  is ~72k on the busiest action at 1M decisions with 9 actions, and it *falls*
-  as `|A|` rises, because the same insertions spread over more tables. At the
-  Atari-100k budget there is an exact rule: you cannot insert more than
-  `total_frames` entries in total, so `buffer_size: 100_000` provably never
-  evicts whatever `|A|` is.
+  RoadRunner, Jamesbond) allocates twice Ms. Pac-Man's QEC: at the ablation's
+  `100_000`, 18 × 100k × 512 × 4 = 3.7 GB. Eviction cannot fire, by an exact
+  rule rather than by headroom — capacity is pinned equal to `total_frames`, you
+  cannot insert more than `total_frames` entries in total, and they spread over
+  `|A|` tables, so the per-action peak *falls* as `|A|` rises. (It was `150_000`
+  against a 1M-decision budget, sized off a measured ~72k peak on the busiest
+  action; the pin supersedes that.) Raise it in lockstep if you raise
+  `total_frames`.
 
 The default is `MsPacman`, and it is written as `${oc.select:game,MsPacman}`
 rather than `${game}` on purpose: `scripts/encoder_diagnostics.py` loads these
@@ -606,7 +631,7 @@ would raise.
 ## The encoder ablation
 
 Seven arms over **two** env pairs, on whichever `game` you select. Everything that is not φ is held equal —
-1M decisions, `num_envs: 4`, `eval_every: 50_000`, `buffer_size: 150_000` —
+100k decisions, `num_envs: 4`, `eval_every: 10_000`, `buffer_size: 100_000` —
 so a between-arm difference is an encoder difference and nothing else.
 Pinned by `tests/test_encoder_factory.py`.
 
@@ -763,10 +788,10 @@ MFEC's state embedding is pluggable (`algorithm.encoder_name`):
   tokens against the CLIP arm's ViT-B/32 50, same depth and width, so ≈4× the φ
   cost per frame, and there is no ViT-B/32 MAE checkpoint to trade down to. And
   at `state_dim: 768` it is the **widest** φ, so the eager QEC allocation is
-  0.46 GB per action — 4.15 GB on 9-action Ms. Pac-Man and **8.29 GB on
-  18-action Frostbite**, alongside the backbone on the same device. Frostbite
-  wants a ≥16 GB card. Do not shrink `buffer_size` for this arm alone; it is
-  held equal across the whole grid on purpose.
+  0.31 GB per action at `buffer_size: 100_000` — 2.76 GB on 9-action
+  Ms. Pac-Man and **5.53 GB on 18-action Frostbite**, alongside the backbone on
+  the same device. Do not shrink `buffer_size` for this arm alone; it is held
+  equal across the whole grid on purpose.
 
 The RGB encoders (`dinov2`, `resnet`, `clip`, `mae`) share one env pair,
 `atari_mfec_train_rgb` / `atari_mfec_eval_rgb`: single RGB frame, no
@@ -888,10 +913,13 @@ the same set also serves an MFEC comparison. All six `*_nec_*` env configs drop
 `SignTransform` (NEC does not clip rewards), drop `VecNorm`, disable v5 sticky
 actions, and cap episodes at the full 27,000 agent steps (30 min).
 
-Held identical across all twelve: `total_frames: 1_000_000` agent steps (= 4M
-raw frames), `num_updates: 100`, `eps_end: 0.001`, `annealing_frames: 50_000`,
-`init_random_frames: 12_500`, `eval_eps: 0.005`, `eval_every_n_steps: 50_000`,
-`seed: 42`. Only the resource knobs differ by arm — the ViT arms run
+Held identical across all twelve: `total_frames: 100_000` agent steps (= 400k
+raw frames, the shared probe budget), `num_updates: 100`, `eps_end: 0.001`,
+`annealing_frames: 50_000`, `init_random_frames: 12_500`, `eval_eps: 0.005`,
+`log_every_n_steps: 5_000`, `eval_every_n_steps: 10_000`, `seed: 42`. Note that
+`annealing_frames` still spans half the probe budget — ε only reaches `eps_end`
+at the midpoint of a 100k-step run, so lengthen the run before reading the
+ε-greedy floor's effect. Only the resource knobs differ by arm — the ViT arms run
 `num_envs: 8` and `num_eval_episodes: 5` against the ConvNet's 16 and 10, because
 `num_envs` is also the ViT's inference batch. **Do not tune a single arm in
 isolation**; a change that belongs to the comparison has to land in all twelve.
