@@ -933,6 +933,48 @@ bucket-and-verify scheme (coarse key for the O(1) lookup, exact L2 check to
 reject collisions), not a finer or coarser `key_scale`. That is a real change
 to `QEC` and has not been made.
 
+### Which games MFEC can work on at all — MEASURED
+
+MFEC's whole learning signal is Eq. (1) firing on an **exact state
+re-encounter**. Games differ enormously in whether that ever happens, and a
+game where it does not is a guaranteed null result no matter how good φ is.
+Screen before spending GPU time. Measured (random projection, 15 k frames,
+`eps=0.005`; frame repetition from a 2.5 k-frame random rollout):
+
+| game | \|A\| | raw frame repeat | `train/exact_hit_rate` | verdict |
+|---|---|---|---|---|
+| Ms. Pac-Man | 9 | 22 % | 0.53 | works (reaches ~30x random) |
+| Q*bert | 6 | 13 % | 0.60 | works |
+| Frostbite | 18 | 22 % | 0.41 | works |
+| **Assault** | 7 | **1 %** | **0.000** | **null — scores exactly random** |
+| BankHeist | 18 | 43 % | ~0 | marginal (3-5x random) |
+
+**Assault essentially never shows the same frame twice** (2,995 distinct out of
+3,000), so the QEC is a write-only log: every query falls through to a
+k-neighbour mean over a table it can never index, and the policy is noise. This
+is not an encoder problem — counting *raw* 84x84 frames gives the identical
+number, i.e. φ merges nothing and loses nothing.
+
+Consequences:
+
+* **The five games of Blundell et al. §4.1** (Ms. Pac-Man, Q*bert, River Raid,
+  Frostbite, Space Invaders) are not an arbitrary choice.
+* **Benchmark subsets selected for deep RL do not transfer.** The Atari-5 /
+  Atari-3 methodology fits a regression on gradient-learner scores, for which
+  frame repetition is irrelevant; Assault is in the Atari-3 test set and is
+  near-worst-case for episodic control.
+* **NEC does not share this constraint.** Its DND read path is a
+  kernel-weighted sum over the p nearest neighbours, not an exact-match lookup,
+  and its encoder is trained — so it degrades gracefully where MFEC collapses.
+  Only its *blend* rule needs exact matches, which is why
+  `train/dnd_blend_rate` reads ~0 on high-novelty games. Expect that; it is not
+  a bug. MFEC is therefore the binding constraint when choosing games for a
+  study that runs both.
+
+The recommended set for a joint MFEC/NEC study is the intersection of "MFEC
+demonstrably works" and "in the Atari-100k 26": **Ms. Pac-Man, Q*bert,
+Frostbite**.
+
 ### `game` — one token per Atari game, no per-game config files
 
 `configs/environment/atari_mfec_*.yaml` build `name: ALE/${game}-v5`, so a whole

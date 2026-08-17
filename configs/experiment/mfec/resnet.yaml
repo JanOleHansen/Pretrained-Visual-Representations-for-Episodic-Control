@@ -42,7 +42,7 @@ trainer:
   seed: 42
   accelerator: gpu
   devices: [0]
-  num_envs: 16
+  num_envs: 4
   log_every_n_steps: 10_000
   eval_every_n_steps: 50_000
   # eval_eps=0.0 (see configs/algorithm/mfec_atari.yaml) makes every eval

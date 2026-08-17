@@ -49,17 +49,35 @@ trainer:
   #
   #     paper frames = 4 x (this axis)
   #
-  # 12.5M decisions = 50M emulator frames = the full x-range of Figure 1.
+  # 1M decisions = 4M emulator frames.  Figure 1's full x-range is 50M emulator
+  # frames = 12.5M decisions; this is a tenth of that, held identical across
+  # every arm so the encoder ablation shares an x-axis.  For the Atari-100k
+  # protocol override to 100_000 (see README, "Choosing the game").
   total_frames: 1_000_000
   seed: 42
   accelerator: gpu
   devices: [0]
-  # The paper runs a single sequential stream (Algorithm 1).  Every env in a
-  # ParallelEnv acts on a QEC that is only updated at episode end, so a large
-  # num_envs buys throughput at the cost of the one-shot latching that is the
-  # whole point of episodic control.  4 is the compromise; raise it if
-  # wall-clock hurts more than sample efficiency.
-  num_envs: 16
+  # PARALLEL ENVS.  MFEC writes to the QEC only at episode end (see
+  # MFECAlgorithm._carry), so frames sitting in a trailing partial episode when
+  # the run stops are never written at all.  The stranded amount is roughly
+  # num_envs x (mean episode length / 2), i.e. ABSOLUTE — it hurts most at small
+  # budgets.  Measured on Ms. Pac-Man over an 8,192-decision budget:
+  #
+  #     num_envs   episodes done   frames stranded   unique states kept
+  #        1            12            193  ( 2%)          4,628
+  #        4            13          1,676  (20%)          5,159
+  #       16             7          5,041  (62%)          2,829
+  #
+  # At the 1M budget below that same absolute loss is only ~0.5% for 4 envs and
+  # ~2% for 16 — but the second column does not recover: 16 envs kept 39% fewer
+  # unique states at equal frames, because they share one QEC and eps=0.005, so
+  # they largely retread the same trajectory.
+  #
+  # 4 is the compromise the paper's Algorithm 1 (a single sequential stream)
+  # trades against GPU efficiency: enough to keep a ViT forward batched for the
+  # PVM arms, few enough that stranding and QEC staleness stay small.  Raise it
+  # only if wall-clock hurts more than sample efficiency.
+  num_envs: 4
   log_every_n_steps: 10_000
   eval_every_n_steps: 50_000   # 50k decisions = 200k emulator frames
   # eval_eps=0.0 (see configs/algorithm/mfec_atari.yaml) makes every eval

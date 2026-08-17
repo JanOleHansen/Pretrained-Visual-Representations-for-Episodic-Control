@@ -1,4 +1,28 @@
 # @package _global_
+# ============================================================================
+# DEPRECATED — DO NOT USE FOR THE ENCODER ABLATION.
+#
+# This config predates the game-generic `game` variable and still points at the
+# DQN-style env stack, which breaks MFEC in three documented ways at once:
+#
+#   * SignTransform     reward clipped to {-1,0,+1}. MFEC argmaxes over raw
+#                       Monte-Carlo returns, so every scoring event becomes
+#                       worth the same and episode_reward is not a game score.
+#   * CatFrames N=4     4-frame stack. Blundell §3 embeds a SINGLE frame; a
+#                       stack quadruples D and makes exact re-encounters —
+#                       the thing Eq. (1) needs — strictly rarer.
+#   * sticky actions    repeat_action_probability is left at v5's 0.25. Eq. (1)
+#                       is max-over-returns, which footnote 1 calls "not suited
+#                       to rational action selection in stochastic
+#                       environments"; it latches onto lucky returns.
+#
+# Use the paper-faithful arms instead, which take the game as a variable:
+#
+#     python src/train.py experiment=mfec/rp_gray game=Hero
+#
+# See "The encoder ablation" in AGENTS.md.
+# ============================================================================
+
 # MFEC on ALE/Hero-v5 — same hyperparameters as the Pong/Q*Bert runs.
 # H.E.R.O. has 18 actions, so the mfec_atari defaults (buffer_size=1M, k=11,
 # state_dim=64, gamma=0.99) apply without change.
