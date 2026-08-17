@@ -1,0 +1,116 @@
+# NEC embedding network: finetunable CLIP vision tower
+# (src/networks.py::CLIPEmbedding).
+#
+# The NEC counterpart to MFEC's `encoder_name=clip` (frozen,
+# src/encoders/clip_encoder.py). Both isolate the *projected* image embedding —
+# the space CLIP's contrastive image-text loss was computed on — and both use
+# CLIP's own normalisation constants and skip the centre crop. This one is
+# trained end-to-end with the DND: `freeze_backbone: false`.
+#
+#   python src/train.py experiment=nec/mspacman \
+#       algorithm/embedding_network=clip_finetune \
+#       run.encoder=clip
+#
+# `configs/experiment/nec/mspacman_clip.yaml` bundles that plus a
+# throughput-sized trainer, so prefer `experiment=nec/mspacman_clip` and keep
+# this group override for one-off arms on other games.
+#
+# Set `run.encoder` explicitly (as above, or in the experiment config) so the
+# run directory distinguishes it from a `nature` run — `run.encoder` reads
+# `algorithm.encoder_name`, which is an MFEC-only key.
+#
+# REQUIRES `open_clip_torch`, an OPTIONAL dependency:
+#     uv sync --extra clip
+# CLIPEmbedding imports it lazily inside __init__, so its absence costs the
+# `nature` and `dinov2_finetune` arms nothing.
+_partial_: true
+_target_: src.networks.CLIPEmbedding
+
+# null -> open_clip downloads `pretrained_tag` from its hub, which needs
+# network access. On an offline node, fetch the checkpoint once elsewhere and
+# point this at the local file. A local path WINS over the tag.
+weights_path: null
+
+# open_clip spells architectures with hyphens ("ViT-B-32"), NOT OpenAI's
+# "ViT-B/32". ViT-B-32 is the cheap choice: a 7x7=49 patch grid at 224 against
+# ViT-B-16's 14x14=196, i.e. roughly 4x less attention for the same parameter
+# count.
+#
+# The "-quickgelu" suffix is REQUIRED with the openai tag: OpenAI's CLIP was
+# trained with QuickGELU activations while open_clip's plain ViT-B-32 config
+# uses standard GELU (verified against open_clip 3.3.0). Mismatched, open_clip
+# loads the weights anyway and only emits a UserWarning, then returns subtly
+# wrong features — the worst possible failure for an encoder whose whole value
+# is its geometry. CLIPEmbedding turns that warning into a hard error.
+# LAION/DataComp tags (laion2b_*, datacomp_*) want the PLAIN name instead.
+model_name: ViT-B-32-quickgelu
+pretrained_tag: openai
+
+# null = the tower's native resolution (224 for ViT-B-32). Anything else is
+# passed to open_clip as force_image_size, which interpolates the positional
+# embeddings away from the pretraining resolution.
+#
+# It must also be divisible by the patch size (32 for ViT-B-32). open_clip does
+# NOT check this: force_image_size=112 builds and runs, but the patch conv
+# tiles only 96 pixels and silently discards the last 16 of each axis — on Ms.
+# Pac-Man that is the score/lives row. CLIPEmbedding rejects it. Valid for
+# ViT-B-32: 32, 64, 96, 128, 160, 192, 224, ...
+image_size: null
+
+# CLIP's own preprocessing uses bicubic. Set "bilinear" to hold resizing
+# identical to the DINOv2 arm if you would rather control for it than give each
+# backbone its native pipeline.
+interpolation: bicubic
+
+# L2-normalise the CLIP embedding BEFORE the head.
+#
+# NOTE this does NOT make the DND's metric cosine-in-CLIP-space, the way
+# `clip_normalize` does for MFEC. There phi *is* the key; here a learned
+# Linear(512, embedding_dim) head sits in between and NEC normalises the head's
+# output instead. What it does buy is a well-scaled head input: a pretrained
+# ViT-B-32 emits vectors of norm ~10.7 (measured on Ms. Pac-Man frames), which
+# otherwise sets the head's output and gradient scale via a quantity nothing
+# else in NEC controls. Set false to ablate.
+normalize_features: true
+
+# ---------------------------------------------------------------------------
+# MEASURED AT INITIALISATION — read this before calling a slow start a bug.
+# ---------------------------------------------------------------------------
+# 60 real Ms. Pac-Man frames through this env (4x84x84), embeddings taken
+# exactly as NECAlgorithm._embed produces them (head output, L2-normalised),
+# i.e. what the DND kernel actually sees:
+#
+#   encoder                              mean pairwise L2   delta=1e-3 as % of
+#                                        between states     mean squared dist
+#   NatureEmbedding (the baseline)            0.031                86%
+#   CLIP pretrained, normalize_features=true  0.007               809%
+#   CLIP pretrained, normalize_features=false 0.009               406%
+#   CLIP randomly initialised                 0.001            ~1.4e5%
+#
+# CLIP starts ~4.4x more tightly clustered than the paper's ConvNet, so
+# `kernel_delta` (nec_atari.yaml) dominates the inverse-distance kernel even
+# more than it already does for the baseline — the kernel is close to a flat
+# average over all k neighbours until training spreads the embeddings out.
+# The repo already documents the baseline as marginal in this regime
+# (see NECAlgorithm._embed), so this is a difference of degree, not kind.
+#
+# The cause is upstream and is a property of CLIP on Atari, not of this env:
+# every frame is "a screenshot of Pac-Man" to a contrastive image-text model,
+# so raw pairwise cosine in CLIP space is 0.9935. The MFEC arm's RGB 210x160
+# frames measure 0.9949 — no better. What separates pretrained from random is
+# the residual after removing the common component: 7.4% of the embedding norm
+# pretrained against 0.75% at random init, a 10x difference. The pretraining is
+# doing real work; it is just riding on top of a large constant offset.
+#
+# If `train/q_loss` will not descend and `eval/dnd_top_weight` sits at 1/k,
+# lower `algorithm.kernel_delta` for this arm before concluding CLIP is a bad
+# encoder. Do NOT silently change it for one arm only in a published
+# comparison — it is a learning-relevant knob and must be declared.
+
+freeze_backbone: false        # true -> train only the channel adapter + head
+
+# Learning-rate multiplier for the pretrained vision tower, relative to the
+# randomly-initialised channel adapter + head (which stay at `algorithm.lr`).
+# Same rationale and same caveat as dinov2_finetune.yaml: NOT a validated
+# number. 1.0 restores a single uniform learning rate.
+backbone_lr_scale: 0.1

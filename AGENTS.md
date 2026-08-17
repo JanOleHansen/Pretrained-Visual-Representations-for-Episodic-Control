@@ -393,6 +393,9 @@ configs/
     nature.yaml             — NatureDQN trunk + dense layer (DEFAULT; the paper's net)
     dinov2_finetune.yaml    — finetunable DINOv2 ViT (weights_path required;
                               image_size is the throughput knob)
+    clip_finetune.yaml      — finetunable CLIP vision tower (needs the optional
+                              `open_clip_torch` extra; QuickGELU pairing and
+                              patch-size divisibility are both hard errors)
   environment/cartpole.yaml — env kwargs (name, transforms)
   environment/pong_train.yaml     — Atari Pong (training transforms incl. EndOfLife + Sign + VecNorm; DQN only)
   environment/pong_mfec_train.yaml — Atari Pong for MFEC (same stack WITHOUT VecNorm; see note below)
@@ -478,13 +481,20 @@ configs/
                               cluster-local.  NOTE it keeps the 4x84x84 NEC env, unlike
                               MFEC's DINOv2 arm which needs an RGB env pair — the
                               finetuned adapter handles channels, a frozen ViT cannot
+  experiment/nec/mspacman_clip.yaml — same task and env pair, with the
+                              embedding_network group swapped to clip_finetune
+                              (finetuned CLIP ViT-B-32) and run.encoder=clip.  The
+                              contrastive-PVM arm.  Needs the optional
+                              `open_clip_torch` extra; weights_path defaults to null
+                              (open_clip downloads the `openai` tag — set a local
+                              path on an offline node)
   logger/{wandb,tensorboard}.yaml
   paths/default.yaml
   train.yaml, eval.yaml, train_vae.yaml
 tests/
   test_env_seeding.py       — ParallelEnv workers get reproducible, non-colliding streams;
                               a num_envs=1 env must not re-seed the parent process
-  test_smoke.py             — DQN-on-CartPole, DQN-on-Pong, DDPG-on-HalfCheetah, A2C-on-HalfCheetah, MFEC-on-Pong, NEC-on-Pong, NEC-on-Pong-with-DINOv2 smoke tests
+  test_smoke.py             — DQN-on-CartPole, DQN-on-Pong, DDPG-on-HalfCheetah, A2C-on-HalfCheetah, MFEC-on-Pong, NEC-on-Pong, NEC-on-Pong-with-DINOv2, NEC-on-Pong-with-CLIP smoke tests
   test_mfec_encoder_refactor.py — encoder-abstraction transparency: setup() wiring, embed()
                               shape/determinism, forward(), deepcopy sharing, checkpoint round-trip
   test_mfec_estimator_gap.py — eval_eps defaults to 0.0 (greedy eval) and QEC exposes the
@@ -502,6 +512,13 @@ tests/
                               gradients reaching the backbone, checkpoint round-trip.
                               Second tier (NEC_DINOV2_REAL=1, NEC_DINOV2_REPO_DIR=... if
                               offline) builds the genuine dinov2_vits14
+  test_nec_clip_finetune.py — CLIPEmbedding: lazy open_clip import (AST-checked),
+                              QuickGELU guard, patch-size divisibility guard,
+                              BatchNorm warning, text-tower removal, CLIP-vs-ImageNet
+                              stats, param groups, finetuning through step(),
+                              checkpoint round-trip.  Second tier (NEC_CLIP_REAL=1)
+                              builds the genuine ViT-B-32-quickgelu; third
+                              (CLIP_WEIGHTS=...) loads the real OpenAI checkpoint
 ```
 
 ## Adding a new algorithm
@@ -1916,6 +1933,7 @@ Options:
 |---|---|---|
 | `nature` (default) | `src.networks.NatureEmbedding` | the paper's network; used by every `experiment/nec/*.yaml` |
 | `dinov2_finetune` | `src.networks.DINOv2Embedding` | finetuned DINOv2 ViT-S/14; bundled as `experiment/nec/mspacman_dinov2.yaml` — see below |
+| `clip_finetune` | `src.networks.CLIPEmbedding` | finetuned CLIP ViT-B-32; bundled as `experiment/nec/mspacman_clip.yaml`. Needs the optional `open_clip_torch` extra — see below |
 
 **Do not confuse this with MFEC's encoders** (`src/encoders/`, selected by the
 `algorithm.encoder_name` *string*, not a config group). The two systems are
@@ -2115,6 +2133,100 @@ gradient updates, checkpoint save, and resume all confirmed.
 **Not verified**: whether NEC *scores* better with DINOv2 than with
 `nature`. No full training run has been completed — that is the experiment,
 not a precondition for it. `backbone_lr_scale` is likewise untuned.
+
+#### `clip_finetune` — finetunable CLIP vision tower
+
+`src.networks.CLIPEmbedding` +
+`configs/algorithm/embedding_network/clip_finetune.yaml`, bundled as
+`experiment/nec/mspacman_clip.yaml`. The NEC counterpart to MFEC's
+`encoder_name=clip`. Structurally it is `DINOv2Embedding` with an open_clip
+backbone: same mean-replicate channel adapter, same `param_groups` split,
+same `freeze_backbone` / `backbone_lr_scale` knobs. Four things are
+CLIP-specific and all four are load-bearing:
+
+1. **`open_clip_torch` is an OPTIONAL dependency** (`uv sync --extra clip`).
+   `CLIPEmbedding` imports it **lazily, inside `__init__`**. This matters far
+   more than it does for MFEC's `clip_encoder.py`: `src/networks.py` is
+   imported by `src/algorithms/nec.py` and by every DQN/DDPG/A2C config, so a
+   module-scope `import open_clip` would take the *entire repo* down on a
+   machine without the extra. Pinned by
+   `test_open_clip_is_not_a_module_level_import_of_networks`, which parses the
+   AST rather than string-matching.
+2. **Only `model.visual` is kept.** The ~63M-param text tower is not merely
+   dead weight here the way it is for MFEC — every parameter of an
+   `nn.Module` embedding network goes into RMSProp *and into every
+   checkpoint*. Vision tower 87.8M, text tower 63.4M (measured, open_clip
+   3.3.0).
+3. **QuickGELU pairing is a hard error**, exactly as in `CLIPEncoder`:
+   `pretrained_tag=openai` requires a `-quickgelu` model name. Verified
+   against open_clip 3.3.0 that plain `ViT-B-32` really does use `nn.GELU`
+   and `ViT-B-32-quickgelu` really does use `QuickGELU`; a real test asserts
+   this so the rule cannot rot silently.
+4. **`image_size` must be divisible by the patch size (32).** open_clip does
+   NOT check this. Measured: `force_image_size=112` builds and runs, but the
+   patch conv yields a 3×3 grid covering 96 of 112 pixels and **silently
+   discards 16 px of each axis** — on Ms. Pac-Man that is the score/lives row.
+   `_assert_patch_grid_covers_the_image` rejects it and names the valid sizes.
+   Skipped for non-ViT towers, which have no patch grid.
+
+Plus one warning rather than an error: **CLIP's RN\* towers carry BatchNorm**
+(measured: `RN50` has 55 modules; every ViT-\* has none). NEC keeps the
+embedding network in `train()` mode because it is being optimised, so
+BatchNorm would use *batch* statistics — and NEC batches differently in each
+phase (`num_envs` collecting, `batch_size` in gradient steps, **1** in
+`BaseTrainer.evaluate`). The same frame would embed differently in each,
+destabilising every DND key. Prefer a ViT tower.
+
+**`normalize_features` does NOT mean what `clip_normalize` means for MFEC.**
+There φ *is* the key, so L2-normalising makes MFEC's Euclidean kNN exactly
+the cosine kNN CLIP was trained under. Here a learned `Linear(512,
+embedding_dim)` head sits in between and NEC normalises the *head's* output,
+so the DND metric is cosine in the head's space, not CLIP's. Do not repeat
+the MFEC claim for this arm. What it does buy is a unit-norm head input
+(pretrained ViT-B-32 emits norm ~10.7).
+
+**Measured at initialisation** (60 real Ms. Pac-Man frames, embeddings as
+`NECAlgorithm._embed` produces them, i.e. what the DND kernel sees):
+
+| encoder | mean pairwise L2 | `kernel_delta`=1e-3 as % of mean sq. dist |
+|---|---|---|
+| `NatureEmbedding` (baseline) | 0.031 | 86% |
+| CLIP pretrained | 0.007 | 809% |
+| CLIP randomly initialised | 0.001 | ~1.4e5% |
+
+CLIP starts ~4.4× more tightly clustered than the paper's ConvNet, so the
+inverse-distance kernel is even closer to a flat average at step 0 than it
+already is for the baseline (see `NECAlgorithm._embed`). The cause is
+upstream and is not NEC's env: raw pairwise cosine in CLIP space is 0.9935
+on the 4×84×84 NEC frames and 0.9949 on the MFEC arm's RGB 210×160 ones.
+What the pretraining buys is the residual after the common component is
+removed — 7.4% of the norm pretrained against 0.75% random, a 10× gap. If
+`train/q_loss` will not descend and `eval/dnd_top_weight` sits at 1/k, try
+lowering `kernel_delta` for this arm before concluding CLIP is a bad encoder
+— and declare it, because it is a learning-relevant knob.
+
+**Cost.** ViT-B-32's 7×7=49 patch grid at 224 makes the forward comparable to
+DINOv2 ViT-S/14's 16×16=256 despite the wider model, but the parameter count
+is 4× (87.8M vs 22M). Checkpoints measured at 703 MB without the DND, ~820 MB
+with the production `dnd_capacity`; at `checkpoint.save_every_n_steps=50_000`
+a 1M-step run writes 20 of them (~16 GB).
+
+**Verified** (`tests/test_nec_clip_finetune.py`, plus
+`tests/test_smoke.py::test_smoke_nec_pong_clip_finetune`): with a stub tower —
+lazy import, QuickGELU guard, patch-grid guard, BatchNorm warning, text-tower
+removal, CLIP-vs-ImageNet stats, whole-frame resize, adapter init, param
+groups, finetuning through NEC's `step()`, gradient arrival at the tower, and
+checkpoint round-trip. With the **real** `ViT-B-32-quickgelu` (opt-in,
+`NEC_CLIP_REAL=1`) — tower size, GELU/QuickGELU pairing, CLIP stats off the
+real checkpoint metadata, patch-aligned sizes accepted and 112 rejected,
+gradients reaching `conv1` / `positional_embedding` / `class_embedding` /
+`transformer.resblocks.0.*` / `proj`, and NEC end-to-end. With the **real
+OpenAI pretrained checkpoint** (`CLIP_WEIGHTS=`) — loads and embeds. Also run
+manually against `experiment=nec/mspacman_clip` on ALE with the genuine
+pretrained tower: DND writes, gradient updates, checkpoint save and resume.
+
+**Not verified**: whether NEC scores better with CLIP than with `nature` or
+`dinov2_finetune`. That is the experiment.
 
 ### 4. Exact-match dict and VecNorm
 

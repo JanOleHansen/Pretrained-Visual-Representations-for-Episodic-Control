@@ -31,10 +31,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# MFEC's `clip` encoder only (src/encoders/clip_encoder.py).  Kept out of the
-# base dependencies on purpose: nothing else in the repo needs it, the test
-# suite runs against a stub, and `clip_encoder.py` imports it lazily inside
-# CLIPEncoder.__init__ so its absence costs the other encoders nothing.
+# The two CLIP arms only: MFEC's frozen `encoder_name=clip`
+# (src/encoders/clip_encoder.py) and NEC's finetuned
+# `algorithm/embedding_network=clip_finetune` (src.networks.CLIPEmbedding).
+# Kept out of the base dependencies on purpose: nothing else needs it, the test
+# suite runs against a stub, and BOTH classes import it lazily inside
+# __init__ so its absence costs every other encoder nothing.
+#
+# The lazy import matters more for CLIPEmbedding than for CLIPEncoder:
+# src/networks.py is imported by src/algorithms/nec.py and by every
+# DQN/DDPG/A2C config, so a module-scope `import open_clip` there would break
+# the whole repo without this extra, not just the clip arm.  Pinned by
+# tests/test_nec_clip_finetune.py.
 # Install with:
 #     uv sync --extra clip
 clip = ["open_clip_torch>=2.24.0"]

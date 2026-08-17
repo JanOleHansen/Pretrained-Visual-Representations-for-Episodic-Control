@@ -271,3 +271,62 @@ def test_smoke_nec_pong_dinov2_finetune(monkeypatch):
     assert isinstance(metrics, dict)
     assert "train/epsilon" in metrics
     assert "train/dnd_size" in metrics
+
+def test_smoke_nec_pong_clip_finetune(monkeypatch):
+    """NEC with the CLIP embedding network, driven from the CLI override.
+
+    `algorithm/embedding_network=clip_finetune` is the documented way to run
+    this arm, so the smoke test exercises it exactly that way: the Hydra group
+    swap, the 4-channel Atari observation reaching the vision tower's channel
+    adapter, and the two-group optimizer all have to survive `_train()`.
+
+    `open_clip_torch` is an OPTIONAL dependency (`uv sync --extra clip`), so a
+    stub `open_clip` module is injected rather than importorskip-ing: that way
+    this still runs on a machine without the extra, and it pins the lazy-import
+    property that keeps the dependency optional. The real ViT-B-32 is covered
+    by tests/test_nec_clip_finetune.py's NEC_CLIP_REAL tier.
+    """
+    pytest.importorskip("ale_py")
+    import sys
+    import types
+
+    import torch
+    import torch.nn as nn
+
+    class _StubVisual(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # kernel == stride, as every open_clip ViT patch-embed conv has.
+            self.conv1 = nn.Conv2d(3, 8, kernel_size=32, stride=32, bias=False)
+            self.proj = nn.Linear(8, 32)
+            self.image_size = (224, 224)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.proj(self.conv1(x).mean(dim=(-1, -2)))
+
+    class _StubCLIP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.visual = _StubVisual()
+            self.transformer = nn.Linear(8, 8)   # text tower, must be dropped
+
+    module = types.ModuleType("open_clip")
+    module.create_model_and_transforms = lambda name, **kw: (_StubCLIP(), None, None)
+    monkeypatch.setitem(sys.modules, "open_clip", module)
+
+    cfg = load_experiment_cfg(
+        "nec/pong",
+        [
+            *_nec_pong_overrides(),
+            "algorithm/embedding_network=clip_finetune",
+            # 64 = 2 x the stub's patch size, so the patch-grid guard passes.
+            "algorithm.embedding_network.image_size=64",
+            "run.encoder=clip",
+        ],
+    )
+    from src.train import _train
+
+    metrics = _train(cfg)
+    assert isinstance(metrics, dict)
+    assert "train/epsilon" in metrics
+    assert "train/dnd_size" in metrics

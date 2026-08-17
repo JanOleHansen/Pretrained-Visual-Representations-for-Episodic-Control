@@ -48,6 +48,7 @@ Two derived rules:
 | NEC       | ALE/Hero-v5      | `experiment=nec/hero`           |
 | NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman`       |
 | NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman_dinov2` (finetuned DINOv2 ViT-S/14) |
+| NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman_clip` (finetuned CLIP ViT-B-32) |
 
 ## Main technologies
 
@@ -323,7 +324,8 @@ configs/
 │   │                          values there were swept and never published)
 │   └── embedding_network/  <- NEC encoder config group (see "NEC embedding networks")
 │       ├── nature.yaml     <- NatureDQN trunk + dense layer (default)
-│       └── dinov2_finetune.yaml <- finetunable DINOv2 ViT (weights_path required)
+│       ├── dinov2_finetune.yaml <- finetunable DINOv2 ViT (weights_path required)
+│       └── clip_finetune.yaml   <- finetunable CLIP ViT-B-32 (needs the `clip` extra)
 ├── environment/
 │   ├── cartpole.yaml       <- env name + transforms
 │   ├── pong_train.yaml     <- Pong with EndOfLife + Sign + VecNorm (training)
@@ -752,7 +754,8 @@ separate systems that should not be merged. NEC's φ is a Hydra config group,
 | option | factory | status |
 |---|---|---|
 | `nature` (default) | `src.networks.NatureEmbedding` — NatureDQN conv trunk + one dense layer to `embedding_dim` | the paper's network; used by every `experiment/nec/*.yaml` |
-| `dinov2_finetune` | `src.networks.DINOv2Embedding` — DINOv2 ViT-S/14, backbone **not** frozen | the PVM arm; bundled as `experiment/nec/mspacman_dinov2.yaml` (see below) |
+| `dinov2_finetune` | `src.networks.DINOv2Embedding` — DINOv2 ViT-S/14, backbone **not** frozen | the self-supervised PVM arm; bundled as `experiment/nec/mspacman_dinov2.yaml` (see below) |
+| `clip_finetune` | `src.networks.CLIPEmbedding` — CLIP ViT-B-32 vision tower, **not** frozen | the contrastive PVM arm; bundled as `experiment/nec/mspacman_clip.yaml`. Needs `uv sync --extra clip` (see below) |
 
 ```shell
 # Standard encoder (this is what every experiment/nec/*.yaml already does):
@@ -847,6 +850,79 @@ arrival at the backbone, checkpoint round-trip) and, opt-in via
 every documented `image_size`, gradients into the transformer blocks, NEC
 end-to-end). **What is not tested is whether it scores better than `nature`**
 — no full training run has been completed. That is the experiment.
+
+### `clip_finetune` — a finetuned CLIP vision tower
+
+`CLIPEmbedding` runs a pretrained CLIP ViT-B-32 as NEC's φ and trains it with
+the DND. Structurally it is `DINOv2Embedding` with an open_clip backbone: the
+same mean-replicate channel adapter, the same `param_groups` split, the same
+`freeze_backbone` / `backbone_lr_scale` knobs.
+
+**Needs the optional `open_clip_torch` extra:**
+
+```shell
+uv sync --extra clip
+
+# Bundled experiment (Ms. Pac-Man, same env pair as experiment=nec/mspacman):
+python src/train.py experiment=nec/mspacman_clip
+
+# Or as a group override on any NEC game:
+python src/train.py experiment=nec/pong \
+    algorithm/embedding_network=clip_finetune run.encoder=clip
+```
+
+`open_clip` is imported **lazily**, inside `CLIPEmbedding.__init__` — without
+the extra every other arm still runs untouched.
+
+Four CLIP-specific things, all of which will bite silently if ignored:
+
+- **QuickGELU pairing is a hard error.** OpenAI's CLIP was trained with
+  QuickGELU; open_clip's plain `ViT-B-32` config uses standard GELU. open_clip
+  loads the mismatch with only a `UserWarning` and then returns subtly wrong
+  features. Use `ViT-B-32-quickgelu` with `pretrained_tag: openai`, and the
+  plain name with `laion2b_*` / `datacomp_*`.
+- **`image_size` must be divisible by the patch size (32).** open_clip does not
+  check. `force_image_size=112` builds and runs, but the patch conv tiles only
+  96 pixels and **silently discards 16 px of each axis** — on Ms. Pac-Man that
+  is the score/lives row. `CLIPEmbedding` rejects it and names the valid sizes.
+- **Prefer a ViT tower.** CLIP's `RN*` towers carry BatchNorm (RN50 has 55
+  modules). NEC trains the encoder, so it stays in `train()` mode and BatchNorm
+  would use batch statistics — and NEC batches differently when collecting
+  (`num_envs`), when updating (`batch_size`) and when evaluating (1). The
+  module warns.
+- **`normalize_features` is not MFEC's `clip_normalize`.** For MFEC, φ *is* the
+  memory key, so normalising makes its Euclidean kNN exactly the cosine kNN
+  CLIP was trained under. Here a learned `Linear(512, embedding_dim)` head sits
+  in between and NEC normalises the head's output, so the DND's metric is
+  cosine in the *head's* space. Do not repeat the MFEC claim for this arm.
+
+**Expect a slow start.** Measured on 60 real Ms. Pac-Man frames, as the DND
+kernel sees them at initialisation:
+
+| encoder | mean pairwise L2 | `kernel_delta`=1e-3 as % of mean sq. dist |
+|---|---|---|
+| `NatureEmbedding` (baseline) | 0.031 | 86% |
+| CLIP pretrained | 0.007 | 809% |
+| CLIP randomly initialised | 0.001 | ~1.4e5% |
+
+Every Atari frame is "a screenshot of Pac-Man" to a contrastive image-text
+model, so raw pairwise cosine in CLIP space is 0.9935 (and 0.9949 on the MFEC
+arm's RGB frames — this is CLIP, not NEC's grayscale env). The pretraining's
+contribution lives in the residual after that common component: 7.4% of the
+embedding norm, against 0.75% at random init — a 10× gap, so the weights are
+doing real work. But the kernel starts flatter than the baseline's. If
+`train/q_loss` will not descend and `eval/dnd_top_weight` sits at `1/k`, try
+lowering `kernel_delta` for this arm — and declare it, since it changes
+learning.
+
+Checkpoints are ~820 MB (87.8M-param tower, 4× DINOv2 ViT-S/14, plus RMSProp
+state and the DND), so ~16 GB per 1M-step run at the default checkpoint
+interval.
+
+Tested in `tests/test_nec_clip_finetune.py` against a stub tower, opt-in via
+`NEC_CLIP_REAL=1` against the genuine `ViT-B-32-quickgelu`, and via
+`CLIP_WEIGHTS=` against the real OpenAI checkpoint. **Whether it beats
+`nature` or `dinov2_finetune` is untested** — that is the experiment.
 
 ## Reading a NEC run
 

@@ -456,10 +456,19 @@ def test_mfec_end_to_end_with_the_clip_encoder(stub_open_clip):
     reason="set CLIP_WEIGHTS=/path/to/open_clip_pytorch_model.bin to run",
 )
 def test_real_checkpoint_loads_and_embeds():
+    """
+    CLIP_MODEL defaults to the *quickgelu* name, not the plain one. It has to
+    agree with `pretrained_tag`, which CLIPEncoder defaults to "openai", or the
+    constructor's own QuickGELU guard rejects the pair — as it should. This
+    default was `ViT-B-32` and could therefore never pass: the test only runs
+    when CLIP_WEIGHTS is set, and nobody had set it.
+    Set CLIP_MODEL=ViT-B-32 *and* CLIP_TAG=laion2b_s34b_b79k for a LAION file.
+    """
     pytest.importorskip("open_clip")
     encoder = CLIPEncoder(
         weights_path=os.environ["CLIP_WEIGHTS"],
-        model_name=os.environ.get("CLIP_MODEL", "ViT-B-32"),
+        model_name=os.environ.get("CLIP_MODEL", "ViT-B-32-quickgelu"),
+        pretrained_tag=os.environ.get("CLIP_TAG", "openai"),
     )
     out = encoder.embed(_obs(n=2))
     assert out.shape == (2, encoder.state_dim)
