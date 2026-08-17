@@ -28,6 +28,14 @@ Coverage:
      the *config-group seam*; DINOv2Embedding's own behaviour (channel
      adapter, param groups, finetuning through NEC's loop, and the real
      ViT-S/14) lives in tests/test_nec_dinov2_finetune.py.
+  6. MAE group selection -- the same seam for `mae_finetune`, against a stub
+     `timm` module. MAEEmbedding's own behaviour (pooling, the patch-grid
+     guard, param groups, the real ViT-B/16) lives in
+     tests/test_nec_mae_finetune.py.
+
+The `clip_finetune` seam is covered in tests/test_nec_clip_finetune.py
+instead, because a stub `open_clip` has to be installed in `sys.modules`
+before the module is even importable.
 """
 from __future__ import annotations
 
@@ -487,5 +495,88 @@ def test_dinov2_finetune_yaml_instantiates(stub_hub, tmp_path):
 
     net = alg._make_embedding_network(OBS_SHAPE, cfg.embedding_dim)
     assert isinstance(net, DINOv2Embedding)
+    assert net(torch.rand(2, *OBS_SHAPE)).shape == (2, cfg.embedding_dim)
+    assert all(p.requires_grad for p in net.parameters())
+
+
+# ---------------------------------------------------------------------------
+# 6. MAE group selection -- stubbed timm, no network calls
+#
+# Only the config-group seam is checked here. Everything MAE-specific -- the
+# pooling, the patch-grid guard, param_groups, whether NEC's loop actually
+# finetunes the backbone, and the real ViT-B/16 -- is in
+# tests/test_nec_mae_finetune.py.
+# ---------------------------------------------------------------------------
+
+class _StubMAEViT(nn.Module):
+    """``(B, 3, H, W) -> (B, 1 + 49, STUB_EMBED_DIM)`` tokens.
+
+    Stands in for timm's VisionTransformer: MAEEmbedding pools
+    `forward_features` itself and reads `num_prefix_tokens` and the patch
+    conv's stride, so those are the only pieces a stub needs.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_dim = STUB_EMBED_DIM
+        self.num_prefix_tokens = 1
+        self.patch_embed = nn.Module()
+        self.patch_embed.proj = nn.Conv2d(3, STUB_EMBED_DIM, kernel_size=16,
+                                          stride=16)
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        tokens = self.patch_embed.proj(x).flatten(2).transpose(1, 2)
+        return torch.cat([tokens.mean(dim=1, keepdim=True), tokens], dim=1)
+
+
+@pytest.fixture
+def stub_timm(monkeypatch):
+    """Install a fake ``timm``; `timm` is an OPTIONAL dependency (extra `mae`)."""
+    import sys
+    import types
+
+    module = types.ModuleType("timm")
+    module.create_model = lambda *a, **k: _StubMAEViT()
+    monkeypatch.setitem(sys.modules, "timm", module)
+
+
+def test_mae_embedding_builds_and_matches_the_shape_contract(stub_timm):
+    from src.networks import MAEEmbedding
+
+    net = MAEEmbedding(OBS_SHAPE, EMBEDDING_DIM, image_size=112)
+
+    out = net(torch.rand(3, *OBS_SHAPE))
+    assert out.shape == (3, EMBEDDING_DIM)
+    assert out.dtype == torch.float32
+
+
+def test_mae_embedding_is_trainable_by_default(stub_timm):
+    """The NEC variant must NOT freeze the backbone the way MFEC's does."""
+    from src.networks import MAEEmbedding
+
+    net = MAEEmbedding(OBS_SHAPE, EMBEDDING_DIM, image_size=112)
+
+    assert all(p.requires_grad for p in net.parameters())
+    assert all(p.requires_grad for p in net.backbone.parameters()), (
+        "src/encoders/mae_encoder.py freezes the ViT for MFEC; the NEC "
+        "variant is finetunable and must not"
+    )
+
+
+def test_mae_finetune_yaml_instantiates(stub_timm):
+    """The YAML composes and its `_partial_` builds a real, trainable module."""
+    from src.networks import MAEEmbedding
+
+    cfg = _compose_algorithm_cfg(
+        "nec_atari", ["algorithm/embedding_network=mae_finetune"]
+    )
+    assert cfg.embedding_network._target_ == "src.networks.MAEEmbedding"
+    assert cfg.embedding_network._partial_ is True
+    assert cfg.embedding_network.freeze_backbone is False
+
+    alg = instantiate(cfg, device=None)
+    net = alg._make_embedding_network(OBS_SHAPE, cfg.embedding_dim)
+
+    assert isinstance(net, MAEEmbedding)
     assert net(torch.rand(2, *OBS_SHAPE)).shape == (2, cfg.embedding_dim)
     assert all(p.requires_grad for p in net.parameters())

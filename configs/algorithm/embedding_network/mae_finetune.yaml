@@ -1,0 +1,173 @@
+# NEC embedding network: finetunable MAE ViT-B/16 (src/networks.py::MAEEmbedding).
+#
+# The NEC counterpart to MFEC's `encoder_name=mae` (frozen,
+# src/encoders/mae_encoder.py), and the RECONSTRUCTION arm of the NEC encoder
+# ablation — against `nature` (the paper's ConvNet, random init),
+# `dinov2_finetune` (self-distilled) and `clip_finetune` (contrastive).
+#
+# WHY MAE IS THE ARM THAT MAKES THIS AN EXPERIMENT. The other two PVM arms both
+# optimise a *similarity* objective — self-distilled view agreement, image-text
+# cosine similarity — so as a test of "what does the pretraining objective do to
+# the geometry of an episodic-memory key" they are two flavours of one answer.
+# MAE's objective is masked *pixel reconstruction*: nothing in its loss ever
+# compares two images. It is the only arm that varies the causal variable.
+# MAE scoring BELOW the other PVMs is the hypothesis under test, not a defect.
+#
+#   python src/train.py experiment=nec/mspacman \
+#       algorithm/embedding_network=mae_finetune \
+#       run.encoder=mae
+#
+# `configs/experiment/nec/{mspacman,qbert,frostbite}_mae.yaml` bundle exactly
+# that plus a throughput-sized trainer, so prefer `experiment=nec/mspacman_mae`
+# and keep this group override for one-off arms on other games.
+#
+# Set `run.encoder` explicitly (as above, or in the experiment config) so the
+# run directory distinguishes it from a `nature` run — `run.encoder` reads
+# `algorithm.encoder_name`, which is an MFEC-only key.
+#
+# REQUIRES `timm`, an OPTIONAL dependency:
+#     uv sync --extra mae
+# MAEEmbedding imports it lazily inside __init__, so its absence costs the
+# `nature`, `dinov2_finetune` and `clip_finetune` arms nothing — which matters
+# more here than for MFEC's mae encoder, since src/networks.py is imported by
+# src/algorithms/nec.py and by every DQN/DDPG/A2C config.
+_partial_: true
+_target_: src.networks.MAEEmbedding
+
+# null -> timm downloads `model_name` from the HuggingFace hub, which needs
+# network access. On an offline node, fetch the checkpoint once elsewhere and
+# point this at the local file. A local path WINS over the hub.
+#
+# The path is handed to timm as pretrained_cfg_overlay=dict(file=...), NOT
+# torch.load-ed, so it goes through timm's checkpoint_filter_fn: a raw
+# facebookresearch/mae release (mae_pretrain_vit_base.pth, with its {"model":
+# ...} wrapper and original key names) loads as well as a timm-format
+# .safetensors, and pos_embed is resampled to `image_size` either way.
+weights_path: null
+
+# timm's tag spelling: <architecture>.<pretrained tag>. The `.mae` tag is the
+# He et al. (2022) self-supervised checkpoint — NOT `.mae_ft_in1k`, which is MAE
+# pretraining followed by ImageNet-1k supervised finetuning and would quietly
+# turn this into a second supervised arm.
+model_name: vit_base_patch16_224.mae
+
+# ---------------------------------------------------------------------------
+# THE THROUGHPUT KNOB — and the reason this default is not MAEEncoder's 224.
+# ---------------------------------------------------------------------------
+# Token count is (image_size / 16)^2 and attention is quadratic in it. The ViT
+# forward dominates every phase of a NEC step (policy inference at num_envs,
+# episode re-embedding, and num_updates x batch_size gradient updates):
+#
+#   image_size   tokens   ~GFLOPs/frame   source px per patch (84x84 input)
+#      224        14x14        17.6                    6
+#      112         7x7          4.4                   12
+#
+# Measured forward, batch of 8 (= num_envs, the collector-side inference batch),
+# float32 CPU:  MAE @112 408 ms, MAE @224 1300 ms, CLIP ViT-B-32 @224 371 ms.
+# So 112 puts this arm within 10% of the CLIP arm's cost; 224 would be 3.5x it.
+#
+# 112 is the default, and the argument is the ABLATION rather than the clock:
+# at 112 this arm has the same token count, the same patch granularity over the
+# source frame, and near-identical parameter count (85.7M) as the CLIP arm's
+# ViT-B/32 at 224 (49 tokens, 87.8M). A difference between the two is then
+# attributable to the pretraining objective. At 224 MAE would get ~4x the CLIP
+# arm's compute and any win would be confounded with that.
+#
+# Parity with the FROZEN MFEC mae arm's 224 is not an argument here: the NEC
+# arms already see a different input entirely (4x84x84 stacked grayscale vs RGB
+# 210x160). And the positional-embedding resample 112 forces is far cheaper for
+# a finetuned backbone than a frozen one — the ViT adapts to the 7x7 grid
+# instead of living with it unchanged. timm does the resampling itself
+# (checkpoint_filter_fn -> resample_abs_pos_embed), verified for both the hub
+# and the local-file path.
+#
+# WHAT 112 COSTS: a patch covers 12 source pixels instead of 6, so a Ms.
+# Pac-Man ghost (~4x5 px at 84x84) is swallowed whole by one patch. Set 224 for
+# pretraining-resolution fidelity — it is fully supported and tested.
+#
+# Must be divisible by the patch size (16). timm does NOT check this: img_size
+# =100 builds and runs, but the patch conv yields a 6x6 grid covering 96 of 100
+# pixels and silently discards the last 4 of each axis — on Ms. Pac-Man that is
+# the score/lives row. MAEEmbedding rejects it and names the valid sizes.
+image_size: 112
+
+# POOLING — the choice that decides whether this arm measures MAE or measures
+# our pooling. MAE's CLS token is effectively undertrained: the reconstruction
+# loss is computed on patch tokens and never supervises CLS directly, which is
+# why MAE feature evaluation conventionally uses global average pooling over
+# the PATCH tokens (He et al. 2022, §4). "mean" does that (prefix tokens dropped
+# via timm's num_prefix_tokens); "cls" ablates it and is expected to score
+# worse. Note timm's own default for this tag would be CLS — see
+# src/encoders/mae_encoder.py for that, and for why global_pool='avg' is not
+# the fix.
+pooling: mean
+
+# ---------------------------------------------------------------------------
+# MEASURED AT INITIALISATION — read this before calling a slow start a bug.
+# ---------------------------------------------------------------------------
+# 60 real Ms. Pac-Man frames through this env (4x84x84, mspacman_nec_train,
+# rollout seed 0), embeddings taken exactly as NECAlgorithm._embed produces
+# them (head output, L2-normalised) — i.e. what the DND kernel actually sees.
+# embedding_dim=64, image_size=112, averaged over 3 init seeds:
+#
+#   encoder                       mean pairwise L2   (min-max)     delta=1e-3
+#                                 between states                 as % of d^2
+#   NatureEmbedding (baseline)         0.038      (0.032-0.044)       46%
+#   MAE pretrained (this file)         0.008      (0.007-0.010)      392%
+#   MAE randomly initialised           0.005      (0.004-0.005)     1299%
+#
+# MAE starts ~4.8x MORE TIGHTLY CLUSTERED than the paper's ConvNet, so
+# kernel_delta dominates the DND's inverse-distance kernel far more than it
+# does for the baseline — the kernel is close to a flat average over all k
+# neighbours until training spreads the embeddings out. This is the same
+# failure mode clip_finetune.yaml documents; read that file's note before
+# diagnosing a slow start as a bug.
+#
+# THE CAUSE IS UPSTREAM, and it is sharper than CLIP's. Raw pairwise cosine of
+# the pooled MAE features on these frames is 0.9999 at image_size=112 (1.0000
+# at 224) — essentially one direction plus a tiny residual. Measured share of
+# the embedding norm left after removing the common component:
+#
+#   MAE pretrained   0.66%          CLIP pretrained   7.4%   (clip_finetune.yaml)
+#   MAE random init  0.44%          CLIP random init  0.75%
+#
+# So MAE's pretraining buys a 1.5x larger residual over random init, where
+# CLIP's buys 10x. THAT IS THE RESULT THIS ARM EXISTS TO PRODUCE, at
+# initialisation and before any training: masked pixel reconstruction has no
+# term that pulls two images apart, so it does not organise Atari frames the
+# way a similarity objective does. It is a prediction about the arm's starting
+# geometry, not a measurement of its final score.
+#
+# (Side effect worth knowing: 112 retains ~1.6x more relative variance than 224
+# — residual 0.66% vs 0.41%, head-output spread 0.0075 vs 0.0047 — so the
+# throughput choice above is also the less collapsed one.)
+#
+# kernel_delta IS DELIBERATELY NOT CHANGED FOR THIS ARM. It is learning-relevant
+# and an arm-specific value would make a between-arm read a comparison of kernel
+# bandwidths rather than of encoders. If train/q_loss will not descend and
+# eval/dnd_top_weight sits at 1/k, lowering it is the thing to try first — for
+# ALL arms at once, and declared.
+#
+# COMPARABILITY CAVEAT: re-measuring the CLIP arm with this same script gave
+# 0.030, not the 0.007 recorded in clip_finetune.yaml (the CLIP tower's own
+# numbers reproduce exactly — raw norm 10.76 vs the documented ~10.7 — so the
+# difference is downstream of the tower, in the head or the frame set). The two
+# tables are therefore NOT directly comparable; re-measure the CLIP row with
+# this script before putting the two side by side in a writeup.
+
+freeze_backbone: false        # true -> train only the channel adapter + head
+
+# Learning-rate multiplier for the pretrained backbone, relative to the
+# randomly-initialised channel adapter + head (which stay at `algorithm.lr`).
+# Same rationale and same caveat as dinov2_finetune.yaml and clip_finetune.yaml:
+# NOT a validated number — no run has been used to tune it. 0.1 is the
+# convention; 1.0 restores a single uniform learning rate.
+backbone_lr_scale: 0.1
+
+# NOT exposed here on purpose: `pretrained`. MAEEmbedding takes it (False
+# builds the architecture untrained, which is what the random-init row above
+# was measured with and what the real-architecture tests use so they need no
+# download), but a training config has no business selecting it — the same
+# decision src/encoders/factory.py makes for MAEEncoder. Use
+# `+algorithm.embedding_network.pretrained=false` if you deliberately want the
+# control arm.

@@ -1,0 +1,86 @@
+# @package _global_
+# NEC on ALE/Frostbite-v5 with a FINETUNED MAE ViT-B/16 as the embedding network
+# — the RECONSTRUCTION arm of the Frostbite encoder ablation, against
+# nec/frostbite.yaml (NatureEmbedding, the paper's ConvNet),
+# nec/frostbite_dinov2.yaml (self-distilled ViT) and nec/frostbite_clip.yaml
+# (contrastive ViT).
+#
+# This is nec/frostbite.yaml with the embedding-network group swapped, and the
+# exact counterpart of nec/mspacman_mae.yaml with the game swapped. The env
+# pair, gamma, n_step, reward scale, episode boundaries and exploration schedule
+# are all held identical, so the encoder is the only variable.
+#
+# WHY MAE. DINOv2 and CLIP both optimise a *similarity* objective, so as a test
+# of what the pretraining objective does to the geometry of an episodic-memory
+# key they are two flavours of one answer. MAE's objective is masked *pixel
+# reconstruction* — nothing in its loss ever compares two images — so it is the
+# only arm that varies the causal variable. Scoring below the other PVMs is the
+# hypothesis under test, not a defect; see the measured initialisation geometry
+# in configs/algorithm/embedding_network/mae_finetune.yaml.
+#
+# NEC's MAE is FINETUNED, so it keeps the standard NEC env — 4 stacked 84x84
+# grayscale frames — and adapts them inside the module with a trainable 1x1
+# conv. (MFEC's MAE arm is frozen and must be fed RGB single frames at 224.)
+# It runs at image_size=112, matching the CLIP arm's token count so the two PVM
+# arms differ in objective and not in compute.
+#
+# COST WARNING: 18 actions against a ViT-B backbone. Together with
+# nec/frostbite_clip.yaml and nec/frostbite_dinov2.yaml this is the heaviest
+# group in the study.
+#
+# REQUIRES `timm`, an optional dependency:
+#     uv sync --extra mae
+defaults:
+  - override /algorithm: nec_atari
+  - override /environment: frostbite_nec_train
+  - override /environment@eval_environment: frostbite_nec_eval
+  - override /algorithm/embedding_network: mae_finetune
+  - _self_
+
+run:
+  algorithm: nec
+  game: frostbite
+  # See the note in nec/frostbite_dinov2.yaml — without this the run directory
+  # would be nec_frostbite_none_seed42 and collide with the NatureEmbedding arm.
+  encoder: mae
+
+algorithm:
+  embedding_network:
+    # null -> timm resolves `model_name` from the HuggingFace hub (needs
+    # network). On an offline node, fetch the checkpoint once and point this at
+    # the file.
+    weights_path: null
+    # `.mae`, NOT `.mae_ft_in1k` — the latter adds supervised ImageNet
+    # finetuning and would quietly make this a second supervised arm.
+    model_name: vit_base_patch16_224.mae
+    image_size: 112
+    pooling: mean
+
+  # Held identical to nec/frostbite.yaml and every other arm of the ablation.
+  num_updates: 100
+  eps_end: 0.001
+  annealing_frames: 50_000
+  init_random_frames: 12_500
+  eval_eps: 0.005
+
+trainer:
+  # Same units and budget as nec/frostbite.yaml: agent steps, action repeat 4,
+  # so 4M raw ALE frames.
+  total_frames: 1_000_000
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  # 8, matching nec/frostbite_dinov2.yaml and nec/frostbite_clip.yaml. num_envs
+  # sets the ViT's inference batch as well as the process count, and the
+  # backbone is resident on the same device as the DND and the replay buffer.
+  num_envs: 8
+  log_every_n_steps: 10_000
+  # Every 200k raw frames, per paper §4.
+  eval_every_n_steps: 50_000
+  # DISK: MAE ViT-B/16 is 85.7M params, so each checkpoint is 686 MB early and
+  # ~915 MB once the DND fills — weights, an equal-sized RMSProp square_avg,
+  # and the DND's filled entries (18 actions x 50_000 x 64 f32 = 230 MB at
+  # capacity, double the 9-action games'). At the default
+  # checkpoint.save_every_n_steps of 50_000 a 1M-step run writes 20 of them,
+  # i.e. ~17 GB. Raise the interval or prune if that does not fit.
+  num_eval_episodes: 5

@@ -442,6 +442,380 @@ class DINOv2Embedding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# MAE
+# ---------------------------------------------------------------------------
+
+#: The two pooling modes, in one place so ``__init__`` and its error message
+#: cannot disagree about what is supported.  Same list as
+#: ``src/encoders/mae_encoder.py``.
+_MAE_POOLING_MODES = ("mean", "cls")
+
+_MAE_INSTALL_HINT = (
+    "MAEEmbedding needs the `timm` package, which is not installed.\n"
+    "    uv sync --extra mae          (or: pip install 'timm>=1.0.0')\n"
+    "timm is used because it is the only maintained distribution of the MAE "
+    "checkpoints under a stable tag (`vit_base_patch16_224.mae`), and its "
+    "checkpoint_filter_fn is what remaps the original facebookresearch/mae "
+    "release into a loadable ViT — including positional-embedding resampling."
+)
+
+
+class MAEEmbedding(nn.Module):
+    """Finetunable MAE (Masked Autoencoder) ViT as a NEC embedding network.
+
+    Selected by ``configs/algorithm/embedding_network/mae_finetune.yaml``,
+    i.e. ``algorithm/embedding_network=mae_finetune`` on the CLI.
+
+    The NEC counterpart to MFEC's frozen
+    :class:`src.encoders.mae_encoder.MAEEncoder`, and structurally
+    :class:`DINOv2Embedding` with a timm backbone: same mean-replicate channel
+    adapter, same ImageNet statistics, same bilinear whole-frame resize, same
+    ``param_groups`` split, same ``freeze_backbone`` / ``backbone_lr_scale``
+    knobs.  As with the other two PVM arms the backbone is **not** frozen —
+    ``freeze_backbone=False`` is the default, per
+    :class:`NECEmbeddingNetwork` clause 2 — and that is the entire reason a
+    NEC-specific class exists rather than reusing the encoder.
+
+    Pipeline: ``(B, C, H, W)`` → 1×1 conv channel adapter (only when
+    ``C != 3``) → bilinear resize to ``image_size`` → ImageNet normalisation →
+    MAE ViT → pool → ``nn.Linear(768, embedding_dim)`` head.  The head output
+    is deliberately unconstrained; NEC L2-normalises downstream (clause 3).
+
+    Why MAE is in the ablation
+    --------------------------
+    ``NatureEmbedding`` is random init, ``DINOv2Embedding`` optimises
+    self-distilled view agreement, ``CLIPEmbedding`` image-text cosine
+    similarity.  Read as a study of "what does the pretraining objective do to
+    the geometry of an episodic-memory key", the two PVM arms are two flavours
+    of one answer: both are *similarity* objectives.  MAE's is not — He et al.
+    (2022) mask ~75% of the patches and regress the missing **pixels**, and
+    nothing in that loss ever compares two images.  It is therefore the arm
+    that varies the causal variable.  Scoring below the other PVMs is the
+    hypothesis under test, not a defect.
+
+    POOLING — the choice that decides whether this arm measures MAE
+    ---------------------------------------------------------------
+    **MAE's CLS token is effectively undertrained**: the reconstruction loss is
+    computed on patch tokens and never supervises CLS directly.  MAE's own
+    feature evaluations use global average pooling over the **patch** tokens
+    (He et al. 2022, §4 — ``global_pool=True``), so ``pooling="mean"`` is the
+    default here, with the model's ``num_prefix_tokens`` prefix entries dropped
+    rather than a hardcoded 1.  ``pooling="cls"`` stays available so "CLS is
+    bad for MAE" can be *demonstrated* rather than asserted.
+
+    The pooling is done here, from ``forward_features``, not delegated to timm,
+    for the two reasons ``MAEEncoder``'s module docstring gives and
+    ``tests/test_mae_encoder.py`` pins: timm's default for the ``.mae`` tag is
+    ``global_pool='token'`` (i.e. CLS), and "fixing" that with
+    ``global_pool='avg'`` makes ``self.norm`` an ``nn.Identity`` and
+    ``self.fc_norm`` a freshly initialised LayerNorm the MAE checkpoint does
+    not contain — silently discarding the pretrained final norm.
+
+    Not frozen, and not ``.eval()``
+    --------------------------------
+    NEC trains the embedding network, so it stays in ``train()`` mode.  Unlike
+    CLIP's RN\\* towers that is safe here: a timm ViT is LayerNorm-only (no
+    BatchNorm anywhere), and ``vit_base_patch16_224`` is built with
+    ``drop_rate=0`` / ``drop_path_rate=0``, so the forward is batch-independent
+    and deterministic in either mode.  There is no analogue of
+    :meth:`CLIPEmbedding._warn_if_batch_dependent` to write.
+
+    ``image_size`` — the throughput knob, and it is a real decision
+    ---------------------------------------------------------------
+    Token count is ``(image_size / 16)²`` and attention is quadratic in it:
+
+    ==========  ======  ==============  =========================  ==========
+    image_size  tokens  ≈GFLOPs/frame   source px per patch (84²)  fwd, B=8
+    ==========  ======  ==============  =========================  ==========
+    224          196        17.6                  6                 1300 ms
+    112           49         4.4                 12                  408 ms
+    ==========  ======  ==============  =========================  ==========
+
+    (float32 CPU, B=8 = ``num_envs``; the CLIP arm's ViT-B/32 at 224 measures
+    371 ms on the same box, so 112 puts this arm within 10% of it and 224 would
+    be 3.5×.)
+
+    **112 is the default**, against ``MAEEncoder``'s 224, and the reason is the
+    ablation rather than the clock.  At 112 this arm has the same token count,
+    the same patch granularity over the source frame and near-identical
+    parameter count (86 M) as the CLIP arm's ViT-B/32 at 224 (49 tokens,
+    87.8 M), so a difference between the two is attributable to the pretraining
+    objective.  At 224 MAE would get ~4× the CLIP arm's compute and any win it
+    posted would be confounded with that.
+
+    Parity with the frozen MFEC arm's 224 is not an argument here: the NEC arms
+    already see a different input entirely (4×84×84 stacked grayscale vs RGB
+    210×160).  And the positional-embedding resample that 112 forces is far
+    cheaper for a *finetuned* backbone than for a frozen one — the ViT adapts
+    to the 7×7 grid instead of living with it unchanged.  What it costs is
+    resolution: a patch covers 12 source pixels instead of 6, so a Ms. Pac-Man
+    ghost (~4×5 px at 84×84) is swallowed whole by one patch.  Set 224 for
+    pretraining-resolution fidelity; both are guard-validated.
+
+    Measured on 60 real Ms. Pac-Man frames, 112 also *retains* more relative
+    variance than 224 — residual after removing the common component 0.66% vs
+    0.41%, head-output mean pairwise L2 0.0075 vs 0.0047 — so the cheap choice
+    is also the less collapsed one here.  See the table in
+    ``configs/algorithm/embedding_network/mae_finetune.yaml``.
+
+    Cost
+    ----
+    85.7 M parameters, so 343 MB of weights plus an equal-sized RMSProp
+    ``square_avg``.  Measured checkpoint: **686 MB** early in a run, ~801 MB
+    once the DND fills at ``nec_atari.yaml``'s ``dnd_capacity`` of 50 000 per
+    action (the DND serialises only its filled entries, 9 × 50 000 × 64 f32 =
+    115 MB at capacity).  At ``checkpoint.save_every_n_steps=50_000`` a 1 M-step
+    run writes 20 of them, i.e. ~16 GB.
+
+    Parameters
+    ----------
+    obs_shape       : (C, H, W) per-sample observation shape.
+    embedding_dim   : output width, i.e. ``algorithm.embedding_dim``.
+    weights_path    : local checkpoint.  ``None`` (default) lets timm resolve
+        ``model_name`` from the HuggingFace hub, which **requires network
+        access** — pass a path on an offline cluster.  The path is handed to
+        timm as ``pretrained_cfg_overlay=dict(file=...)`` rather than being
+        ``torch.load``-ed, which routes it through timm's
+        ``checkpoint_filter_fn``: that unwraps a ``{"model": ...}`` wrapper,
+        remaps the original ``mae_pretrain_vit_base.pth`` key names, and
+        **resamples ``pos_embed``** when ``image_size`` is not the
+        checkpoint's.  (Verified in timm's ``_builder.py``: ``filter_fn`` runs
+        after the source branches, so the local-file path gets the same
+        treatment as the hub path.)  ``DINOv2Embedding``'s raw
+        ``load_state_dict(strict=True)`` does none of that.
+    model_name      : any timm ViT with an MAE tag, e.g.
+        ``"vit_base_patch16_224.mae"`` (768-d, the arm in the ablation).  Use
+        ``.mae``, **not** ``.mae_ft_in1k`` — the latter is MAE pretraining
+        followed by supervised ImageNet finetuning, which would quietly turn
+        this into a second supervised arm.
+    image_size      : ViT input size; must be divisible by the patch size (16).
+        See the table above.
+    pooling         : ``"mean"`` (default, patch tokens) or ``"cls"``.
+    pretrained      : load pretrained weights (default ``True``).  ``False``
+        builds the architecture untrained — meaningless as a representation but
+        numerically identical, which is what the random-init row of the spread
+        table in ``mae_finetune.yaml`` was measured with, and what the
+        real-architecture tests build so they need no download.  A
+        ``weights_path`` overrides it (a path means "load this file").
+        Deliberately not exposed in the YAML.
+    freeze_backbone : ``True`` trains only the adapter + head.  Default
+        ``False`` (full finetuning).
+    backbone_lr_scale : multiplier on the backbone's learning rate relative to
+        the adapter + head.  Untuned; see :meth:`param_groups`.
+    """
+
+    def __init__(
+        self,
+        obs_shape: Sequence[int],
+        embedding_dim: int,
+        *,
+        weights_path: str | None = None,
+        model_name: str = "vit_base_patch16_224.mae",
+        image_size: int = 112,
+        pooling: str = "mean",
+        pretrained: bool = True,
+        freeze_backbone: bool = False,
+        backbone_lr_scale: float = 0.1,
+    ) -> None:
+        super().__init__()
+        try:
+            import timm
+        except ImportError as exc:                        # pragma: no cover
+            raise ImportError(_MAE_INSTALL_HINT) from exc
+
+        if pooling not in _MAE_POOLING_MODES:
+            raise ValueError(
+                f"pooling={pooling!r} is not a pooling mode; expected one of "
+                f"{list(_MAE_POOLING_MODES)}. 'mean' averages the patch tokens "
+                f"(what MAE evaluation conventionally does, since MAE's CLS "
+                f"token is never directly supervised by the reconstruction "
+                f"loss); 'cls' takes the CLS token and exists to ablate that."
+            )
+
+        self.model_name = model_name
+        self.image_size = int(image_size)
+        self.pooling = pooling
+        self.backbone_lr_scale = float(backbone_lr_scale)
+
+        # NOTE: global_pool is deliberately NOT passed. The default ('token')
+        # keeps `norm` as the pretrained LayerNorm; global_pool='avg' would
+        # swap it for a randomly initialised `fc_norm` the MAE checkpoint does
+        # not contain. This module pools from forward_features itself, so
+        # timm's own pooling is never used either way.
+        build_kwargs: dict = {
+            # A weights_path always means "load this", whatever `pretrained`
+            # says — the file is the thing being asked for.
+            "pretrained": bool(pretrained) or weights_path is not None,
+            "num_classes": 0,       # no classifier head; MAE has no labels
+            "img_size": self.image_size,
+        }
+        if weights_path is not None:
+            # A local file wins over the hub; that is the offline-cluster path.
+            build_kwargs["pretrained_cfg_overlay"] = {"file": weights_path}
+
+        self.backbone = timm.create_model(model_name, **build_kwargs)
+
+        # How many leading tokens are NOT patches. 1 (CLS) for the MAE ViTs,
+        # but read rather than assumed: a model with register tokens reports
+        # more, and averaging those in would quietly corrupt the embedding.
+        self._num_prefix = int(getattr(self.backbone, "num_prefix_tokens", 1))
+
+        self._assert_patch_grid_covers_the_image()
+
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad_(False)
+
+        in_channels = int(obs_shape[0])
+        self.channel_adapter: nn.Module = (
+            nn.Identity() if in_channels == 3
+            else nn.Conv2d(in_channels, 3, kernel_size=1)
+        )
+        if isinstance(self.channel_adapter, nn.Conv2d):
+            # Mean over input channels, replicated to R=G=B — see
+            # DINOv2Embedding for why a random init here throws the
+            # pretraining away.
+            with torch.no_grad():
+                self.channel_adapter.weight.fill_(1.0 / in_channels)
+                self.channel_adapter.bias.zero_()
+
+        self.register_buffer(
+            "_mean", torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1), persistent=False
+        )
+        self.register_buffer(
+            "_std", torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1), persistent=False
+        )
+
+        # Probed from a real forward rather than read off `embed_dim`: it is
+        # the ground truth including whatever pooling does, it costs one image,
+        # and it is the discipline MAEEncoder and CLIPEmbedding both use.
+        self.feature_dim = self._probe_feature_dim()
+        self.head = nn.Linear(self.feature_dim, embedding_dim)
+
+    # ------------------------------------------------------------------
+    # Construction-time guards
+    # ------------------------------------------------------------------
+
+    def _assert_patch_grid_covers_the_image(self) -> None:
+        """Reject an ``image_size`` the patch grid cannot tile.
+
+        timm accepts ``img_size=100`` on a patch-16 ViT without complaint, but
+        the patch-embedding conv has kernel = stride = 16, so it produces a 6×6
+        grid covering only 96 pixels and **silently discards the last 4 of each
+        axis**.  On Ms. Pac-Man the dropped strip is the row carrying the score
+        and remaining lives.  Measured against timm 1.0.28:
+
+            img_size   grid    pixels covered   dropped
+              100       6×6        96/100          4
+              112       7×7       112/112          0
+              224      14×14      224/224          0
+
+        Nothing upstream raises, so the check lives here — the same failure
+        ``CLIPEmbedding._assert_patch_grid_covers_the_image`` guards against on
+        open_clip.  Skipped when the backbone exposes no patch-embedding conv,
+        where the arithmetic does not apply.
+        """
+        proj = getattr(getattr(self.backbone, "patch_embed", None), "proj", None)
+        if not isinstance(proj, nn.Conv2d):
+            return                       # not a patch-embed ViT; no patch grid
+        patch = int(proj.stride[0])
+        if self.image_size % patch:
+            valid = list(range(patch, 257, patch))
+            raise ValueError(
+                f"image_size={self.image_size} is not divisible by "
+                f"{self.model_name}'s patch size ({patch}). timm accepts this "
+                f"without error, but the patch-embedding conv would tile only "
+                f"{self.image_size // patch * patch} pixels and silently "
+                f"discard the last {self.image_size % patch} of each axis.\n"
+                f"    Valid sizes: {valid}"
+            )
+
+    @torch.no_grad()
+    def _probe_feature_dim(self) -> int:
+        dev = next(self.backbone.parameters()).device
+        probe = torch.zeros(1, 3, self.image_size, self.image_size, device=dev)
+        out = self._pool(self.backbone.forward_features(probe))
+        if out.ndim != 2:                                 # pragma: no cover
+            raise RuntimeError(
+                f"pooled MAE output has shape {tuple(out.shape)}; expected "
+                "(B, d). NEC needs one vector per observation."
+            )
+        return int(out.shape[-1])
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _pool(self, tokens: torch.Tensor) -> torch.Tensor:
+        """``(B, N, d)`` tokens -> ``(B, d)``.
+
+        ``"mean"`` drops the ``num_prefix_tokens`` prefix entries first, so the
+        average is over patch tokens only — the CLS token is not a patch and
+        MAE's is undertrained, so including it would both dilute and bias the
+        embedding.
+        """
+        if tokens.ndim != 3:                              # pragma: no cover
+            raise RuntimeError(
+                f"forward_features returned shape {tuple(tokens.shape)}; "
+                f"expected (B, N, d) tokens. MAEEmbedding pools them itself, "
+                f"so a model whose forward_features is already pooled cannot "
+                f"be used here."
+            )
+        if self.pooling == "cls":
+            return tokens[:, 0]
+        return tokens[:, self._num_prefix:].mean(dim=1)
+
+    # ------------------------------------------------------------------
+    # NECEmbeddingNetwork optional extension
+    # ------------------------------------------------------------------
+
+    def param_groups(self, base_lr: float) -> list[dict]:
+        """Backbone at a scaled LR, adapter + head at ``base_lr``.
+
+        Identical arrangement (and identical caveat) to
+        :meth:`DINOv2Embedding.param_groups`: a randomly-initialised head needs
+        a far larger step than a pretrained trunk, and NEC's RMSProp trio was
+        calibrated on ``NatureEmbedding``, where every parameter is random
+        init.  ``backbone_lr_scale`` is **not** a validated number.
+        """
+        backbone = [p for p in self.backbone.parameters() if p.requires_grad]
+        head = [
+            p
+            for module in (self.channel_adapter, self.head)
+            for p in module.parameters()
+            if p.requires_grad
+        ]
+        groups: list[dict] = []
+        if backbone:
+            groups.append({"params": backbone, "lr": base_lr * self.backbone_lr_scale})
+        if head:
+            groups.append({"params": head, "lr": base_lr})
+        return groups
+
+    # ------------------------------------------------------------------
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        x = obs.float().reshape(-1, *obs.shape[-3:])           # (B, C, H, W)
+        # Adapt channels BEFORE the resize: the 1x1 conv is cheaper at 84x84
+        # than at image_size, and the result is identical either way.
+        x = self.channel_adapter(x)                             # (B, 3, H, W)
+        if x.shape[-2:] != (self.image_size, self.image_size):
+            # Whole-frame resize, no centre crop: cropping a 210x160 Atari
+            # frame to a square deletes the left/right of the maze and the
+            # score row. Losing pixels is much worse than distorting them when
+            # the embedding is a memory key.
+            x = F.interpolate(
+                x, (self.image_size, self.image_size),
+                mode="bilinear", align_corners=False,
+            )
+        x = (x - self._mean) / self._std
+        h = self._pool(self.backbone.forward_features(x)).float()
+        # No F.normalize here, deliberately: NEC normalises the head's output
+        # downstream and pre-normalising makes that a no-op (contract clause 3).
+        return self.head(h)                                     # (B, embedding_dim)
+
+
+# ---------------------------------------------------------------------------
 # CLIP
 # ---------------------------------------------------------------------------
 

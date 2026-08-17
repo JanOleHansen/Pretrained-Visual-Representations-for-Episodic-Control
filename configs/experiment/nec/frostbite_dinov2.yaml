@@ -16,7 +16,7 @@
 # it preserves the frame stack, NEC's only source of velocity information.
 # (MFEC's DINOv2 arm is frozen and therefore needs an RGB single-frame env pair.)
 #
-# COST WARNING: this is the most expensive of the nine arms — 18 actions (twice
+# COST WARNING: this is among the most expensive of the twelve arms — 18 actions (twice
 # Ms. Pac-Man's) against a ViT forward on every collector step. Budget
 # accordingly, and see the num_envs note below before raising it.
 defaults:

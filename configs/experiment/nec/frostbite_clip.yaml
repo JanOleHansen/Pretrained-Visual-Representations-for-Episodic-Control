@@ -24,7 +24,7 @@
 # grayscale frames — and adapts them inside the module with a trainable 1x1
 # conv. (MFEC's CLIP arm is frozen and must be fed RGB single frames directly.)
 #
-# COST WARNING: 18 actions against the largest of the three encoders. Together
+# COST WARNING: 18 actions against the largest of the four encoders. Together
 # with nec/frostbite_dinov2.yaml this is the heaviest pair in the study.
 #
 # REQUIRES `open_clip_torch`, an optional dependency:

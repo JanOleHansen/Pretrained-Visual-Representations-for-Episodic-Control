@@ -4,7 +4,7 @@
 # The Frostbite arm of the three-game NEC encoder ablation. The other two games
 # are nec/mspacman.yaml and nec/qbert.yaml; the other two encoders for this game
 # are nec/frostbite_dinov2.yaml and nec/frostbite_clip.yaml. Every
-# learning-relevant setting below is held IDENTICAL across all nine arms so that
+# learning-relevant setting below is held IDENTICAL across all twelve arms so that
 # game and encoder are the only variables — do not tune one arm in isolation.
 #
 # Game choice: Frostbite is one of the five games of Blundell et al. §4.1, is

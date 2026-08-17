@@ -47,14 +47,22 @@ dependencies = [
 #     uv sync --extra clip
 clip = ["open_clip_torch>=2.24.0"]
 
-# MFEC's frozen `encoder_name=mae` (src/encoders/mae_encoder.py) only — the
-# reconstruction arm of the encoder ablation.  Kept out of the base
-# dependencies for the same reasons as `clip`: nothing else needs it, the test
-# suite runs against a stub `timm` module, and MAEEncoder imports it lazily
-# inside __init__ so its absence costs every other encoder nothing (factory.py
-# imports MAEEncoder at module scope, so a module-scope `import timm` there
-# would break every MFEC run, random_projection included).  Pinned by
+# The two MAE arms — the reconstruction arm of each encoder ablation: MFEC's
+# frozen `encoder_name=mae` (src/encoders/mae_encoder.py) and NEC's finetuned
+# `algorithm/embedding_network=mae_finetune` (src.networks.MAEEmbedding).
+# Kept out of the base dependencies for the same reasons as `clip`: nothing
+# else needs it, the test suite runs against a stub `timm` module, and BOTH
+# classes import it lazily inside __init__ so its absence costs every other
+# encoder nothing.
+#
+# The lazy import matters in two different places.  factory.py imports
+# MAEEncoder at module scope, so a module-scope `import timm` in
+# mae_encoder.py would break every MFEC run, random_projection included —
+# pinned by
 # tests/test_encoder_factory.py::test_importing_the_factory_does_not_require_timm.
+# And src/networks.py is imported by src/algorithms/nec.py and by every
+# DQN/DDPG/A2C config, so one there would break the *whole repo* — pinned by
+# tests/test_nec_mae_finetune.py::test_timm_is_not_a_module_level_import_of_networks.
 #
 # timm rather than another source because it is the only maintained
 # distribution of the MAE checkpoints under a stable tag, and its

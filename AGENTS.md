@@ -18,14 +18,14 @@ Implemented experiments:
 | MFEC      | ALE/Pong-v5      | `experiment=mfec/pong`         |
 | MFEC      | ALE/Breakout-v5  | `experiment=mfec/breakout`     |
 | MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`        |
-| MFEC      | any ALE game     | `experiment=mfec/{rp_gray,rp_rgb,vae,dinov2,resnet,clip} game=<Game>` |
+| MFEC      | any ALE game     | `experiment=mfec/{rp_gray,rp_rgb,vae,dinov2,resnet,clip,mae} game=<Game>` |
 | NEC       | ALE/Pong-v5      | `experiment=nec/pong`          |
-| NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman{,_dinov2,_clip}` |
-| NEC       | ALE/Qbert-v5     | `experiment=nec/qbert{,_dinov2,_clip}`    |
-| NEC       | ALE/Frostbite-v5 | `experiment=nec/frostbite{,_dinov2,_clip}` |
+| NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman{,_dinov2,_clip,_mae}` |
+| NEC       | ALE/Qbert-v5     | `experiment=nec/qbert{,_dinov2,_clip,_mae}`    |
+| NEC       | ALE/Frostbite-v5 | `experiment=nec/frostbite{,_dinov2,_clip,_mae}` |
 
-The last three rows are the **NEC encoder ablation**: 3 games x 3 encoders, nine
-arms, all learning-relevant settings held identical. See "The NEC encoder
+The last three rows are the **NEC encoder ablation**: 3 games x 4 encoders,
+twelve arms, all learning-relevant settings held identical. See "The NEC encoder
 ablation" below before touching any of them.
 
 The MFEC row is the **MFEC encoder ablation**: 7 encoders x whichever `game` is
@@ -350,9 +350,11 @@ src/
                               make_mlp_a2c_actor, make_mlp_a2c_value;
                               NEC embedding networks — NECEmbeddingNetwork
                               (contract Protocol), NatureEmbedding (CNN trunk,
-                              no Q-head; default), DINOv2Embedding (finetunable
-                              ViT + channel adapter + param_groups; see
-                              "Adding a new NEC embedding network")
+                              no Q-head; default), DINOv2Embedding / CLIPEmbedding /
+                              MAEEmbedding (finetunable ViT + channel adapter +
+                              param_groups; the last two import their optional
+                              backbone package lazily — see "Adding a new NEC
+                              embedding network")
   algorithms/
     base.py                 — BaseAlgorithm ABC; TrainingState and CollectorConfig dataclasses
     dqn.py                  — DQNAlgorithm; replay/network factories (defaults + setup contract)
@@ -411,6 +413,10 @@ configs/
     clip_finetune.yaml      — finetunable CLIP vision tower (needs the optional
                               `open_clip_torch` extra; QuickGELU pairing and
                               patch-size divisibility are both hard errors)
+    mae_finetune.yaml       — finetunable MAE ViT-B/16 (needs the optional `timm`
+                              extra; mean-pooled PATCH tokens, image_size=112 to
+                              match the CLIP arm's token count, divisibility by 16
+                              is a hard error)
   environment/cartpole.yaml — env kwargs (name, transforms)
   environment/pong_train.yaml     — Atari Pong (training transforms incl. EndOfLife + Sign + VecNorm; DQN only)
   environment/pong_mfec_train.yaml — Atari Pong for MFEC (same stack WITHOUT VecNorm; see note below)
@@ -531,25 +537,40 @@ configs/
                               `open_clip_torch` extra; weights_path defaults to null
                               (open_clip downloads the `openai` tag — set a local
                               path on an offline node)
-  experiment/nec/qbert.yaml, qbert_dinov2.yaml, qbert_clip.yaml — the Q*bert arms of
-                              the same three-encoder ablation, on qbert_nec_train/eval.
-                              6 actions, the cheapest of the three games per gradient
-                              step (cost is num_updates x |A| exact kNN scans)
-  experiment/nec/frostbite.yaml, frostbite_dinov2.yaml, frostbite_clip.yaml — the
+  experiment/nec/mspacman_mae.yaml — same task and env pair, with the
+                              embedding_network group swapped to mae_finetune
+                              (finetuned MAE ViT-B/16) and run.encoder=mae.  The
+                              RECONSTRUCTION arm, and the one that makes the NEC
+                              ablation a study rather than a bake-off: the only
+                              embedding network whose pretraining objective is not a
+                              similarity objective.  Needs the optional `timm` extra;
+                              weights_path defaults to null (timm pulls the
+                              `vit_base_patch16_224.mae` tag from the HuggingFace hub —
+                              set a local path on an offline node).  Runs at
+                              image_size=112 (7x7=49 tokens), matching the CLIP arm's
+                              token count so the two PVM arms differ in objective and
+                              not in compute
+  experiment/nec/qbert.yaml, qbert_dinov2.yaml, qbert_clip.yaml, qbert_mae.yaml — the
+                              Q*bert arms of the same four-encoder ablation, on
+                              qbert_nec_train/eval.  6 actions, the cheapest of the
+                              three games per gradient step (cost is
+                              num_updates x |A| exact kNN scans)
+  experiment/nec/frostbite.yaml, frostbite_dinov2.yaml, frostbite_clip.yaml,
+  frostbite_mae.yaml — the
                               Frostbite arms, on frostbite_nec_train/eval. 18 actions,
                               the most expensive of the three; the ViT arms here are the
                               heaviest runs in the study
-                              ALL NINE ablation files repeat their shared settings
+                              ALL TWELVE ablation files repeat their shared settings
                               verbatim (Hydra experiment configs do not compose with
                               each other) — a change that belongs to the comparison has
-                              to land in all nine
+                              to land in all twelve
   logger/{wandb,tensorboard}.yaml
   paths/default.yaml
   train.yaml, eval.yaml, train_vae.yaml
 tests/
   test_env_seeding.py       — ParallelEnv workers get reproducible, non-colliding streams;
                               a num_envs=1 env must not re-seed the parent process
-  test_smoke.py             — DQN-on-CartPole, DQN-on-Pong, DDPG-on-HalfCheetah, A2C-on-HalfCheetah, MFEC-on-Pong, NEC-on-Pong, NEC-on-Pong-with-DINOv2, NEC-on-Pong-with-CLIP smoke tests
+  test_smoke.py             — DQN-on-CartPole, DQN-on-Pong, DDPG-on-HalfCheetah, A2C-on-HalfCheetah, MFEC-on-Pong, NEC-on-Pong, NEC-on-Pong-with-DINOv2, NEC-on-Pong-with-CLIP, NEC-on-Pong-with-MAE smoke tests
   test_mfec_encoder_refactor.py — encoder-abstraction transparency: setup() wiring, embed()
                               shape/determinism, forward(), deepcopy sharing, checkpoint round-trip
   test_mfec_estimator_gap.py — eval_eps defaults to 0.0 (greedy eval) and QEC exposes the
@@ -561,7 +582,8 @@ tests/
   test_nec_embedding_network.py — NEC embedding-network config group: shape/dtype contract,
                               gradient flow (proves the encoder is genuinely trainable),
                               Hydra-composition architecture regression, config-swap
-                              setup()+step() end-to-end, DINOv2 group selection (stub backbone)
+                              setup()+step() end-to-end, DINOv2 group selection (stub
+                              backbone), MAE group selection (stub timm)
   test_nec_dinov2_finetune.py — DINOv2Embedding itself: channel-adapter init, param_groups
                               and setup()'s use of them, finetuning through step(),
                               gradients reaching the backbone, checkpoint round-trip.
@@ -574,6 +596,18 @@ tests/
                               checkpoint round-trip.  Second tier (NEC_CLIP_REAL=1)
                               builds the genuine ViT-B-32-quickgelu; third
                               (CLIP_WEIGHTS=...) loads the real OpenAI checkpoint
+  test_nec_mae_finetune.py  — MAEEmbedding: lazy timm import (AST-checked), PATCH-token
+                              pooling (poisoned-prefix stub) vs cls, prefix count read
+                              not assumed, patch-size divisibility guard, ImageNet-vs-CLIP
+                              stats, whole-frame resize, adapter init, param groups,
+                              finetuning through step(), checkpoint round-trip, and the
+                              learning-knob parity of all three _mae experiment configs
+                              against their nature arms.  Second tier (NEC_MAE_REAL=1)
+                              builds the genuine ViT-B/16 architecture with
+                              pretrained=False; third (MAE_WEIGHTS=... or
+                              NEC_MAE_DOWNLOAD=1) loads real weights and pins that timm
+                              resamples pos_embed at image_size=112 from BOTH the hub
+                              and a local file
 ```
 
 ## Adding a new algorithm
@@ -944,6 +978,13 @@ included), pinned by
 `tests/test_encoder_factory.py::test_importing_the_factory_does_not_require_timm`.
 `tests/test_mae_encoder.py` runs against a stub `timm` in `sys.modules`, so CI
 never needs the package.
+
+The extra now covers **two** arms: this frozen MFEC encoder and NEC's finetuned
+`algorithm/embedding_network=mae_finetune` (`src.networks.MAEEmbedding`, see
+"3. Embedding networks"). The lazy-import rule is stricter on the NEC side —
+`src/networks.py` is imported by every DQN/DDPG/A2C config, so a module-scope
+`import timm` there breaks the whole repo rather than only MFEC. Pinned by
+`tests/test_nec_mae_finetune.py::test_timm_is_not_a_module_level_import_of_networks`.
 
 **Why the arm exists.** `resnet` (ImageNet labels), `dinov2` (self-distillation)
 and `clip` (contrastive) all optimise for semantic discriminability. MAE's
@@ -2180,11 +2221,18 @@ Options:
 | `nature` (default) | `src.networks.NatureEmbedding` | the paper's network; used by every `experiment/nec/*.yaml` |
 | `dinov2_finetune` | `src.networks.DINOv2Embedding` | finetuned DINOv2 ViT-S/14; bundled as `experiment/nec/{mspacman,qbert,frostbite}_dinov2.yaml` — see below |
 | `clip_finetune` | `src.networks.CLIPEmbedding` | finetuned CLIP ViT-B-32; bundled as `experiment/nec/{mspacman,qbert,frostbite}_clip.yaml`. Needs the optional `open_clip_torch` extra — see below |
+| `mae_finetune` | `src.networks.MAEEmbedding` | finetuned MAE ViT-B/16 — the **reconstruction** arm, the only non-similarity objective; bundled as `experiment/nec/{mspacman,qbert,frostbite}_mae.yaml`. Needs the optional `timm` extra — see below |
 
-#### The NEC encoder ablation — 3 games x 3 encoders
+#### The NEC encoder ablation — 3 games x 4 encoders
 
-Nine bundled arms: `experiment=nec/{mspacman,qbert,frostbite}` (nature),
-`..._dinov2`, `..._clip`.
+Twelve bundled arms: `experiment=nec/{mspacman,qbert,frostbite}` (nature),
+`..._dinov2`, `..._clip`, `..._mae`.
+
+The three PVM arms are not three flavours of one idea, and the writeup should
+not present them as one. `dinov2_finetune` and `clip_finetune` both optimise a
+**similarity** objective; `mae_finetune` optimises masked **pixel
+reconstruction**, whose loss never compares two images. MAE is the arm that
+varies the causal variable, and its expected position is *below* the other two.
 
 | game | env pair | \|A\| | raw-frame repeat | MFEC `exact_hit_rate` |
 |---|---|---|---|---|
@@ -2197,13 +2245,15 @@ all" above — the intersection of "MFEC demonstrably works" and "in the
 Atari-100k 26" — so the same three serve an MFEC comparison. NEC does not share
 MFEC's exact-match constraint, so it is safe on all three by construction.
 
-**Held identical across all nine, by design:** `total_frames: 1_000_000` agent
+**Held identical across all twelve, by design:** `total_frames: 1_000_000` agent
 steps (4M raw frames), `num_updates: 100`, `eps_end: 0.001`,
 `annealing_frames: 50_000`, `init_random_frames: 12_500`, `eval_eps: 0.005`,
 `eval_every_n_steps: 50_000`, `seed: 42`, and the six env configs (all unclipped,
 no VecNorm, sticky actions off, 27,000-step cap). The measurements justifying
-each value live in `experiment/nec/mspacman.yaml`; the other eight files repeat
+each value live in `experiment/nec/mspacman.yaml`; the other eleven files repeat
 them with a pointer rather than re-arguing them.
+`tests/test_nec_mae_finetune.py::test_the_mae_arm_holds_every_learning_knob_identical`
+asserts the parity for the three `_mae` files against their nature arms.
 
 **Only resource knobs vary by arm:** the ViT arms use `num_envs: 8` and
 `num_eval_episodes: 5` where the nature arms use 16 and 10, because `num_envs`
@@ -2212,8 +2262,11 @@ is also the ViT's collector-side inference batch.
 Three failure modes to avoid when editing these:
 
 * **Tuning one arm.** Any change to a learning-relevant knob has to land in all
-  nine or the comparison is void. Hydra experiment configs do not compose with
-  each other, so there is no inheritance to lean on — it is nine edits.
+  twelve or the comparison is void. Hydra experiment configs do not compose with
+  each other, so there is no inheritance to lean on — it is twelve edits. This
+  includes `kernel_delta`, which the CLIP and MAE arms both have a measured
+  reason to want lowered (see their config comments) — lower it for all twelve
+  and declare it, or not at all.
 * **Dropping `run.game` / `run.encoder`.** Both are set explicitly in every file.
   `run.encoder` defaults to `${oc.select:algorithm.encoder_name,none}`, an
   MFEC-only key, so without the override every encoder arm of a game resolves to
@@ -2524,6 +2577,120 @@ pretrained tower: DND writes, gradient updates, checkpoint save and resume.
 
 **Not verified**: whether NEC scores better with CLIP than with `nature` or
 `dinov2_finetune`. That is the experiment.
+
+#### `mae_finetune` — finetunable MAE ViT
+
+`src.networks.MAEEmbedding` +
+`configs/algorithm/embedding_network/mae_finetune.yaml`, bundled as
+`experiment/nec/{mspacman,qbert,frostbite}_mae.yaml`. The NEC counterpart to
+MFEC's `encoder_name=mae`. Structurally it is `DINOv2Embedding` with a timm
+backbone: same mean-replicate channel adapter, same ImageNet stats, same
+bilinear whole-frame resize, same `param_groups` split, same `freeze_backbone` /
+`backbone_lr_scale` knobs. Four things are MAE-specific:
+
+1. **`timm` is an OPTIONAL dependency** (`uv sync --extra mae`), imported
+   **lazily inside `__init__`** for the same reason `CLIPEmbedding` does it:
+   `src/networks.py` is imported by `src/algorithms/nec.py` and every
+   DQN/DDPG/A2C config, so a module-scope `import timm` would take the entire
+   repo down on a machine without the extra. Pinned by
+   `test_timm_is_not_a_module_level_import_of_networks`, which parses the AST.
+2. **Pooling is over the PATCH tokens, and that is load-bearing.** MAE's CLS
+   token is never directly supervised by the reconstruction loss, so
+   `pooling: mean` averages the patch tokens with the model's
+   `num_prefix_tokens` prefix entries dropped (read, not hardcoded — a ViT with
+   register tokens reports more). `pooling: cls` exists to ablate it and is
+   expected to score worse. timm's own default for the `.mae` tag is
+   `global_pool='token'`, i.e. CLS, and `global_pool='avg'` is **not** the fix —
+   it makes `norm` an `nn.Identity` and adds a fresh `fc_norm` the MAE
+   checkpoint does not contain. So the module pools from `forward_features`
+   itself, exactly as `MAEEncoder` does.
+3. **`image_size` defaults to 112, not `MAEEncoder`'s 224.** Measured cost and
+   granularity:
+
+   | image_size | tokens | ≈GFLOPs/frame | source px per patch (84×84) | fwd, B=8 |
+   |---|---|---|---|---|
+   | 224 | 14×14 = 196 | 17.6 | 6 | 1300 ms |
+   | 112 | 7×7 = 49 | 4.4 | 12 | 408 ms |
+
+   (float32 CPU, B=8 = `num_envs`. The CLIP arm's ViT-B/32 at 224 measures
+   371 ms on the same box: 112 is within 10% of it, 224 would be 3.5×.)
+
+   At 112 this arm has the CLIP arm's token count, patch granularity and
+   parameter count (85.7 M vs 87.8 M), so a difference between the two PVM arms
+   is attributable to the pretraining objective rather than to compute. Parity
+   with the frozen MFEC arm's 224 is not an argument here — the NEC arms already
+   see a different input (4×84×84 grayscale vs RGB 210×160) — and the pos-embed
+   resample is far cheaper for a finetuned backbone than a frozen one.
+   **Verified against timm 1.0.28** that the resample really happens, for the
+   hub path *and* a local file: `_builder.load_pretrained` applies `filter_fn`
+   after every source branch, and `vision_transformer.checkpoint_filter_fn`
+   calls `resample_abs_pos_embed` on a shape mismatch. A local file with the
+   upstream `{"model": ...}` wrapper produces a state_dict **identical** to the
+   hub's, with `pos_embed` (1, 50, 768) and the CLS position token preserved.
+4. **`image_size` must be divisible by 16.** timm does NOT check. Measured:
+   `img_size=100` builds and runs, but `patch_embed.grid_size` is 6×6, covering
+   96 of 100 pixels and **silently discarding 4 px of each axis** — on Ms.
+   Pac-Man the score/lives row. `_assert_patch_grid_covers_the_image` rejects it
+   and names the valid sizes, the same guard `CLIPEmbedding` carries for
+   open_clip.
+
+No BatchNorm warning is needed (unlike `CLIPEmbedding`): timm ViTs are
+LayerNorm-only and `vit_base_patch16_224` is built with `drop_rate=0` /
+`drop_path_rate=0`, so the forward is batch-independent even in `train()` mode.
+`test_real_vit_has_no_batch_dependent_layers` asserts batched and single-row
+forwards agree.
+
+**Measured at initialisation** (60 real Ms. Pac-Man frames from
+`mspacman_nec_train`, embeddings as `NECAlgorithm._embed` produces them, mean
+over 3 init seeds):
+
+| encoder | mean pairwise L2 | `kernel_delta`=1e-3 as % of mean sq. dist |
+|---|---|---|
+| `NatureEmbedding` (baseline) | 0.038 | 46% |
+| MAE pretrained | 0.008 | 392% |
+| MAE randomly initialised | 0.005 | 1299% |
+
+MAE starts ~4.8× more tightly clustered than the paper's ConvNet. Raw pairwise
+cosine of the pooled features is **0.9999** at 112 (1.0000 at 224), and the
+residual after removing that common component is **0.66 % of the embedding norm
+pretrained against 0.44 % at random init — a 1.5× gap, where CLIP's is 10×**.
+That is the arm's result at initialisation, before any training: a
+reconstruction objective does not organise Atari frames the way a similarity
+objective does. `kernel_delta` is deliberately unchanged; see the ablation
+section's "tuning one arm".
+
+**Comparability caveat**: re-measuring the CLIP arm with the same script gave
+0.030, not the 0.007 recorded in `clip_finetune.yaml` — the tower's own numbers
+reproduce exactly (raw norm 10.76 vs the documented ~10.7), so the difference is
+downstream of it. Re-measure the CLIP row before putting the two tables side by
+side.
+
+**Cost.** 85.7 M parameters. Checkpoints measured at **686 MB** (weights +
+RMSProp `square_avg`) and ~801 MB once the DND fills on a 9-action game (the DND
+serialises only its filled entries: 9 × 50 000 × 64 f32 = 115 MB at capacity,
+230 MB on 18-action Frostbite). ~16 GB per 1M-step run at
+`checkpoint.save_every_n_steps=50_000`.
+
+**Verified** (`tests/test_nec_mae_finetune.py`, plus
+`tests/test_smoke.py::test_smoke_nec_pong_mae_finetune`): with a stub `timm` —
+lazy import, build kwargs (`num_classes=0`, `img_size` forwarded, `global_pool`
+never passed), the `pretrained_cfg_overlay` file route, patch-token pooling
+against a poisoned-prefix stub, prefix count read not assumed, the patch-grid
+guard, ImageNet-vs-CLIP stats, non-persistent normalisation buffers, whole-frame
+resize, adapter init, param groups and `setup()`'s use of them, finetuning
+through NEC's `step()`, gradient arrival at the backbone through the DND kernel,
+checkpoint round-trip with groups intact, `state_dict()` completeness, and the
+learning-knob parity of all three experiment configs. With the **real** ViT-B/16
+(opt-in, `NEC_MAE_REAL=1`, `pretrained=False` so no network) — 85.7 M-param
+backbone, the real 7×7 grid and 50 tokens at 112, batch independence, gradients
+reaching `blocks.0.attn.qkv` / `patch_embed.proj` / `cls_token` / `pos_embed`,
+and NEC end-to-end. With **real pretrained weights** (`MAE_WEIGHTS=` or
+`NEC_MAE_DOWNLOAD=1`) — pos-embed resampling at 112 and 224, and a local file
+loading identically to the hub.
+
+**Not verified**: whether NEC scores better with MAE than with `nature`,
+`dinov2_finetune` or `clip_finetune`. That is the experiment. No training run
+has been completed with it, and `backbone_lr_scale` is untuned like the others.
 
 ### 4. Exact-match dict and VecNorm
 

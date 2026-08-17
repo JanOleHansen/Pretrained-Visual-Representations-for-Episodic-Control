@@ -330,3 +330,63 @@ def test_smoke_nec_pong_clip_finetune(monkeypatch):
     assert isinstance(metrics, dict)
     assert "train/epsilon" in metrics
     assert "train/dnd_size" in metrics
+
+
+def test_smoke_nec_pong_mae_finetune(monkeypatch):
+    """NEC with the MAE embedding network, driven from the CLI override.
+
+    `algorithm/embedding_network=mae_finetune` is the documented way to run
+    this arm, so the smoke test exercises it exactly that way: the Hydra group
+    swap, the 4-channel Atari observation reaching the ViT's channel adapter,
+    the token pooling, and the two-group optimizer all have to survive
+    `_train()`.
+
+    `timm` is an OPTIONAL dependency (`uv sync --extra mae`), so a stub `timm`
+    module is injected rather than importorskip-ing: that way this still runs
+    on a machine without the extra, and it pins the lazy-import property that
+    keeps the dependency optional. The real ViT-B/16 is covered by
+    tests/test_nec_mae_finetune.py's NEC_MAE_REAL tier.
+    """
+    pytest.importorskip("ale_py")
+    import sys
+    import types
+
+    import torch
+    import torch.nn as nn
+
+    class _StubViT(nn.Module):
+        """forward_features -> (B, 1 + P, 32) tokens, as timm's ViT gives."""
+
+        def __init__(self):
+            super().__init__()
+            self.embed_dim = 32
+            self.num_prefix_tokens = 1
+            self.patch_embed = nn.Module()
+            # kernel == stride, as every timm ViT patch-embed conv has.
+            self.patch_embed.proj = nn.Conv2d(3, 32, kernel_size=16, stride=16)
+
+        def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+            t = self.patch_embed.proj(x).flatten(2).transpose(1, 2)
+            return torch.cat([t.mean(dim=1, keepdim=True), t], dim=1)
+
+    module = types.ModuleType("timm")
+    module.create_model = lambda name, **kw: _StubViT()
+    monkeypatch.setitem(sys.modules, "timm", module)
+
+    cfg = load_experiment_cfg(
+        "nec/pong",
+        [
+            *_nec_pong_overrides(),
+            "algorithm/embedding_network=mae_finetune",
+            # 32 = 2 x the stub's patch size, so the patch-grid guard passes
+            # and the stub stays cheap.
+            "algorithm.embedding_network.image_size=32",
+            "run.encoder=mae",
+        ],
+    )
+    from src.train import _train
+
+    metrics = _train(cfg)
+    assert isinstance(metrics, dict)
+    assert "train/epsilon" in metrics
+    assert "train/dnd_size" in metrics
