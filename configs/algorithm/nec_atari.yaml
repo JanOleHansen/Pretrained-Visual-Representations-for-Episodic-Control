@@ -122,9 +122,34 @@ max_grad_norm: null
 
 # Exploration — (swept, unreported); §4 lists the "ε-greedy exploration-rate"
 # among the swept values.
+#
+# ANNEALING_FRAMES IS SIZED FOR THE SHARED 100k PROBE BUDGET, not for the
+# paper's runs. It counts AGENT STEPS, like trainer.total_frames, so the two
+# are only meaningful relative to each other. This was 4_000_000 — sized for a
+# 10M-agent-step paper-scale run — while configs/train.yaml's shared probe
+# budget is total_frames: 100_000. At that pairing epsilon reaches only
+# 1 - 0.99 * 100e3/4e6 = 0.975 by the END of the run, i.e. the whole run is
+# uniform random play. Any experiment config that did not override it inherited
+# exactly that (nec/pong.yaml and nec/hero.yaml both did, until this was fixed).
+#
+# The binding constraint on the low side is that the anneal must outlast the
+# point where the DND becomes usable: NEC writes only at EPISODE END, and an
+# action holding <= k = 50 entries answers +inf, so the argmax has nothing to
+# exploit until the first round of episodes has been written. Measured episode
+# length under a random policy on the real NEC env stacks (agent steps):
+#
+#     Q*bert 314   Frostbite 371   Ms. Pac-Man 498   H.E.R.O. 656   Pong 922
+#
+# At num_envs: 8 the first round of episodes therefore completes between ~2.5k
+# and ~7.4k collected frames, and lands 165-1230 entries per action — all well
+# past k. 10_000 clears the slowest game (Pong) with margin and puts epsilon at
+# its floor by 10% of the probe budget.
+#
+# RAISE THIS IN LOCKSTEP with trainer.total_frames. For a paper-scale run
+# (total_frames: 2_500_000 for the 10M-raw-frame table) restore 4_000_000.
 eps_start: 1.0
 eps_end: 0.01
-annealing_frames: 4_000_000
+annealing_frames: 10_000
 
 # Evaluation exploration rate (get_policy()). NOT annealed, and deliberately
 # LARGER than the training floor. ALE is deterministic here
@@ -140,7 +165,29 @@ eval_eps: 0.05
 # Data collection.  frames_per_batch counts AGENT STEPS, and every Atari config
 # here runs action-repeat 4, so 1600 agent steps == 6400 raw ALE frames.
 frames_per_batch: 1_600
-init_random_frames: 50_000
+
+# ALSO SIZED FOR THE 100k PROBE BUDGET — read the annealing_frames note above
+# first; the two move together. This was 50_000, i.e. HALF of the shared budget
+# spent on a uniform random policy before the collector ever consults the DND.
+#
+# Two constraints fix the value:
+#
+#   * 4_800 = exactly 3 collector batches at frames_per_batch: 1_600. torchrl
+#     warns and rounds UP when init_random_frames is not a multiple of
+#     frames_per_batch (collectors/_single.py), so the previous 12_500 the
+#     experiment configs used was silently 12_800.
+#   * At num_envs: 8 that is 600 agent steps per env, which completes the first
+#     episode on every ablation game (Q*bert 314, Frostbite 371, Ms. Pac-Man
+#     498 — see the measured table above), so the DND is non-empty and past
+#     k = 50 on every action before the first gradient step runs. Pong (922)
+#     and H.E.R.O. (656) fill during the anneal instead, which is why
+#     annealing_frames is set to outlast them.
+#
+# The paper and the reference implementation have NO warm-up at all — both act
+# epsilon-greedily from step 0 (AGENTS.md, "Deviations that are not
+# numerical"). This exists only to keep the optimistic-init argmax off an empty
+# table; it is not a paper-sanctioned knob and should not grow.
+init_random_frames: 4_800
 max_frames_per_traj: -1
 
 # (paper §4) "we do one replay update for every 16 observed frames".  "Frames"

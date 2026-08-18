@@ -915,14 +915,33 @@ actions, and cap episodes at the full 27,000 agent steps (30 min).
 
 Held identical across all twelve: `total_frames: 100_000` agent steps (= 400k
 raw frames, the shared probe budget), `num_updates: 100`, `eps_end: 0.001`,
-`annealing_frames: 50_000`, `init_random_frames: 12_500`, `eval_eps: 0.005`,
-`log_every_n_steps: 5_000`, `eval_every_n_steps: 10_000`, `seed: 42`. Note that
-`annealing_frames` still spans half the probe budget — ε only reaches `eps_end`
-at the midpoint of a 100k-step run, so lengthen the run before reading the
-ε-greedy floor's effect. Only the resource knobs differ by arm — the ViT arms run
-`num_envs: 8` and `num_eval_episodes: 5` against the ConvNet's 16 and 10, because
-`num_envs` is also the ViT's inference batch. **Do not tune a single arm in
+`annealing_frames: 10_000`, `init_random_frames: 4_800`, `eval_eps: 0.005`,
+`num_envs: 8`, `num_eval_episodes: 5`, `log_every_n_steps: 5_000`,
+`eval_every_n_steps: 10_000`, `seed: 42`. **Do not tune a single arm in
 isolation**; a change that belongs to the comparison has to land in all twelve.
+`tests/test_nec_ablation_parity.py` enforces that.
+
+Two of those were wrong until recently, and both are worth knowing about if you
+are reading older runs:
+
+* **The exploration schedule did not follow the budget down.**
+  `annealing_frames: 50_000` and `init_random_frames: 12_500` were sized for a
+  1M-step run and survived the cut to 100k, where they became 50% and 12.5% of
+  it — **26.6% of every collected frame took a uniform random action**, and the
+  policy was only near-greedy for the second half of the run. Worse,
+  `nec/pong.yaml` and `nec/hero.yaml` carry no `algorithm:` block and inherited
+  `nec_atari.yaml`'s paper-scale defaults (`annealing_frames: 4_000_000`,
+  `init_random_frames: 50_000`), so ε reached only 0.975 by step 100k — those
+  two were essentially random-play runs. Both are now sized against the probe
+  budget; see AGENTS.md, *Shared probe budget*, for the arithmetic and the
+  measured random-policy episode lengths behind the floor.
+* **`num_envs` is not a free resource knob.** The ConvNet arms ran 16 against
+  the ViT arms' 8. NEC writes to the DND only at episode end, so frames left in
+  a trailing partial episode are never written — a loss proportional to
+  `num_envs` — and MFEC measured that 16 envs keep 39% fewer unique states than
+  4 at equal frames. The baseline was being handicapped against the encoders it
+  is compared to. All twelve now run 8 (and `num_eval_episodes: 5`, which was
+  10 on the ConvNet arms and gave them a different standard error).
 
 ```shell
 # One arm:

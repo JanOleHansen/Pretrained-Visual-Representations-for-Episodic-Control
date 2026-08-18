@@ -48,14 +48,26 @@ algorithm:
   num_updates: 100
   eps_end: 0.001
   # The anneal deliberately outlasts the random warm-up: NEC only writes to the
-  # DND at episode end, and while an action's table holds <= k entries its Q is
-  # +inf (mapped to 1e9), so argmax degenerates. This matters more here than on
-  # the other two games: with 18 actions the same number of episodes spreads
-  # over twice as many tables, so each one fills at roughly half the rate. Watch
-  # train/dnd_size early — if the tables are still under k=50 when the anneal
-  # ends, raise annealing_frames and init_random_frames together.
-  annealing_frames: 50_000
-  init_random_frames: 12_500
+  # DND at EPISODE END, and while an action's table holds <= k = 50 entries its
+  # Q is +inf, so the argmax has nothing to exploit until the first round of
+  # episodes has been written. This matters more here than on the other two
+  # games: with 18 actions the same number of episodes spreads over twice as
+  # many tables, so each one fills at roughly half the rate.
+  #
+  # Both values are sized against trainer.total_frames below and must move with
+  # it — see nec/mspacman.yaml for the full arithmetic. They were 50_000 /
+  # 12_500, sized for a 1M-step run, which against the 100k probe budget put
+  # ~26.6% of all collected frames on a uniform random action; 10_000 / 4_800
+  # brings that to ~6.2%.
+  #
+  # Checked for this game specifically, since it is the one with the thinnest
+  # margin: random-policy episode length is 371 agent steps (measured,
+  # frostbite_nec_train), so at num_envs: 8 the 4_800-frame warm-up completes
+  # one episode per env and leaves ~165 entries per action across the 18
+  # tables — still >3x k. Watch train/dnd_size early anyway; if any table is
+  # under 50 when the anneal ends, raise both together.
+  annealing_frames: 10_000
+  init_random_frames: 4_800
   # Large enough to decorrelate eval episodes on a deterministic ALE, small
   # enough to stay within 10x of eps_end so train/* and eval/* describe the same
   # policy.
@@ -71,15 +83,23 @@ trainer:
   seed: 42
   accelerator: gpu
   devices: [0]
-  # NEC holds a 100k-transition float32 replay buffer (~11.3 GB, preallocated by
-  # LazyTensorStorage) plus a per-env raw-pixel carry buffer for the in-flight
-  # episode, and spawns one worker process per env. If this run dies with
-  # `EOFError: proc <pid> failed, last command: step_and_maybe_reset`, that is
-  # the OOM killer taking a ParallelEnv worker — drop to 8.
-  num_envs: 16
+  # HELD IDENTICAL ACROSS ALL TWELVE ABLATION ARMS — canonical note in
+  # nec/mspacman.yaml. Was 16 here while the PVM arms ran 8, which made num_envs
+  # a second variable in an encoder comparison: NEC writes to the DND only at
+  # EPISODE END, so ~num_envs x (mean episode length / 2) frames are stranded in
+  # trailing partial episodes and never written. With Frostbite's measured
+  # 371-step random-policy episodes that is ~3.0k frames (3.0%) at 16 envs
+  # against ~1.5k (1.5%) at 8 — and the stranded frames are spread over 18
+  # tables here, so they cost the thinnest ones most.
+  num_envs: 8
   log_every_n_steps: 5_000
   # 10_000 agent steps == every 40k raw frames.  Paper §4 ("We evaluate MFEC and
   # NEC every 200.000 frames") is every 50_000 agent steps; shortened in
   # proportion to the 100k-step probe budget so a run still yields ten points.
   eval_every_n_steps: 10_000
-  num_eval_episodes: 10
+  # HELD IDENTICAL ACROSS ALL TWELVE ABLATION ARMS. Was 10 here while the nine
+  # PVM arms ran 5, which gave the baseline's eval/return_mean half the standard
+  # error of the arms it is plotted against. 5 rather than 10 because each eval
+  # episode is a full game (up to StepCounter's 27_000 steps) at batch 1, which
+  # is the least amortised inference in the whole run.
+  num_eval_episodes: 5

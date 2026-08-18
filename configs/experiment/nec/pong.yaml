@@ -18,6 +18,19 @@ defaults:
   - override /environment@eval_environment: pong_eval
   - _self_
 
+# NO `algorithm:` block, deliberately: this config takes nec_atari.yaml's
+# defaults wholesale, including num_updates: 400 (paper §4's rate — the twelve
+# ablation arms override that DOWN to 100, this one does not).
+#
+# That inheritance used to be a bug rather than a choice. nec_atari.yaml carried
+# annealing_frames: 4_000_000 and init_random_frames: 50_000, both sized for a
+# paper-scale 10M-step run, so against the 100k probe budget below this config
+# spent half the run on a uniform random policy and reached only eps = 0.975 by
+# the end — the whole run was random play. Those defaults are now sized for the
+# shared probe budget; see the comments on them in nec_atari.yaml. Pong has the
+# longest random-policy episodes of any game here (922 agent steps, measured),
+# so it is the game those defaults have the least margin on: the DND fills
+# during the anneal rather than during the warm-up.
 trainer:
   # Agent steps, not raw frames: with action-repeat 4 this is 400k raw ALE
   # frames — the shared probe budget, held identical across every experiment in
@@ -27,13 +40,16 @@ trainer:
   seed: 42
   accelerator: gpu
   devices: [0]
-  # WARNING — untested at this width for NEC. nec/mspacman.yaml documents an
-  # observed OOM at num_envs=16 on a 32 GB host (NEC adds a 100k-transition
-  # float32 replay buffer, ~11.3 GB preallocated, plus a per-env raw-pixel
-  # carry buffer, on top of the DND) and drops to 8. If this run dies with
+  # 8, matching every other NEC config — see the canonical note in
+  # nec/mspacman.yaml for why num_envs is learning-relevant here (NEC writes to
+  # the DND only at episode end, so trailing partial episodes are stranded in
+  # proportion to num_envs). This was 16, which nec/mspacman.yaml documents as
+  # OOMing on a 32 GB host: NEC adds a 100k-transition float32 replay buffer
+  # (~11.3 GB preallocated) plus a per-env raw-pixel carry buffer on top of the
+  # DND. If a run still dies with
   # `EOFError: proc <pid> failed, last command: step_and_maybe_reset`, that is
-  # the OOM killer taking a ParallelEnv worker — set num_envs: 8.
-  num_envs: 16
+  # the OOM killer taking a ParallelEnv worker — drop further.
+  num_envs: 8
   log_every_n_steps: 5_000
   # 10_000 agent steps == every 40k raw frames.  Paper §4 ("We evaluate MFEC and
   # NEC every 200.000 frames") is every 50_000 agent steps; shortened in

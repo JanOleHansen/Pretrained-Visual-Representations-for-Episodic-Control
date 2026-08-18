@@ -69,11 +69,26 @@ algorithm:
   # two runs.
   eps_end: 0.001
   # The anneal deliberately outlasts the random warm-up: NEC only writes to the
-  # DND at episode end, and while an action's table holds <= k entries its Q is
-  # +inf (mapped to 1e9), so argmax degenerates. Annealing over 50k agent steps
-  # (200k raw frames) keeps real exploration alive until the DND is populated.
-  annealing_frames: 50_000
-  init_random_frames: 12_500
+  # DND at EPISODE END, and while an action's table holds <= k = 50 entries its
+  # Q is +inf, so the argmax has nothing to exploit until the first round of
+  # episodes has been written.
+  #
+  # BOTH VALUES ARE SIZED AGAINST trainer.total_frames BELOW and must move with
+  # it. They were 50_000 / 12_500, set when this file ran at total_frames:
+  # 1_000_000 (5% and 1.25% of the run). The 100k probe budget left them
+  # untouched, which made them 50% and 12.5%: ~26.6% of every collected frame
+  # was a uniform random action and the policy was only near-greedy for the
+  # second half of the run. At 10_000 / 4_800 that falls to ~6.2%.
+  #
+  # The floor is set by when the DND becomes usable. Measured episode length
+  # under a random policy on mspacman_nec_train: 498 agent steps (mean of 12).
+  # At num_envs: 8 the warm-up is 600 steps per env, so every env finishes its
+  # first episode inside it and the 9 tables hold ~440 entries each — well past
+  # k — before the first gradient step. 4_800 is also exactly 3 collector
+  # batches at frames_per_batch: 1_600; torchrl rounds init_random_frames UP to
+  # a batch multiple, so the old 12_500 was silently 12_800.
+  annealing_frames: 10_000
+  init_random_frames: 4_800
 
   # Eval ε has to decorrelate episodes without describing a different policy
   # than training. ALE is deterministic here and NoopResetEnv does nothing on
@@ -102,16 +117,42 @@ trainer:
   seed: 42
   accelerator: gpu
   devices: [0]
-  # 8 rather than MFEC's 16. On top of the DND, NEC holds a 100k-transition
-  # float32 replay buffer (~11 GB, preallocated by LazyTensorStorage) plus a
-  # per-env raw-pixel carry buffer for the in-flight episode, and spawns one
-  # worker process per env. 16 envs overruns the 32 GB devcontainer limit; the
-  # OOM killer then takes out a ParallelEnv worker, which surfaces as
+  # PARALLEL ENVS — HELD IDENTICAL ACROSS ALL TWELVE ABLATION ARMS. This is the
+  # canonical note; the other eleven point back here.
+  #
+  # It was 16 here (and in nec/qbert.yaml and nec/frostbite.yaml) while the nine
+  # PVM arms ran 8, so the `nature` baseline was being compared against encoders
+  # that had collected their data under a different regime. num_envs is
+  # learning-relevant for episodic control, and the MFEC side measured how (see
+  # the canonical note in experiment/mfec/rp_gray.yaml):
+  #
+  #   * NEC and MFEC write to memory only at EPISODE END, so frames sitting in a
+  #     trailing partial episode when the run stops are never written at all.
+  #     The loss is ~num_envs x (mean episode length / 2) — ABSOLUTE, so it
+  #     hurts most at a short budget. With Ms. Pac-Man's measured 498-step
+  #     random-policy episodes that is ~4.0k frames (4.0% of this budget) at 16
+  #     envs against ~2.0k (2.0%) at 8.
+  #   * MFEC also measured that 16 envs kept 39% FEWER UNIQUE STATES than 4 at
+  #     equal frames: the envs share one memory and a low epsilon, so they
+  #     largely retread the same trajectory.
+  #
+  # 8 rather than MFEC's 4 because the nine PVM arms run a ViT whose inference
+  # batch IS num_envs, and 4 leaves it badly under-utilised. 16 also overruns
+  # the 32 GB devcontainer limit here: on top of the DND, NEC holds a
+  # 100k-transition float32 replay buffer (~11.3 GB, preallocated by
+  # LazyTensorStorage) plus a per-env raw-pixel carry buffer for the in-flight
+  # episode, and spawns one worker process per env. The OOM killer then takes a
+  # ParallelEnv worker, which surfaces as
   # `EOFError: proc <pid> failed, last command: step_and_maybe_reset`.
-  num_envs: 16
+  num_envs: 8
   log_every_n_steps: 5_000
   # 10_000 agent steps == every 40k raw frames.  Paper §4 ("We evaluate MFEC and
   # NEC every 200.000 frames") is every 50_000 agent steps; shortened in
   # proportion to the 100k-step probe budget so a run still yields ten points.
   eval_every_n_steps: 10_000
-  num_eval_episodes: 10
+  # HELD IDENTICAL ACROSS ALL TWELVE ABLATION ARMS. Was 10 here while the nine
+  # PVM arms ran 5, which gave the baseline's eval/return_mean half the standard
+  # error of the arms it is plotted against. 5 rather than 10 because each eval
+  # episode is a full game (up to StepCounter's 27_000 steps) at batch 1, which
+  # is the least amortised inference in the whole run.
+  num_eval_episodes: 5

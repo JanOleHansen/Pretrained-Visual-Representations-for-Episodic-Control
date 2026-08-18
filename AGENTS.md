@@ -336,11 +336,42 @@ so capacity can never bind on any `|A|`. **Move the four together:** raising
 changes the algorithm partway through and at a different moment in each arm.
 
 This budget is an Atari-100k-style probe, far short of the papers' 40M-frame
-runs, so scores off it are **not** comparable to published tables. Two knobs are
-deliberately *not* rescaled with it and are worth knowing about: NEC's
-`annealing_frames: 50_000` now spans half the run, and `nec/{hero,pong}.yaml`
-inherit `init_random_frames: 50_000` from `nec_atari.yaml`, i.e. half the run is
-pure random exploration. Override them if a short run needs to be informative.
+runs, so scores off it are **not** comparable to published tables.
+
+**NEC's exploration schedule is part of the set that moves with `total_frames`.**
+`annealing_frames` and `init_random_frames` are agent-step counts, exactly like
+`total_frames`, so they are only meaningful relative to it. An earlier version
+of this section noted that they were "deliberately *not* rescaled" with the cut
+from 1M to 100k and suggested overriding them per run. That was wrong — the
+values were simply left behind, and the cost was large:
+
+| | before | after |
+|---|---|---|
+| `annealing_frames` (12 ablation arms) | `50_000` = 50% of the run | `10_000` = 10% |
+| `init_random_frames` (12 ablation arms) | `12_500` = 12.5% | `4_800` = 4.8% |
+| `annealing_frames` (`nec_atari.yaml` default, inherited by `nec/{pong,hero}`) | `4_000_000` — ε reaches only **0.975** by step 100k | `10_000` |
+| `init_random_frames` (same default) | `50_000` = **half the run** uniform random | `4_800` |
+| share of collected frames taking a uniform random action | **26.6%** (ablation) / **~99%** (pong, hero) | 6.2% / 7.1% |
+
+The floor on both is when the DND becomes usable: NEC writes only at EPISODE
+END, and an action holding `<= k = 50` entries answers `+inf`, so there is
+nothing to exploit until the first round of episodes has been written. Measured
+episode length under a random policy on the real NEC env stacks (agent steps):
+
+| Q*bert | Frostbite | Ms. Pac-Man | H.E.R.O. | Pong |
+|---|---|---|---|---|
+| 314 | 371 | 498 | 656 | 922 |
+
+At `num_envs: 8` that puts the first writes between ~2.5k and ~7.4k collected
+frames, at 165-1230 entries per action — all well past `k`. `4_800` is also
+exactly three collector batches at `frames_per_batch: 1_600`; torchrl rounds
+`init_random_frames` **up** to a batch multiple and warns when it has to
+(`collectors/_single.py`), so the old `12_500` was silently `12_800`.
+
+Guarded by
+`tests/test_nec_ablation_parity.py::test_the_exploration_schedule_fits_inside_the_probe_budget`.
+For a paper-scale run (`total_frames: 2_500_000`) restore `annealing_frames:
+4_000_000`.
 
 Parity is guarded by `tests/test_encoder_factory.py`
 (`test_every_arm_shares_one_training_budget`,
@@ -545,13 +576,20 @@ configs/
                               an offline cluster.  Slowest arm (197 tokens vs the CLIP
                               arm's 50) and widest phi (768), so also the largest eager
                               QEC allocation — see "QEC memory is sized by state_dim".
-  experiment/nec/pong.yaml     — NEC on Pong (10M agent steps = 40M raw frames, num_envs=16);
-                              keeps the clipped env — Pong's rewards are already in [-1, 1]
-                              so SignTransform is a no-op there, not a deviation
-  experiment/nec/hero.yaml     — NEC on H.E.R.O. (10M agent steps = 40M raw frames);
-                              uses hero_nec_train (unclipped)
-  experiment/nec/mspacman.yaml — NEC on Ms. Pac-Man (10M agent steps = 40M raw frames,
-                              num_envs=8); uses mspacman_nec_train (unclipped)
+  experiment/nec/pong.yaml     — NEC on Pong (100k agent steps = 400k raw frames, the shared
+                              probe budget; num_envs=8); keeps the clipped env — Pong's
+                              rewards are already in [-1, 1] so SignTransform is a no-op
+                              there, not a deviation.  Carries NO `algorithm:` block, so it
+                              inherits nec_atari.yaml wholesale (num_updates: 400, i.e.
+                              paper §4's rate, unlike the twelve ablation arms)
+  experiment/nec/hero.yaml     — NEC on H.E.R.O. (100k agent steps = 400k raw frames;
+                              num_envs=8); uses hero_nec_train (unclipped).  Same
+                              no-`algorithm:`-block inheritance as nec/pong.yaml
+  experiment/nec/mspacman.yaml — NEC on Ms. Pac-Man (100k agent steps = 400k raw frames,
+                              num_envs=8); uses mspacman_nec_train (unclipped).  The
+                              CANONICAL ablation arm: the measurements behind num_updates,
+                              eps_end, annealing_frames, init_random_frames, eval_eps and
+                              num_envs live here and the other eleven point back at it
   experiment/nec/mspacman_dinov2.yaml — same task and env pair, with the embedding_network
                               group swapped to dinov2_finetune (finetuned ViT-S/14) and
                               run.encoder=dinov2 so the run dir does not collide.  The
@@ -609,6 +647,21 @@ tests/
                               CLIP (not ImageNet) stats, no centre crop, determinism,
                               state round-trip, and an MFEC end-to-end run on the RGB env.
                               Runs against a stub open_clip, so CI needs no package.
+  test_nec_optimistic_tiebreak.py — the NEC half of "Optimistic init must be tie-broken
+                              RANDOMLY": an empty DND must not make argmax play one fixed
+                              action, a partially-populated one must spread over the
+                              still-optimistic actions, the jitter must survive float32
+                              rounding at 1e9 (ULP 64.0) and stay above the trainer's 1e8
+                              sentinel threshold, and FINITE estimates must stay
+                              bit-identical across calls (eval determinism)
+  test_nec_ablation_parity.py — the twelve encoder-ablation arms differ ONLY in the
+                              encoder: every algorithm- and trainer-side knob is compared
+                              arm-vs-nature-baseline and across games (this is what
+                              catches a num_envs or num_eval_episodes drift), plus the
+                              exploration schedule is checked to fit inside
+                              trainer.total_frames — init_random_frames a whole number of
+                              collector batches, annealing_frames <= 20% of the budget,
+                              warm-up shorter than the anneal
   test_nec_embedding_network.py — NEC embedding-network config group: shape/dtype contract,
                               gradient flow (proves the encoder is genuinely trainable),
                               Hydra-composition architecture regression, config-swap
@@ -1518,9 +1571,25 @@ Constraints if you touch this:
   `torch.where` untouched, so a QEC that has information about a state is
   exactly as deterministic as before — the guarantee that matters for eval.
   The draw uses the global torch RNG, so seeded runs stay reproducible.
-- `NECPolicy` (`src/algorithms/nec.py`) still has the un-jittered
-  `torch.where(isinf, 1e9, ...)` form and the same latent defect. It has not
-  been changed, because the failure was only confirmed experimentally for MFEC.
+- **NEC has the same fix**, in `DNDPolicy.forward` (`src/algorithms/nec.py`),
+  with its own `OPTIMISTIC_VALUE` / `OPTIMISTIC_JITTER` constants — duplicated
+  rather than imported so `nec.py` stays free of a dependency on `mfec.py`.
+  This note used to say NEC "still has the un-jittered
+  `torch.where(isinf, 1e9, ...)` form and the same latent defect", left alone
+  because the failure had only been confirmed experimentally for MFEC. It has
+  now been confirmed for NEC too, on a 9-action Ms. Pac-Man spec over 500
+  states: an empty DND emitted action 0 for **500/500**, and once actions 0-3
+  passed `k` it emitted action 4 for **500/500**. Guarded by
+  `tests/test_nec_optimistic_tiebreak.py`.
+- NEC is less exposed than MFEC only because `init_random_frames` covers part
+  of the window in which a table sits at or below `k`. The exposure is worst on
+  the game with the most tables to fill (Frostbite, 18 actions), and the window
+  is precisely when the DND is first being seeded.
+- **Determinism is guaranteed on the finite path only**, for both algorithms.
+  A test that asserts a deterministic argmax must populate the memory first —
+  `tests/test_nec_eval_policy.py::test_zero_eval_eps_restores_deterministic_argmax`
+  used to assert it against an EMPTY DND, which was asserting the collapse
+  rather than the fix.
 
 Contract (`Encoder`):
 - `embed(obs) -> (B, d) float32` on `obs.device`; **must be deterministic**
@@ -1845,7 +1914,7 @@ Everything §4 actually publishes, checked against the composed config:
 
 | Paper §4 / §3 | Value | Ours | |
 |---|---|---|---|
-| "store up to 5 x 10^5 memories per action" | 5e5 | `dnd_capacity: 500_000` | ok |
+| "store up to 5 x 10^5 memories per action" | 5e5 | `dnd_capacity: 50_000` | deviation — 5e5 never fills inside this repo's budgets; 5e4 reproduces the paper's own ~1.85 turnovers and bounds the exact-kNN scan (§5b). NOTE at `total_frames: 100_000` even 5e4 cannot bind: ~100k inserts spread over `\|A\|` tables peaks at ~11k/action on Ms. Pac-Man, so eviction never fires and the LRU policy below is inert |
 | "nearest neighbours p = 50 in all our experiments" | 50 | `k: 50` | ok |
 | "horizon of N = 100" | 100 | `n_step: 100` | ok |
 | "replay buffer stores the only last 10^5 states" | 1e5 | `LazyTensorStorage(100_000)` | ok |
@@ -1883,17 +1952,28 @@ Deviations that are **not** numerical:
   now 5e4, which fills at ~450k agent steps.
 * **Approximate NN.** §3.1 uses kd-trees; ours is an exact scan. Same answer,
   much slower — see the fps table in §5b.
-* **Warm-up.** `init_random_frames: 12_500` has no counterpart in the paper or
-  the reference; both act ε-greedily from step 0.
+* **Warm-up.** `init_random_frames: 4_800` has no counterpart in the paper or
+  the reference; both act ε-greedily from step 0. It exists only to keep the
+  optimistic-init argmax off an empty DND, and it is sized against
+  `trainer.total_frames` — see "Shared probe budget" above for the arithmetic
+  and for the 1M-era values (`12_500`, and `50_000` in this file's own
+  defaults) that survived the cut to 100k.
 * **Optimistic init.** Neither the paper nor the reference returns `+inf` for an
-  under-populated action (the reference returns 0.0); we return `1e9`.
-* **Gradient clipping.** Neither clips; we keep `max_grad_norm: 10.0`, which —
-  measured — binds on **100 % of updates** (median raw grad norm ~1.7e3). So it
-  is the de-facto step-size control here, not a safety net. Removing it was
-  tried and reverted: torch's RMSProp `eps=1e-8` barely damps anything, so the
-  clip is the only thing bounding the step, and dropping both at once diverges
-  (`train/q_loss` 1.5e3 -> 1.9e4 within three batches). It only makes sense to
-  drop together with the reference's `rmsprop_eps=0.01`.
+  under-populated action (the reference returns 0.0); we return `1e9` **plus
+  per-entry uniform jitter**, so the argmax is uniform over the under-populated
+  actions rather than always the lowest index. See "Optimistic init must be
+  tie-broken RANDOMLY" above — the un-jittered form played one fixed action for
+  a whole rollout.
+* **Gradient clipping.** Neither clips, and neither do we: `max_grad_norm:
+  null`. (This bullet used to say "we keep `max_grad_norm: 10.0`"; that was
+  already stale — see the §5b table row, which records the change as shipped.)
+  At the old threshold of 10 it bound on **100 % of updates** (median raw grad
+  norm ~1.7e3), making it the de-facto step-size control rather than a safety
+  net. It could only be removed together with the reference's
+  `rmsprop_eps=0.01`: torch's `eps=1e-8` damps nothing, so dropping both at
+  once diverges (`train/q_loss` 1.5e3 -> 1.9e4 within three batches). The two
+  shipped together; re-enable the clip only alongside a re-examination of
+  `rmsprop_eps`.
 
 ### 5b. Diff against the reference implementation
 
@@ -1968,12 +2048,14 @@ Differences **left in place** — deliberate, but the first is the one to A/B fi
   `dnd_key_lr=0 dnd_value_lr=0` is a bit-exact no-op by construction, so it is
   a free A/B.
 * **Optimistic init.** Reference returns `Q = 0.0` for an action whose dict
-  holds `<= k` entries; we return `+inf -> 1e9`, so argmax chases whichever
-  action is under-populated. Reference also gates *training* on **all** actions
-  being queryable.
+  holds `<= k` entries; we return `+inf -> 1e9 + U(0, 1e6)`, so argmax chases
+  whichever action is under-populated, uniformly among them rather than by
+  lowest index (see "Optimistic init must be tie-broken RANDOMLY"). Reference
+  also gates *training* on **all** actions being queryable.
 * **`embedding_dim`** 64 vs the reference's 128.
 * **Exploration.** Reference default is a *constant* `epsilon=0.1` (no anneal);
-  we anneal 1.0 -> `eps_end` over `annealing_frames`.
+  we anneal 1.0 -> `eps_end` over `annealing_frames`, which is sized against
+  `trainer.total_frames` (see "Shared probe budget").
 
 #### fps: exact kNN vs the reference's ANNOY index
 
@@ -2271,18 +2353,48 @@ MFEC's exact-match constraint, so it is safe on all three by construction.
 
 **Held identical across all twelve, by design:** `total_frames: 100_000` agent
 steps (400k raw frames — the shared probe budget), `num_updates: 100`,
-`eps_end: 0.001`, `annealing_frames: 50_000`, `init_random_frames: 12_500`,
-`eval_eps: 0.005`, `log_every_n_steps: 5_000`, `eval_every_n_steps: 10_000`,
+`eps_end: 0.001`, `annealing_frames: 10_000`, `init_random_frames: 4_800`,
+`eval_eps: 0.005`, `num_envs: 8`, `num_eval_episodes: 5`,
+`log_every_n_steps: 5_000`, `eval_every_n_steps: 10_000`,
 `seed: 42`, and the six env configs (all unclipped,
 no VecNorm, sticky actions off, 27,000-step cap). The measurements justifying
 each value live in `experiment/nec/mspacman.yaml`; the other eleven files repeat
 them with a pointer rather than re-arguing them.
-`tests/test_nec_mae_finetune.py::test_the_mae_arm_holds_every_learning_knob_identical`
-asserts the parity for the three `_mae` files against their nature arms.
 
-**Only resource knobs vary by arm:** the ViT arms use `num_envs: 8` and
-`num_eval_episodes: 5` where the nature arms use 16 and 10, because `num_envs`
-is also the ViT's collector-side inference batch.
+**`num_envs` is NOT a free resource knob** — this is the correction that matters
+most here. This section used to say "only resource knobs vary by arm: the ViT
+arms use `num_envs: 8` and `num_eval_episodes: 5` where the nature arms use 16
+and 10, because `num_envs` is also the ViT's collector-side inference batch."
+The inference-batch part is true; the "only resource knobs" conclusion is not.
+`num_envs` moves the learning curve for episodic control, and the MFEC side had
+already measured how (canonical note in `configs/experiment/mfec/rp_gray.yaml`):
+
+* NEC and MFEC write to memory only at EPISODE END, so frames sitting in a
+  trailing partial episode when the run stops are **never written at all**. The
+  loss is ~`num_envs x (mean episode length / 2)` — ABSOLUTE, so it bites
+  hardest at a short budget. At this budget, with Ms. Pac-Man's measured
+  498-step random-policy episodes, that is ~4.0k frames (4.0%) at 16 envs
+  against ~2.0k (2.0%) at 8.
+* 16 envs kept **39% fewer unique states** than 4 at equal frames: the envs
+  share one memory and a low epsilon, so they largely retread one trajectory.
+
+So the three `nature` arms at 16 were handicapped against the nine PVM arms at
+8 that they are plotted against — a data-collection difference wearing an
+encoder comparison's clothes, the same trap the MFEC ablation lists as failure
+mode 1. All twelve now run `num_envs: 8`: 8 rather than MFEC's 4 because the
+PVM arms' ViT inference batch IS `num_envs`, and 16 additionally overruns the
+32 GB devcontainer limit for NEC (a preallocated ~11.3 GB replay buffer plus a
+per-env raw-pixel carry, on top of the DND).
+
+`num_eval_episodes` was 10 against the PVM arms' 5, which gave the baseline's
+`eval/return_mean` a different standard error from the arms it is compared to.
+Now 5 everywhere.
+
+Parity is guarded by `tests/test_nec_ablation_parity.py`, which checks every
+algorithm- and trainer-side knob for all twelve arms against their `nature`
+baseline **and** across games.
+`tests/test_nec_mae_finetune.py::test_the_mae_arm_holds_every_learning_knob_identical`
+is the older, narrower version of the same check for the three `_mae` files.
 
 Three failure modes to avoid when editing these:
 

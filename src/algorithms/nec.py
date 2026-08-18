@@ -1217,7 +1217,57 @@ class DNDPolicy(nn.Module):
     ``forward()`` is decorated @torch.no_grad() for efficient action selection
     during collection.  The training gradient path uses the embedding_net and
     DND directly (not through this module) so gradients can flow.
+
+    Optimistic initialisation
+    -------------------------
+    ``DND.estimate_all`` returns ``+inf`` for any action whose table holds
+    ``<= k`` entries, so an under-populated action is always preferred.
+    ``forward`` maps those sentinels onto a large finite value — ``QValueActor``
+    cannot argmax over ``inf`` — **plus independent uniform jitter per
+    (state, action)**.
+
+    The jitter is load-bearing, not cosmetic, and this is the same defect and
+    the same fix as ``MFECAlgorithm``'s ``QECPolicy`` (see
+    ``tests/test_mfec_optimistic_tiebreak.py``).  Mapping every ``+inf`` onto a
+    single constant makes the under-populated actions **exact ties**, and
+    argmax resolves ties by *lowest index*.  Measured on a 9-action Ms.
+    Pac-Man spec, 500 states, before this fix:
+
+        empty DND                       action 0 for 500/500
+        actions 0-3 above k, 4-8 below  action 4 for 500/500
+
+    i.e. the policy plays one fixed action until that action's table passes
+    ``k``, then the next one — seeding the DND with ``|A|`` degenerate
+    single-action trajectories at exactly the moment it is being populated.
+    NEC is less exposed than MFEC because ``init_random_frames`` covers part of
+    that window, but the exposure is worst on the game with the most
+    tables to fill (Frostbite, 18 actions).
+
+    Constraints if you touch this:
+
+    * **The jitter cannot be small.** ``q_values`` is float32 and the ULP at
+      1e9 is 64.0, so ``uniform(0, 1)`` jitter rounds straight back to exactly
+      1e9 and restores the tie.
+    * **``OPTIMISTIC_VALUE`` must exceed any achievable return** (unclipped
+      Ms. Pac-Man tops out ~3e4) or a real Q-value would outrank an
+      under-populated action.  A jittered entry stays ``<= 1.001e9``, well
+      above ``StepTrainer._OPTIMISTIC_Q_THRESHOLD`` = 1e8, so these values are
+      still kept out of ``train/q_values``.
+    * **Only the ``+inf`` path is perturbed.**  Finite estimates pass through
+      ``torch.where`` untouched, so a DND that has information about a state is
+      exactly as deterministic as before — the guarantee that matters for
+      evaluation.  The draw uses the global torch RNG, so seeded runs stay
+      reproducible.
     """
+
+    #: Finite stand-in for the ``+inf`` optimistic estimate.  Mirrors
+    #: ``QECPolicy.OPTIMISTIC_VALUE``; kept as a separate constant rather than
+    #: imported so ``nec.py`` stays free of a dependency on ``mfec.py``.
+    OPTIMISTIC_VALUE = 1e9
+
+    #: Width of the uniform jitter added to each optimistic entry.  See the
+    #: float32-ULP constraint in the class docstring.
+    OPTIMISTIC_JITTER = 1e6
 
     def __init__(
         self,
@@ -1244,11 +1294,20 @@ class DNDPolicy(nn.Module):
         # Unit-norm: a REPO DEVIATION, not the paper. See _embed().
         h         = nn.functional.normalize(h, dim=-1)
         q_values  = self.dnd.estimate_all(h)                   # (B, A)
-        q_values  = torch.where(
-            torch.isinf(q_values),
-            torch.full_like(q_values, 1e9),
-            q_values,
-        )
+
+        # Optimistic entries -> large finite value + per-entry jitter, so the
+        # downstream argmax picks uniformly among the under-populated actions
+        # rather than always returning the lowest index.  See the class
+        # docstring for the measured failure this prevents.
+        optimistic = torch.isposinf(q_values)
+        if optimistic.any():
+            jitter = torch.rand_like(q_values) * self.OPTIMISTIC_JITTER
+            q_values = torch.where(
+                optimistic,
+                self.OPTIMISTIC_VALUE + jitter,
+                q_values,          # finite estimates pass through untouched
+            )
+
         if leading:
             return q_values.reshape(*leading, self.num_actions)
         return q_values.squeeze(0) if q_values.shape[0] == 1 else q_values

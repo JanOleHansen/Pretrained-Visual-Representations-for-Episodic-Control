@@ -43,6 +43,25 @@ class _MockAtariEnv:
         self.batch_size = torch.Size([])
 
 
+def _populate_dnd(alg: NECAlgorithm) -> None:
+    """Give every action more than ``k`` entries, so lookups return finite Q.
+
+    Without this the DND is empty, every action answers with the optimistic
+    ``+inf`` sentinel, and ``DNDPolicy.forward`` jitters those to break the tie
+    (see ``tests/test_nec_optimistic_tiebreak.py``) — so the argmax is random
+    by design and these tests would be measuring the sentinel path rather than
+    the epsilon module.  ``QECPolicy`` makes the same distinction on the MFEC
+    side: only the FINITE path is guaranteed deterministic.
+    """
+    n = alg.k + 3
+    for a in range(alg._num_actions):
+        keys = torch.nn.functional.normalize(
+            torch.randn(n, alg.embedding_dim, dtype=torch.float32), dim=-1
+        )
+        values = torch.full((n,), float(a), dtype=torch.float32)
+        alg.dnd.write_batch(a, keys, values, alg.dnd_lr)
+
+
 def _make(eval_eps: float) -> NECAlgorithm:
     alg = NECAlgorithm(
         device=torch.device("cpu"),
@@ -54,6 +73,7 @@ def _make(eval_eps: float) -> NECAlgorithm:
         eval_eps=eval_eps,
     )
     alg.setup(_MockAtariEnv)
+    _populate_dnd(alg)
     return alg
 
 
@@ -88,7 +108,16 @@ def test_eval_policy_is_stochastic_under_exploration_mode():
 
 
 def test_zero_eval_eps_restores_deterministic_argmax():
-    """eval_eps=0.0 must be an exact no-op, so old runs stay reproducible."""
+    """eval_eps=0.0 must be an exact no-op, so old runs stay reproducible.
+
+    Scoped to a POPULATED DND (``_make`` fills it).  Determinism is guaranteed
+    on the finite-estimate path only: an empty or under-populated table answers
+    ``+inf`` for every action, and ``DNDPolicy`` deliberately jitters those so
+    the argmax does not collapse onto action 0 for a whole rollout.  Asserting
+    determinism on an EMPTY DND — which this test used to do — was asserting
+    exactly that collapse.
+    """
+    torch.manual_seed(0)
     assert len(_actions_under_mode(_make(0.0))) == 1
 
 
