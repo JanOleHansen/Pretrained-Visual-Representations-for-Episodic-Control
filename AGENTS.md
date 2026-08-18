@@ -398,6 +398,37 @@ periodic eval buys you nothing beyond more episodes.
 `BaseTrainer` owns env lifecycle, `evaluate(num_episodes)` (greedy rollout), and
 checkpoint orchestration.
 
+### Paper-ready metrics (logged live, no post-processing)
+
+`evaluate()` and `StepTrainer._training_loop()` emit these so the thesis figures
+come straight off W&B. See README "Paper-ready metrics" for the table.
+
+- `eval/hns` — human-normalised score `(return_mean − random)/(human − random)`.
+  Baselines in `src/utils/atari_scores.py` (Wang et al. 2016 / SPR Table 3, 26
+  Atari 100k games). The game is resolved in `BaseTrainer.__init__` from
+  `run.game`/`game`/`environment.name` via `resolve_game`, with
+  `throw_on_resolution_failure=False` because `run.game` is often the
+  `${hydra:...}` interpolation that raises outside a live Hydra run. Absent (not
+  zero) for a non-benchmark game.
+- `eval/value_return_corr` (+ `eval/value_return_n`) — Pearson corr between the
+  memory's value for the **taken** action and its realised discounted
+  return-to-go, pooled over eval steps. Uses `self.algorithm.gamma`; sentinels
+  (`|v| ≥ 1e8`) and non-finite pairs dropped; needs ≥2 points with non-zero
+  variance or it is omitted. `_taken_action_value` reads `QValueActor`'s
+  `action_value`/`action` and handles categorical and one-hot encodings;
+  returns `None` (metric skipped) when the policy exposes no action-value.
+- `sys/gpu_mem_peak_gb` / `time/elapsed_min` — peak CUDA allocation (counter
+  reset at loop start) and cumulative wall-clock; last values are the run's peak
+  and total. `_training_loop` reads `self.device` via `getattr` so the stub in
+  `tests/test_interval_metrics.py` (which bypasses `setup()`) still runs.
+- `eval/num_episodes` — sample size per eval point; `eval/return_std` is
+  **omitted** at `num_eval_episodes=1` rather than logged as `0.0`.
+
+The **cross-game aggregate** (mean/median/IQM HNS + CIs) is the one thing that
+cannot be a per-run scalar (one run = one game). `scripts/aggregate_results.py`
+pulls the runs and computes it with a stratified bootstrap, recomputing
+`eval/hns` from `eval/return_mean` for runs that predate the metric.
+
 ## File map
 
 ```

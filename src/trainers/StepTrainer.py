@@ -163,6 +163,17 @@ class StepTrainer(BaseTrainer):
         log_every = int(self.trainer_cfg.log_every_n_steps)
         metrics: dict[str, float] = {}
 
+        # Wall-clock start of *this* process's training. On CUDA, reset the peak
+        # memory counter so ``sys/gpu_mem_peak_gb`` reports this run's footprint
+        # rather than a leftover high watermark from setup or an earlier phase.
+        # ``getattr`` because tests drive ``_training_loop`` directly on a stub
+        # that bypasses ``setup()`` and never assigns ``self.device``.
+        loop_start = time.perf_counter()
+        device = getattr(self, "device", None)
+        cuda_device = device if getattr(device, "type", None) == "cuda" else None
+        if cuda_device is not None:
+            torch.cuda.reset_peak_memory_stats(cuda_device)
+
         collector_iter = iter(self.collector)
         while True:
             collect_start = time.perf_counter()
@@ -198,6 +209,16 @@ class StepTrainer(BaseTrainer):
                 metrics["time/speed"] = (
                     batch_frames / total_time if total_time > 0 else 0.0
                 )
+                # Compute-cost metrics for the encoder comparison: cumulative
+                # wall-clock (its last value is the run's total training time)
+                # and the peak GPU allocation (monotonic; its last value is the
+                # run's peak). Both surface directly as W&B run-summary numbers,
+                # so the cost table needs no post-processing.
+                metrics["time/elapsed_min"] = (time.perf_counter() - loop_start) / 60.0
+                if cuda_device is not None:
+                    metrics["sys/gpu_mem_peak_gb"] = (
+                        torch.cuda.max_memory_allocated(cuda_device) / 1e9
+                    )
                 fire_callbacks(
                     TrainerEvent.ON_STEP_END,
                     self.callbacks,

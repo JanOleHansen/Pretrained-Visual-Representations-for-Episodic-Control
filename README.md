@@ -451,6 +451,39 @@ optimistic-initialisation sentinels from episodic-control policies (MFEC/NEC
 substitute ~1e9 for state-actions their memory cannot yet evaluate) rather than
 real returns.
 
+### Paper-ready metrics
+
+These are logged **live, per run** — no post-processing — so the presentation
+figures come straight off W&B. Every one is a plain scalar the W&B UI can plot
+or put in a run-summary table.
+
+| metric | where | what it is |
+|---|---|---|
+| `eval/hns` | every eval | **Human-normalised score** `(return_mean − random)/(human − random)`, the primary Atari 100k metric. Puts every game on one axis. Only logged for the 26 Atari 100k games (baselines in `src/utils/atari_scores.py`, from Wang et al. 2016 / SPR Table 3); silently absent otherwise. |
+| `eval/value_return_corr` | every eval | **kNN retrieval quality**: Pearson correlation between the value the memory assigns the taken action and the discounted return that action actually earned (over `eval/value_return_n` pooled eval steps). The dependent variable of the encoder comparison — a better representation scores higher. Uses the algorithm's own `gamma`; sentinels and non-finite pairs dropped. |
+| `sys/gpu_mem_peak_gb` | every log step | **Peak GPU allocation** (`torch.cuda.max_memory_allocated`, reset at train start). Its last value is the run's peak — the compute-cost axis for the larger PVR encoders. CUDA only. |
+| `time/elapsed_min` | every log step | Cumulative wall-clock; its last value is total training time. Alongside the existing `time/speed` (frames/s). |
+| `eval/num_episodes` | every eval | Sample size behind each eval point. `eval/return_std` is **omitted** (not `0.0`) at `num_eval_episodes=1`, so a single-episode eval does not read as a zero-variance policy. |
+
+The one thing that is *not* a per-run number is the **cross-game aggregate**
+(mean / median / IQM human-normalised score with confidence intervals): each run
+is a single game, so aggregating across games is inherently multi-run. Two ways
+to get it, cheapest first:
+
+- **In W&B, no script:** group runs by `run.encoder` (or `run.group`) and plot
+  the mean of the `eval/hns` summary — a grouped bar of mean HNS per encoder
+  across games and seeds. Enough for the talk.
+- **Publication-grade:** `scripts/aggregate_results.py` pulls the runs via the
+  W&B API and emits mean/median/IQM HNS with 95 % stratified-bootstrap CIs
+  (Agarwal et al. 2021), a LaTeX table, a per-encoder cost table, and optional
+  learning-curve CSVs. It recomputes `eval/hns` from `eval/return_mean` for runs
+  that predate the metric, so **runs finished before this change need no
+  re-running**.
+
+  ```shell
+  python scripts/aggregate_results.py --entity <you> --project <proj> --plot --curves
+  ```
+
 ## Callbacks
 
 The trainer fires events at key points:

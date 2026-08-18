@@ -6,13 +6,16 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+import math
+
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 from src.algorithms.base import BaseAlgorithm
 from src.environments.environment import Environment
 from src.environments.factory import env_worker_device
+from src.utils.atari_scores import human_random, resolve_game
 from src.utils.device import resolve_device
 from src.utils.seeding import derive_seed
 
@@ -104,6 +107,35 @@ class BaseTrainer(ABC):
 
         self._step: int = 0
 
+        #: ``(random, human)`` baseline raw scores for this run's game, or
+        #: ``None`` when the game is not one of the 26 Atari 100k titles (or the
+        #: config names no game at all, as in unit tests). When set,
+        #: ``evaluate()`` logs ``eval/hns`` — the human-normalised score — next
+        #: to the raw return, so cross-game aggregation needs no post-hoc
+        #: rescaling. Resolved from several config fields because the game token
+        #: lives in different places for the per-game (``run.game``) and
+        #: game-generic (top-level ``game`` / the ``ALE/<game>-v5`` env name)
+        #: experiment layouts. See ``src/utils/atari_scores.py``.
+        # ``throw_on_resolution_failure=False``: ``run.game`` is often the Hydra
+        # interpolation ``${hydra:runtime.choices.environment}``, which raises
+        # outside a live Hydra run (e.g. in tests). Fall through to the next
+        # candidate instead of crashing the trainer over a diagnostic metric.
+        def _select(path: str):
+            return OmegaConf.select(
+                cfg, path, default=None, throw_on_resolution_failure=False
+            )
+
+        game = resolve_game(
+            _select("run.game"),
+            _select("game"),
+            _select("environment.name"),
+            _select("eval_environment.name"),
+        )
+        self._game: str | None = game
+        self._hns_ref: tuple[float, float] | None = (
+            human_random(game) if game is not None else None
+        )
+
     def setup(self) -> None:
         """Create environment and set up the algorithm."""
         num_envs = int(self.trainer_cfg.get("num_envs", 1))
@@ -177,19 +209,40 @@ class BaseTrainer(ABC):
         policy = self.algorithm.get_policy()
         self.algorithm.reset_eval_metrics()
 
+        # Discount for the Monte-Carlo return-to-go used by the retrieval-quality
+        # metric below; the algorithm's own gamma (1.0 for MFEC on Atari, 0.99
+        # for NEC) is the value its memory approximates. Stub algorithms in
+        # tests have none, so fall back to the undiscounted sum.
+        gamma = float(getattr(self.algorithm, "gamma", 1.0))
+
         returns: list[float] = []
         lengths: list[int] = []
+        #: Retrieval-quality samples pooled over every eval step of every
+        #: episode: the value the memory assigned to the action actually taken,
+        #: paired with the realised discounted return-to-go from that state.
+        pred_values: list[float] = []
+        realised_returns: list[float] = []
         with torch.no_grad(), set_exploration_type(ExplorationType.MODE):
             for _ in range(num_episodes):
                 td = eval_env.reset()
                 episode_return = 0.0
                 episode_length = 0
+                # Full per-step reward sequence and the memory's value for the
+                # taken action (or None when the policy exposes no action-value,
+                # e.g. a bare test policy). Kept whole so the return-to-go is
+                # computed over every reward even if a value is missing.
+                ep_rewards: list[float] = []
+                ep_values: list[float | None] = []
                 done = False
                 while not done:
-                    td = policy(td.to(self.device)).to(self._env_device)
-                    td = eval_env.step(td)
-                    episode_return += td["next", "reward"].sum().item()
+                    td = policy(td.to(self.device))
+                    value = self._taken_action_value(td)
+                    td = eval_env.step(td.to(self._env_device))
+                    reward = td["next", "reward"].sum().item()
+                    episode_return += reward
                     episode_length += 1
+                    ep_rewards.append(reward)
+                    ep_values.append(value)
                     done = (
                         td["next", "done"].any().item()
                         or td["next", "terminated"].any().item()
@@ -198,22 +251,112 @@ class BaseTrainer(ABC):
                 returns.append(episode_return)
                 lengths.append(episode_length)
 
+                # Discounted return-to-go G_t = r_t + gamma*G_{t+1}, matched to
+                # the value the memory reported for the action taken at t.
+                g = 0.0
+                for reward, value in zip(reversed(ep_rewards), reversed(ep_values)):
+                    g = reward + gamma * g
+                    if value is not None:
+                        pred_values.append(value)
+                        realised_returns.append(g)
+
         eval_env.close()
         t = torch.tensor(returns, dtype=torch.float32)
         metrics = {
             "eval/return_mean": t.mean().item(),
-            # Unbiased std needs n >= 2; with num_eval_episodes=1 torch returns
-            # NaN, which loggers happily plot as a hole in the chart.
-            "eval/return_std": t.std().item() if t.numel() > 1 else 0.0,
             "eval/return_min": t.min().item(),
             "eval/return_max": t.max().item(),
             # Separates "the policy plays badly" from "the episode ended early":
             # a return that collapses while the length holds is a scoring
             # problem, both collapsing together is a dying-agent problem.
             "eval/episode_length": float(sum(lengths)) / len(lengths),
+            # Sample size behind this point, so return_{mean,min,max} can be read
+            # with the right uncertainty — at num_eval_episodes=1 the three
+            # order statistics are necessarily one number.
+            "eval/num_episodes": float(len(returns)),
         }
+        # Unbiased std needs n >= 2. At n=1 it is undefined; omit it rather than
+        # log a fabricated 0.0, which would read as a perfectly consistent
+        # policy (and leaves a genuine gap in the chart instead).
+        if t.numel() > 1:
+            metrics["eval/return_std"] = t.std().item()
+
+        # Human-normalised score: the primary cross-game metric. Logged here so
+        # every game lands on one axis and the aggregate needs no post-hoc
+        # rescaling. Absent when the game is not one of the 26 Atari 100k titles.
+        if self._hns_ref is not None:
+            random_score, human_score = self._hns_ref
+            metrics["eval/hns"] = (
+                (metrics["eval/return_mean"] - random_score)
+                / (human_score - random_score)
+            )
+
+        # kNN retrieval quality: how well the value the memory retrieves for the
+        # taken action tracks the return that action actually earned. This is
+        # the dependent variable of the encoder comparison — a representation
+        # whose neighbourhoods group states of similar value scores higher.
+        corr = self._pearson(pred_values, realised_returns)
+        if corr is not None:
+            metrics["eval/value_return_corr"] = corr
+            metrics["eval/value_return_n"] = float(len(pred_values))
+
         metrics.update(self.algorithm.eval_metrics())
         return metrics
+
+    @staticmethod
+    def _taken_action_value(td) -> float | None:
+        """Value the policy assigned to the action it actually took, or ``None``.
+
+        Reads the ``QValueActor`` outputs (``action_value`` = per-action values,
+        ``action`` = the chosen action) and returns the value of the taken
+        action — using the *taken* action rather than the greedy one so an
+        epsilon-random eval step still yields a truthful ``(value, return)``
+        pair. Handles both categorical (integer index) and one-hot action
+        encodings, and returns ``None`` when the policy exposes no action-value
+        (a plain test policy) so the caller simply skips the sample.
+        """
+        action_value = td.get("action_value", default=None)
+        action = td.get("action", default=None)
+        if action_value is None or action is None:
+            return None
+        av = action_value.detach().reshape(-1, action_value.shape[-1]).float()
+        n_rows, n_actions = av.shape
+        act = action.detach()
+        if act.numel() == n_rows:                 # categorical index
+            idx = act.reshape(n_rows, 1).long()
+            chosen = av.gather(-1, idx).squeeze(-1)
+        elif act.numel() == n_rows * n_actions:   # one-hot
+            chosen = (av * act.reshape(n_rows, n_actions).float()).sum(-1)
+        else:
+            return None
+        return float(chosen.mean().item())
+
+    @staticmethod
+    def _pearson(xs: list[float], ys: list[float]) -> float | None:
+        """Pearson correlation of paired samples, or ``None`` if undefined.
+
+        Drops non-finite pairs and the optimistic-initialisation sentinels that
+        episodic-control memories report (~1e9) for state-actions they cannot
+        yet evaluate, then requires at least two points with non-zero variance
+        in both series. Pure Python so it carries no NumPy dependency into the
+        trainer.
+        """
+        pairs = [
+            (x, y)
+            for x, y in zip(xs, ys)
+            if math.isfinite(x) and math.isfinite(y) and abs(x) < 1e8
+        ]
+        n = len(pairs)
+        if n < 2:
+            return None
+        mean_x = sum(p[0] for p in pairs) / n
+        mean_y = sum(p[1] for p in pairs) / n
+        sxx = sum((p[0] - mean_x) ** 2 for p in pairs)
+        syy = sum((p[1] - mean_y) ** 2 for p in pairs)
+        sxy = sum((p[0] - mean_x) * (p[1] - mean_y) for p in pairs)
+        if sxx <= 0.0 or syy <= 0.0:
+            return None
+        return sxy / math.sqrt(sxx * syy)
 
     def save_checkpoint(self, path: str | Path) -> None:
         """Save algorithm state + trainer step."""
