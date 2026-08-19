@@ -894,6 +894,21 @@ resolves to the same entry and returns the same value. Read
 `eval/memory_hit_rate`, not `eval/exact_hit_rate`, when comparing encoders.
 Details and the reason lowering `key_scale` is *not* the fix are in AGENTS.md.
 
+> **The rescue only holds at true FP32, and that is not the PyTorch default.**
+> `torch.backends.cudnn.allow_tf32` defaults to `True`, running every
+> convolution at a 10-bit mantissa (unit roundoff ~4.9e-4 vs FP32's ~6e-8) —
+> about **16x over** the rescue's per-coordinate budget for `resnet18`
+> (`3e-5·(1+‖q‖)` ≈ 7.8e-4 in L2 at `‖φ‖` ≈ 25). Left at the default, the
+> `mfec/resnet` Ms. Pac-Man run logged `eval/memory_hit_rate` **identically
+> 0.000** on every seed: both retrieval paths dead, every Q-estimate a
+> k-neighbour mean, `eval/return_mean` pinned at random play (~400) while
+> `train/episode_reward` passed 2000. `src/encoders/factory.py` now pins FP32
+> convolutions for every MFEC encoder before φ is built. The PVM arms are
+> correspondingly slower, and **checkpoints written before the change cannot be
+> resumed across it** — their QEC keys are from the TF32 regime. Note
+> `key b/s = 0.000` in the table above does *not* distinguish the safe drift
+> regime from the fatal one; only the L2 drift against the rescue budget does.
+
 Note the flip side of the same table: all three PVMs beat the random projection
 on both discriminability columns, with CLIP best on relative contrast.
 
@@ -1255,9 +1270,15 @@ A gap where `eval/return_mean` is well below `train/episode_reward` **at the
 same `eval/episode_length`** is a scoring-rate gap, not a survival gap, and
 points at the policy being evaluated rather than at the environment. The two
 Ms. Pac-Man env configs and `BaseTrainer.evaluate`'s rollout loop are verified
-byte-identical to a plain `env.rollout`, and `NoopResetEnv` alone produces
-exactly zero return variance on this game — so non-zero `eval/return_std` is
-proof that evaluation ran with a real ε.
+byte-identical to a plain `env.rollout`.
+
+> **Retracted:** this used to add that `NoopResetEnv` alone produces exactly
+> zero return variance on this game, and therefore that a non-zero
+> `eval/return_std` proves evaluation ran with a real ε. It does not. The 1–30
+> no-op draw moves the start state — 7 of 8 resets give a different first
+> observation, and one fixed action sequence returns `[380, 170, 180, 340]` — so
+> eval returns vary with ε off. Read `eval/epsilon` instead. This is also why
+> every MFEC experiment now uses `num_eval_episodes: 5` rather than 1.
 
 ## Adding a new algorithm
 

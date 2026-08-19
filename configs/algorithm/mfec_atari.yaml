@@ -33,9 +33,11 @@ annealing_frames: 1
 # Evaluation exploration rate — 0.0, i.e. eval/* is a pure argmax rollout.
 #
 # This used to be 0.005 so that num_eval_episodes produced more than one
-# distinct sample (the ALE is deterministic at repeat_action_probability=0.0
-# and NoopResetEnv does not change Ms. Pac-Man's score, so a greedy rollout
-# repeats itself).  Measured cost of doing it that way, one QEC, 6 episodes:
+# distinct sample — believing the ALE deterministic at
+# repeat_action_probability=0.0 *and* NoopResetEnv unable to change
+# Ms. Pac-Man's score, so that a greedy rollout repeats itself.  The second
+# half of that is FALSE (see below); eps is still not the way to buy samples.
+# Measured cost of doing it that way, one QEC, 6 episodes:
 #
 #   eval_eps=0.000  [1440, 1440, 1440, 1440, 1440, 1440]  mean 1440
 #   eval_eps=0.005  [ 490, 1440,  870,  550, 1440, 1440]  mean 1038
@@ -46,7 +48,18 @@ annealing_frames: 1
 # reports is the *collector's* score and is already logged as
 # train/episode_reward — nothing is lost by evaluating greedily here.
 #
-# Because eval is now deterministic, set trainer.num_eval_episodes: 1.
+# CORRECTION — eval is NOT deterministic, and this used to say
+# "set trainer.num_eval_episodes: 1" on the strength of that.  NoopResetEnv
+# draws 1-30 noops per reset and Ms. Pac-Man does not absorb them: measured on
+# atari_mfec_eval_rgb, 7 of 8 resets give a different first observation, and a
+# single fixed action sequence returns [380, 170, 180, 340].  Every eval point
+# was therefore one sample from a real distribution, which is what produced the
+# identical, wildly swinging eval/return_{min,mean,max} curves and left
+# eval/return_std undefined.  Every MFEC experiment now sets
+# trainer.num_eval_episodes: 5, matching NEC and configs/train.yaml.
+#
+# Note this does NOT reopen eval_eps: the 1440-vs-1038 measurement above is
+# about eps derailing the policy, not about sample count, and stands unchanged.
 eval_eps: 0.0
 
 # Divisible by every num_envs we use (1/2/4/8/16) so the collector does not

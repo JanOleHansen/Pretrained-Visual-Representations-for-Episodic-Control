@@ -146,9 +146,10 @@ class MFECAlgorithm(BaseAlgorithm):
     ``eval_eps`` used to default to the paper's 0.005 so that
     ``num_eval_episodes`` produced more than one distinct sample — the ALE is
     deterministic here (``repeat_action_probability=0.0``) and ``NoopResetEnv``
-    does not change Ms. Pac-Man's score, so a greedy rollout is the same
-    episode every time.  That reasoning is sound but the cure is worse than the
-    disease.  Measured on one QEC (Ms. Pac-Man, 51 k frames, 6 episodes each):
+    was believed not to change Ms. Pac-Man's score, so a greedy rollout would be
+    the same episode every time.  The ``NoopResetEnv`` half of that is wrong
+    (see below), and the cure was worse than the disease regardless.  Measured
+    on one QEC (Ms. Pac-Man, 51 k frames, 6 episodes each):
 
         eval_eps=0.000   [1440, 1440, 1440, 1440, 1440, 1440]  mean 1440
         eval_eps=0.005   [ 490, 1440,  870,  550, 1440, 1440]  mean 1038
@@ -168,11 +169,29 @@ class MFECAlgorithm(BaseAlgorithm):
       while max climbed past 4000);
     * ``eval/return_std`` measures ε-sensitivity, not policy variability.
 
-    At ``eval_eps=0.0`` every eval episode is identical, so set
-    ``num_eval_episodes: 1`` — ``eval/return_{min,mean,max}`` collapse onto one
-    honest curve and evaluation costs N times less.  Nothing is lost: the
-    ε=0.005 score the paper reports is what the *collector* already produces,
-    and it is logged as ``train/episode_reward``.
+    So ``eval_eps`` stays 0.0.  Nothing is lost: the ε=0.005 score the paper
+    reports is what the *collector* already produces, and it is logged as
+    ``train/episode_reward``.
+
+    ``num_eval_episodes`` is a separate question — and the old answer was wrong
+    -----------------------------------------------------------------------
+    This used to conclude "at ``eval_eps=0.0`` every eval episode is identical,
+    so set ``num_eval_episodes: 1``".  It is not identical.  ``NoopResetEnv``
+    draws 1–30 no-ops on every reset and Ms. Pac-Man does not absorb them:
+    measured on ``atari_mfec_eval_rgb``, **7 of 8 resets produce a different
+    first observation**, and one fixed action sequence returns
+    ``[380, 170, 180, 340]``.  A greedy policy is closed-loop and may re-converge
+    where an open-loop action stream cannot, but the start state genuinely
+    varies, so ``N = 1`` was a single sample from a real distribution rather
+    than the whole of a degenerate one.
+
+    That is what produced the reported symptom: ``eval/return_{min,mean,max}``
+    logged as one identical curve swinging several hundred points between
+    adjacent eval steps, with ``eval/return_std`` never defined (``evaluate``
+    omits it at ``n = 1``).  Every MFEC experiment now sets
+    ``num_eval_episodes: 5``, matching the NEC experiments and
+    ``configs/train.yaml``'s default so every ``eval/return_mean`` in the study
+    carries the same standard error.
     """
 
     def __init__(

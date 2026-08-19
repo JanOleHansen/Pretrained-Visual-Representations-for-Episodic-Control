@@ -5,15 +5,20 @@ Bug being guarded against
 ``MFECAlgorithm.get_policy()`` used to return a bare argmax chain
 (``_EmbedModule -> QValueActor``) with no exploration at all.  Combined with
 ``repeat_action_probability=0.0`` — which MFEC requires, since Eq. (1) is
-max-over-returns (footnote 1) — the ALE is fully deterministic, and Ms. Pac-Man's
-opening is insensitive to ``NoopResetEnv``.  So every evaluation episode replayed
-the *same* trajectory:
+max-over-returns (footnote 1) — the ALE is fully deterministic.  So every
+evaluation episode replayed the *same* trajectory:
 
     eval/return_std  == 0.0 exactly, for the whole run
     eval/return_min  == eval/return_mean == eval/return_max
 
 i.e. ``num_eval_episodes: 5`` bought one sample at five times the cost, and the
 eval curve could never show variance.  Measured on Ms. Pac-Man with one QEC:
+
+(That measurement is about *this particular policy* re-converging, and was later
+over-read into "``NoopResetEnv`` cannot change the start state", which is false —
+see "``num_eval_episodes`` was 1 for a wrong reason" in AGENTS.md.  It does not
+affect what this file tests, which is that ``eval_eps`` reaches the eval rollout
+at all.)
 
     get_policy()         / MODE     mean=380.0  std=0.000   (5/5 identical)
     get_explore_policy() / RANDOM   mean=448.0  std=248.4

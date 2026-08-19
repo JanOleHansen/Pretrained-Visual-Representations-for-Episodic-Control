@@ -145,6 +145,67 @@ def test_unknown_encoder_still_raises_value_error():
 
 
 # ---------------------------------------------------------------------------
+# 2b. TF32 convolutions must be off before any φ is built
+#
+# `torch.backends.cudnn.allow_tf32` defaults to True, which runs convolutions
+# at a 10-bit mantissa (unit roundoff ~4.9e-4).  MFEC keys its memory on φ's
+# bits and the collector (num_envs rows) and BaseTrainer.evaluate (1 row) hit
+# different cuDNN algorithms, so at TF32 the drift exceeds QEC's near-exact
+# rescue budget (3e-5*(1+‖q‖) ≈ 7.8e-4 for resnet18) by ~16x per coordinate.
+# Measured consequence when this was left at the default: eval/memory_hit_rate
+# identically 0.000 for a whole run and eval/return_mean pinned at random play
+# while train/episode_reward climbed past 2000.  See
+# src/encoders/factory.pin_fp32_conv_precision.
+# ---------------------------------------------------------------------------
+
+def test_building_any_encoder_pins_fp32_convolutions(monkeypatch):
+    """Every branch, not just resnet — a ViT's patch embedding is a Conv2d too."""
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", True)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+
+    make_encoder("random_projection", obs_flat_dim=16, in_channels=1, state_dim=4)
+
+    assert torch.backends.cudnn.allow_tf32 is False, (
+        "make_encoder() left cuDNN's TF32 convolutions enabled; MFEC's exact-match "
+        "and near-exact paths cannot survive a 10-bit mantissa across batch shapes."
+    )
+    assert torch.backends.cuda.matmul.allow_tf32 is False
+
+
+def test_the_pin_runs_before_the_encoder_is_constructed(monkeypatch):
+    """Ordering matters: a backbone may run a forward pass while initialising."""
+    order: list[str] = []
+
+    monkeypatch.setattr(
+        "src.encoders.factory.pin_fp32_conv_precision",
+        lambda: order.append("pin"),
+    )
+
+    class _FakeResNetEncoder:
+        def __init__(self, **kwargs):
+            order.append("encoder")
+            self.state_dim = 512
+
+    monkeypatch.setattr(
+        "src.encoders.factory.ResNetEncoder", _FakeResNetEncoder
+    )
+    make_encoder("resnet", obs_flat_dim=16, in_channels=3, state_dim=512)
+
+    assert order == ["pin", "encoder"]
+
+
+def test_the_pin_is_a_noop_without_cuda(monkeypatch):
+    """It must not raise on a CPU-only build — both flags are plain globals."""
+    from src.encoders.factory import pin_fp32_conv_precision
+
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", True)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+
+    pin_fp32_conv_precision()
+    assert torch.backends.cudnn.allow_tf32 is False
+
+
+# ---------------------------------------------------------------------------
 # 3. The resnet branch reaches ResNetEncoder with the right arguments
 # ---------------------------------------------------------------------------
 
@@ -394,10 +455,15 @@ def _ablation_cfgs():
 
 
 def test_every_arm_shares_one_training_budget():
+    # num_eval_episodes is in here because a per-arm N gives one arm's
+    # eval/return_mean a different standard error from the arms it is plotted
+    # against — the exact failure the NEC `nature` baseline hit at 10 vs the
+    # PVM arms' 5.  tests/test_nec_ablation_parity.py pins it on that side.
     cfgs = _ablation_cfgs()
     budgets = {
         arm: (c.trainer.total_frames, c.trainer.num_envs,
-              c.trainer.eval_every_n_steps, c.algorithm.buffer_size)
+              c.trainer.eval_every_n_steps, c.trainer.num_eval_episodes,
+              c.algorithm.buffer_size)
         for arm, c in cfgs.items()
     }
     assert len(set(budgets.values())) == 1, (

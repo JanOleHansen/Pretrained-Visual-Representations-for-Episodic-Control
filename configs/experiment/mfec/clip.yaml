@@ -86,7 +86,21 @@ trainer:
   num_envs: 4
   log_every_n_steps: 5_000
   eval_every_n_steps: 10_000
-  # eval_eps=0.0 (see configs/algorithm/mfec_atari.yaml) makes every eval
-  # episode identical on a deterministic ALE, so N>1 buys N copies of one
-  # number at N times the cost.
-  num_eval_episodes: 1
+  # 5, matching every NEC experiment and configs/train.yaml's default, so each
+  # eval/return_mean in the study carries the same sample size and the same
+  # standard error (a per-arm N is the failure mode AGENTS.md records for the
+  # NEC `nature` baseline, which ran 10 against the PVM arms' 5).
+  #
+  # This was 1, justified by "eval_eps=0.0 makes every eval episode identical
+  # on a deterministic ALE".  That premise is FALSE.  NoopResetEnv draws 1-30
+  # noops per reset and Ms. Pac-Man is not insensitive to them: measured on
+  # atari_mfec_eval_rgb, 7 of 8 resets give a different first observation, and
+  # one fixed action sequence returns [380, 170, 180, 340].  So every eval
+  # point was a single sample from a real distribution -- which is why
+  # eval/return_{min,mean,max} logged as one identical, wildly swinging curve
+  # and why eval/return_std was never defined (BaseTrainer omits it at N=1).
+  #
+  # eval_eps stays 0.0: that argument is separate and still stands (see
+  # configs/algorithm/mfec_atari.yaml -- eps at eval understates the policy
+  # ~30% because MFEC cannot absorb one off-trajectory action).
+  num_eval_episodes: 5

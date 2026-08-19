@@ -1188,21 +1188,75 @@ separation, which merges genuinely distinct states into one key. That is a
 silently wrong Q-value, strictly worse than the current behaviour. Nor is
 "accumulate in float64" actionable: it works for one matmul, not a ViT.
 
-**What actually happens, and why runs still work.** The consequences are
-bounded and were verified:
+**What actually happens.** The consequences are:
 
 - **Training is unaffected.** The collector embeds `num_envs` rows on every
   policy call and `step()` reuses those cached embeddings, so every QEC write
   and every train-time query uses the same batch shape. `train/exact_hit_rate`
   is real.
-- **Evaluation loses only the O(1) path.** `estimate_all` falls through to the
-  near-exact rescue, which accepts the top-1 neighbour when
-  `‖q − s₁‖ ≤ 3e-5·(1+‖q‖)`. Drift is ~1e-6 while the nearest *distinct* frame
-  sits at ~30% of the mean pairwise distance, so the rescue resolves to the
-  same entry the dict would have found. It returns the identical stored value,
-  just via kNN instead of a hash lookup.
+- **Evaluation loses only the O(1) path — *if and only if* convolutions run at
+  true FP32.** `estimate_all` falls through to the near-exact rescue, which
+  accepts the top-1 neighbour when `‖q − s₁‖ ≤ 3e-5·(1+‖q‖)`. At FP32 the drift
+  is ~1e-6 while the nearest *distinct* frame sits at ~30% of the mean pairwise
+  distance, so the rescue resolves to the same entry the dict would have found
+  and returns the identical stored value, just via kNN instead of a hash lookup.
 - **`eval/exact_hit_rate` reads 0 for every PVM arm** and is not comparable
   across encoders. Use `eval/memory_hit_rate`, which counts both paths.
+
+#### CORRECTION: the rescue does NOT survive TF32 — it must be pinned off
+
+The paragraph above was written against an assumed ~1e-6 drift. That is an
+**FP32** number, and `torch.backends.cudnn.allow_tf32` **defaults to `True`**:
+on Ampere and later every convolution runs at TF32's 10-bit mantissa, unit
+roundoff 2⁻¹¹ ≈ **4.9e-4** per operation rather than FP32's 2⁻²⁴ ≈ 6e-8.
+(`torch.backends.cuda.matmul.allow_tf32` defaults to `False`, so conv backbones
+are hit hardest — but a ViT's patch embedding is a `Conv2d`, so no arm is
+exempt. `random_projection` has no convolution and is unaffected.)
+
+Measured against the rescue's own budget, on 400 real Ms. Pac-Man frames with
+`resnet18`:
+
+| quantity | value |
+|---|---|
+| `‖φ(o)‖` | 25.0 |
+| rescue budget `3e-5·(1+‖q‖)` | 7.8e-4 in L2 |
+| ...per coordinate over `d = 512` | ~3.1e-5 relative |
+| **TF32 unit roundoff, one operation** | **4.9e-4 — ~16x over budget** |
+| nearest *distinct* frame | 0.307 (400x headroom; false merges were never the risk) |
+
+**Measured consequence on the `mfec/resnet` Ms. Pac-Man run (5 seeds, 100k
+decisions):** `eval/memory_hit_rate` identically **0.000** at every eval point
+on every seed — dict path *and* rescue dead. All `|A|` Q-estimates per frame
+were k-neighbour means over nearly the same neighbourhood, so the argmax was
+noise and `eval/return_mean` sat at random play (~400 against MsPacman's 307.3)
+while `train/episode_reward` climbed past 2000. `eval/exact_minus_knn_value` is
+absent from those runs for the same reason: `value_stats` had zero samples on
+the exact side, which is also why the guard below did not catch it.
+
+Note `eval/value_return_corr` read a healthy **0.6–0.85** throughout. It does
+not flag this: kNN neighbours are temporally local, so their stored returns
+correlate with the realised return-to-go for the trivial reason that both decay
+toward episode end. It measures "does the memory know how far into the episode
+I am", not "does the memory discriminate between actions".
+
+**Fixed by `src/encoders/factory.pin_fp32_conv_precision()`**, called at the top
+of `make_encoder` — which is MFEC's and only MFEC's φ factory, so NEC/DQN/DDPG/
+A2C conv throughput is untouched. Applied to every arm, not just `resnet`,
+because a per-arm numerics regime would make a between-arm read a comparison of
+float precisions. Two costs, both intended: PVM arms get slower (TF32 is ~2x on
+conv-bound work and φ is the bottleneck), and **checkpoints do not cross the
+change** — a QEC written under TF32 holds keys the FP32 process will never
+reproduce, so re-run rather than resume. Guarded by
+`tests/test_encoder_factory.py::test_building_any_encoder_pins_fp32_convolutions`
+and `::test_the_pin_runs_before_the_encoder_is_constructed`.
+
+**`key b/s = 0.000` in the table above is not a sufficient diagnostic.** At
+`d = 512` it reads 0.000 for any drift above ~1e-10, so it cannot distinguish
+"1e-6, rescue fine" from "1e-2, rescue dead" — the two regimes that decide
+whether a run measures anything. `scripts/encoder_diagnostics.py` reports only
+the key rate; the number that matters is the **L2 drift between batch shapes
+against `3e-5·(1+‖q‖)`**. Measure that before trusting any new conv-carrying
+encoder.
 
 `QEC.value_stats` therefore counts near-exact rescues on the *exact* side.
 Keying it off `_lookup_exact` (dict hits only) omitted
@@ -1502,10 +1556,11 @@ Guarded by `tests/test_mfec_eval_policy.py`.
 
 `eval_eps` was 0.005 (Blundell et al. §4.1) so that `num_eval_episodes` produced
 more than one distinct sample: MFEC requires `repeat_action_probability=0.0`, so
-ALE is deterministic, `NoopResetEnv` does not change Ms. Pac-Man's score, and a
-greedy rollout repeats itself exactly. All of that is still true — but the cure
-was worse than the disease. Measured against one QEC (Ms. Pac-Man, 51 k frames,
-6 episodes each):
+ALE is deterministic, `NoopResetEnv` was believed not to change Ms. Pac-Man's
+score, and a greedy rollout would repeat itself exactly. The `NoopResetEnv` half
+is **false** — see "`num_eval_episodes` was 1 for a wrong reason" below — and
+the cure was worse than the disease regardless. Measured against one QEC
+(Ms. Pac-Man, 51 k frames, 6 episodes each):
 
 | `eval_eps` | returns | mean | min |
 |---|---|---|---|
@@ -1529,11 +1584,40 @@ Nothing is lost by evaluating greedily: the ε = 0.005 score the paper reports i
 the **collector's**, and it is already logged as `train/episode_reward` — which
 this file elsewhere already names as the paper-comparable metric.
 
-Because eval is deterministic, every `configs/experiment/mfec/*.yaml` sets
-`num_eval_episodes: 1`. `eval/return_{min,mean,max}` collapse onto one honest
-curve, `eval/return_std` is 0, and evaluation costs N times less. **That
-signature is now expected, not a bug** — the bug it used to indicate (a stock
-`EGreedyModule` no-op) is covered by the tests above.
+#### `num_eval_episodes` was 1 for a wrong reason — MEASURED
+
+Every `configs/experiment/mfec/*.yaml` used to set `num_eval_episodes: 1`,
+justified by "eval is deterministic, so N > 1 buys N copies of one number".
+**The premise does not hold.** `NoopResetEnv(noops=30, random=True)` draws 1–30
+no-ops on every reset, and Ms. Pac-Man does not absorb them. Measured on
+`atari_mfec_eval_rgb`:
+
+| probe | result |
+|---|---|
+| distinct first observations over 8 resets | **7 / 8** |
+| return under one *fixed* 600-action sequence, 4 resets | `[380, 170, 180, 340]` |
+
+A closed-loop greedy policy may partly re-converge where an open-loop action
+stream cannot — which is probably what the earlier `eval/return_std == 0`
+measurement saw — but the **start state genuinely varies**, so `N = 1` was one
+sample from a real distribution, not the whole of a degenerate one.
+
+The reported symptom is exactly that: on the `mfec/resnet` Ms. Pac-Man runs
+`eval/return_{min,mean,max}` logged as one identical curve swinging several
+hundred points between adjacent eval steps, and `eval/return_std` was never
+defined at all (`BaseTrainer.evaluate` omits it at `n = 1` rather than
+fabricating a 0.0).
+
+**Every MFEC experiment now sets `num_eval_episodes: 5`**, matching all eleven
+NEC experiments and `configs/train.yaml`'s default, so every `eval/return_mean`
+in the study carries the same sample size and the same standard error. A per-arm
+`N` is a real failure mode this repo has already hit once — see the NEC `nature`
+baseline, which ran 10 against the PVM arms' 5. Note eval episodes run at batch
+size 1, the slowest φ path, so this is not free: budget ~5x the previous eval
+cost per run, on top of the FP32 conv pin.
+
+This does **not** reopen `eval_eps`. The 1440-vs-1038 measurement above is about
+ε derailing the policy, not about sample count, and stands unchanged.
 
 Raise `eval_eps` only to deliberately measure ε-robustness, and then read
 `eval/return_mean` as such. Guarded by `tests/test_mfec_estimator_gap.py`.
@@ -2230,10 +2314,17 @@ reports `eval/epsilon` next to the returns. Guarded by
 
 Note this is *not* the CPU/CUDA observation-drift failure MFEC hits
 (`env_worker_device`): both env configs and `BaseTrainer.evaluate`'s manual
-rollout loop were verified byte-identical to `env.rollout` on Ms. Pac-Man, and
-`NoopResetEnv` alone produces **exactly zero** return variance there — so a
-non-zero `eval/return_std` is proof that eval ran with a real ε, not proof
-that episodes were decorrelated by the noop reset.
+rollout loop were verified byte-identical to `env.rollout` on Ms. Pac-Man.
+
+~~`NoopResetEnv` alone produces **exactly zero** return variance there — so a
+non-zero `eval/return_std` is proof that eval ran with a real ε, not proof that
+episodes were decorrelated by the noop reset.~~ **Retracted.** That was measured
+from one closed-loop policy's returns, and it does not generalise: the no-op
+draw *does* move the start state (7 of 8 resets give a different first
+observation on `atari_mfec_eval_rgb`, and one fixed action sequence returns
+`[380, 170, 180, 340]` — see "`num_eval_episodes` was 1 for a wrong reason").
+A non-zero `eval/return_std` is therefore **not** proof that ε was on. Read
+`eval/epsilon`, which `eval_metrics()` logs for exactly this purpose.
 
 ### 2. N-step returns (per-env, sliding window)
 
