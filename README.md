@@ -360,7 +360,8 @@ configs/
 │       ├── nature.yaml     <- NatureDQN trunk + dense layer (default)
 │       ├── dinov2_finetune.yaml <- finetunable DINOv2 ViT (weights_path required)
 │       ├── clip_finetune.yaml   <- finetunable CLIP ViT-B-32 (needs the `clip` extra)
-│       └── mae_finetune.yaml    <- finetunable MAE ViT-B/16 (needs the `mae` extra)
+│       ├── mae_finetune.yaml    <- finetunable MAE ViT-B/16 (needs the `mae` extra)
+│       └── resnet_finetune.yaml <- finetunable ImageNet ResNet-18 (no extra needed)
 ├── environment/
 │   ├── cartpole.yaml       <- env name + transforms
 │   ├── pong_train.yaml     <- Pong with EndOfLife + Sign + VecNorm (training)
@@ -925,6 +926,7 @@ separate systems that should not be merged. NEC's φ is a Hydra config group,
 | `dinov2_finetune` | `src.networks.DINOv2Embedding` — DINOv2 ViT-S/14, backbone **not** frozen | the self-supervised PVM arm; bundled as `experiment/nec/{mspacman,qbert,frostbite}_dinov2.yaml` (see below) |
 | `clip_finetune` | `src.networks.CLIPEmbedding` — CLIP ViT-B-32 vision tower, **not** frozen | the contrastive PVM arm; bundled as `experiment/nec/{mspacman,qbert,frostbite}_clip.yaml`. Needs `uv sync --extra clip` (see below) |
 | `mae_finetune` | `src.networks.MAEEmbedding` — MAE ViT-B/16, **not** frozen | the **reconstruction** PVM arm — the only one whose objective is not a similarity objective; bundled as `experiment/nec/{mspacman,qbert,frostbite}_mae.yaml`. Needs `uv sync --extra mae` (see below) |
+| `resnet_finetune` | `src.networks.ResNetEmbedding` — ImageNet ResNet-18, **not** frozen, BatchNorm held at its running statistics | the **supervised** PVM arm — the only one pretrained on labels; bundled as `experiment/nec/{mspacman,qbert,frostbite}_resnet.yaml`. Needs no optional extra (see below) |
 
 ```shell
 # Standard encoder (this is what every experiment/nec/*.yaml already does):
@@ -935,19 +937,29 @@ python src/train.py experiment=nec/pong algorithm/embedding_network=nature   # e
 python src/train.py experiment=nec/pong algorithm/embedding_network=<name>
 ```
 
-### The NEC encoder ablation — three games x four encoders
+### The NEC encoder ablation — three games x five encoders
 
-The twelve bundled arms are `experiment=nec/{mspacman,qbert,frostbite}` (the
-paper's ConvNet), `..._dinov2`, `..._clip` and `..._mae`. Each one is a complete
-config; they do not compose with each other, which is why the shared settings
-are repeated verbatim in all twelve files.
+The fifteen bundled arms are `experiment=nec/{mspacman,qbert,frostbite}` (the
+paper's ConvNet), `..._dinov2`, `..._clip`, `..._mae` and `..._resnet`. Each one
+is a complete config; they do not compose with each other, which is why the
+shared settings are repeated verbatim in all fifteen files.
 
-The three PVM arms are not three flavours of one idea. `dinov2_finetune` and
-`clip_finetune` both optimise a **similarity** objective (self-distilled view
-agreement, image-text cosine); `mae_finetune`'s optimises masked **pixel
-reconstruction**, and nothing in that loss ever compares two images. It is the
-arm that turns a list of backbones into a test of what the pretraining
-objective does to the geometry of an episodic-memory key.
+The four PVM arms are not four flavours of one idea — each varies the
+**pretraining objective**, which is the causal variable the study is about:
+
+| arm | objective | compares two images? | labels? |
+|---|---|---|---|
+| `dinov2_finetune` | self-distilled view agreement | yes | no |
+| `clip_finetune` | image-text contrastive | yes | weak (captions) |
+| `mae_finetune` | masked pixel reconstruction | **no** | no |
+| `resnet_finetune` | ImageNet-1k classification | no | **yes** |
+
+`mae_finetune` is the arm that separates "similarity" from "not similarity";
+`resnet_finetune` is the arm that separates "labels" from "no labels", and it is
+also the one whose pretraining distribution is furthest from the task — an
+ImageNet classifier is trained to be *invariant* to the small positional shifts
+that distinguish two Atari states, which is a plausible disadvantage for a
+representation used as a nearest-neighbour memory key.
 
 | game | env pair | \|A\| | raw-frame repeat | MFEC `exact_hit_rate` |
 |---|---|---|---|---|
@@ -1249,6 +1261,74 @@ independence, gradients into the transformer blocks, NEC end-to-end), plus a
 pretrained-weights tier (`MAE_WEIGHTS=` or `NEC_MAE_DOWNLOAD=1`) that pins the
 `pos_embed` resampling and the local-file path. **Whether it beats `nature`,
 `dinov2_finetune` or `clip_finetune` is untested** — that is the experiment.
+
+### `resnet_finetune` — a finetuned ImageNet ResNet
+
+The **supervised** arm, and the counterpart to MFEC's frozen `encoder_name=
+resnet`. `src.networks.ResNetEmbedding` takes a torchvision ResNet-18, replaces
+the 1000-way `fc` with `nn.Identity`, and trains the trunk end-to-end with the
+DND behind a 1x1 channel adapter and a `Linear(512, embedding_dim)` head.
+
+**Why this arm exists.** The other three PVMs learn without labels. This one is
+trained on ImageNet-1k *categories*, so it is what makes "supervised" a level of
+the pretraining-objective variable rather than a gap in it. It is also the arm
+with the sharpest a-priori reason to do **badly**: an ImageNet classifier is
+trained to be invariant to small positional shifts, and a small positional shift
+is exactly what distinguishes two Ms. Pac-Man states. A representation used as a
+nearest-neighbour memory key wants the opposite. A mid- or low-ranking result
+here is the prediction, not a defect.
+
+```shell
+python src/train.py experiment=nec/mspacman_resnet     # bundled
+python src/train.py experiment=nec/pong \
+    algorithm/embedding_network=resnet_finetune run.encoder=resnet
+```
+
+**No optional dependency.** torchvision is a core dependency, so unlike the
+`clip` (`open_clip_torch`) and `mae` (`timm`) arms this needs no `uv sync
+--extra`. The import is still deferred into `__init__`, because
+`src/networks.py` is imported by every DQN/DDPG/A2C config too.
+
+**BatchNorm is the design problem, and `freeze_batchnorm: true` is the answer.**
+This is the only arm whose backbone is not LayerNorm-only. NEC keeps the
+embedding network in `train()` mode because it is being optimised, so BatchNorm
+would normalise with *batch* statistics — and NEC uses a different batch in
+every phase: `num_envs` (8) during collection, up to 256 when re-embedding a
+finished episode, `batch_size` during gradient steps, and **1** inside
+`BaseTrainer.evaluate`. Keys are written in one phase and queried in another, so
+batch-dependent φ breaks the DND's premise that keys stay comparable (paper §6).
+At batch=1 it is worse than unstable: BatchNorm over a single sample zeroes
+every channel mean, destroying the spatial mean of each feature map exactly
+during evaluation — the phase the reported score comes from. The default holds
+every BatchNorm at its ImageNet running statistics for the whole run, which
+makes φ batch-independent; `train()` is overridden so a stray `.train()` cannot
+silently undo it. Convolution weights and BatchNorm affine parameters still
+train — this is not a back-door `freeze_backbone`. Setting it `false` warns, and
+a run made that way should not be reported beside the other arms without saying
+so.
+
+**Cost — the cheap arm.** The trunk is 11.2 M parameters against DINOv2's 22 M,
+MAE's 85.7 M and CLIP's 87.8 M, and ~1.8 GFLOPs/frame at 224 against CLIP's
+~4.4. So `image_size` is not the throughput knob it is for the ViT arms, and 224
+is the default for two reasons that agree: it is what the ImageNet weights were
+trained at, and it matches `resnet_image_size` in `mfec_atari.yaml`, so the same
+encoder sees the same resolution in both algorithms. Checkpoints are ~210 MB
+against the CLIP arm's ~820 MB.
+
+**What has not been measured.** `clip_finetune.yaml` and `mae_finetune.yaml`
+each carry a table of embedding spread at initialisation, because a PVM whose
+Atari embeddings start nearly collinear makes `kernel_delta` dominate the DND
+kernel. That measurement has **not** been run for this arm. `kernel_delta` is
+deliberately not changed for it either way.
+
+Tested in `tests/test_nec_resnet_finetune.py` — single-tier, against the real
+`resnet18` architecture with `pretrained=False` (torchvision is not optional and
+an untrained ResNet is cheap to build, so there is no stub to drift out of sync).
+Covers the BatchNorm mode invariant and the batch-independence it buys, the
+size guard, adapter init, param groups, finetuning through NEC's `step()`,
+gradient arrival at the trunk, and checkpoint round-trip including running
+statistics. **Whether it beats `nature`, `dinov2_finetune`, `clip_finetune` or
+`mae_finetune` is untested** — that is the experiment.
 
 ## Reading a NEC run
 

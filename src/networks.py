@@ -1209,3 +1209,351 @@ class CLIPEmbedding(nn.Module):
         if self.normalize_features:
             h = F.normalize(h, dim=-1)
         return self.head(h)                                     # (B, embedding_dim)
+
+
+class ResNetEmbedding(nn.Module):
+    """Finetunable ImageNet ResNet as a NEC embedding network.
+
+    Selected by ``configs/algorithm/embedding_network/resnet_finetune.yaml``,
+    i.e. ``algorithm/embedding_network=resnet_finetune`` on the CLI.
+
+    The NEC counterpart to MFEC's frozen
+    :class:`src.encoders.resnet_encoder.ResNetEncoder`, and the **supervised**
+    arm of the NEC encoder ablation — against ``nature`` (the paper's ConvNet,
+    random init), ``dinov2_finetune`` (self-distilled), ``clip_finetune``
+    (contrastive image-text) and ``mae_finetune`` (masked reconstruction).
+    Both variants take the pooled trunk output (``fc`` replaced by
+    ``nn.Identity``) with ImageNet normalisation constants; the difference is
+    that this one is trained end-to-end with the DND rather than frozen, per
+    :class:`NECEmbeddingNetwork` clause 2.
+
+    Pipeline: ``(B, C, H, W)`` → 1×1 conv channel adapter (only when
+    ``C != 3``) → bilinear resize to ``image_size`` → ImageNet normalisation →
+    ResNet trunk → global average pool → optional L2 → ``nn.Linear(pool_dim,
+    embedding_dim)`` head.  The head output is deliberately unconstrained; NEC
+    L2-normalises downstream (contract clause 3).
+
+    BatchNorm is the whole design problem here
+    -------------------------------------------
+    This is the only arm of the ablation whose backbone is not
+    LayerNorm-only, and it is the failure mode
+    :meth:`CLIPEmbedding._warn_if_batch_dependent` exists to steer people away
+    from ("Prefer a ViT-\\* tower").  ResNet carries a BatchNorm after every
+    convolution, and NEC keeps the embedding network in ``train()`` mode
+    because it is being optimised — so by default BatchNorm would normalise
+    with **batch** statistics.  The same frame then embeds differently
+    depending on what it was batched with, and NEC batches differently in
+    every phase:
+
+    =====================================  ==================================
+    phase                                  batch size
+    =====================================  ==================================
+    collection (``DNDPolicy.forward``)     ``num_envs`` (8)
+    episode re-embedding (``_embed``)      up to ``_EMBED_CHUNK`` (256)
+    gradient step                          ``batch_size``
+    ``BaseTrainer.evaluate``               **1**
+    =====================================  ==================================
+
+    Keys are *written* to the DND in one phase and *queried* in another, so
+    batch-dependent φ breaks the DND's premise directly (paper §6: keys "remain
+    relatively stable").  At batch=1 it is worse than unstable: BatchNorm over
+    a single sample normalises every channel to zero mean, so the spatial mean
+    of each feature map is destroyed exactly during evaluation — the phase the
+    reported score comes from.
+
+    ``freeze_batchnorm=True`` (**the default**) is the fix: every
+    ``_BatchNorm`` module is held in ``eval()`` mode for the whole run, so it
+    applies the checkpoint's ImageNet running statistics as a fixed affine map
+    and φ is batch-independent in every phase.  :meth:`train` re-asserts this
+    after any ``.train()`` call, because ``nn.Module.train()`` recurses and
+    would otherwise silently undo it the first time the trainer or a test
+    toggles the mode.
+
+    This is the standard frozen-BN finetuning recipe (small batches cannot
+    estimate BatchNorm statistics anyway), and it is deliberately *not*
+    ``freeze_backbone``: the convolution weights still train, and the BatchNorm
+    ``weight``/``bias`` affine parameters still receive gradients.  Only the
+    running statistics are held fixed.  ``freeze_batchnorm=False`` restores
+    textbook BatchNorm and warns — it is a legitimate thing to ablate, it must
+    not be silent, and a result produced with it should not be reported beside
+    the other arms without saying so.
+
+    Why this arm is cheap
+    ---------------------
+    ResNet-18's trunk is ~11.2 M parameters against DINOv2 ViT-S/14's 22 M,
+    MAE ViT-B/16's 85.7 M and CLIP ViT-B-32's 87.8 M, and its published cost at
+    224² is ~1.8 GFLOPs/frame against ViT-B/32's ~4.4 (architectural figures,
+    not measured on this box).  So ``image_size`` is **not** the throughput
+    knob it is for the ViT arms, and 224 is the default for two reasons that
+    agree: it is the resolution the ImageNet weights were trained at, and it
+    matches MFEC's frozen ``resnet`` arm (``resnet_image_size`` in
+    ``configs/algorithm/mfec_atari.yaml``), so the same encoder sees the same
+    resolution in both algorithms.  The MAE arm's argument for dropping to 112
+    — compute parity with CLIP — does not apply to a backbone that is already
+    below CLIP at full resolution.
+
+    Checkpoints are correspondingly small: ~45 MB of weights plus an equal
+    RMSProp ``square_avg``, so ~210 MB with the DND, against the CLIP arm's
+    ~820 MB.
+
+    A note on what "pretrained" means for this arm
+    -----------------------------------------------
+    The other three PVM arms are self-supervised or weakly supervised.  This
+    one is trained on ImageNet-1k **labels**, which makes it the arm that tests
+    whether supervised category features are a better starting point for an
+    episodic-memory key than objectives with no label at all.  It is also the
+    arm whose pretraining distribution is furthest from Atari — an ImageNet
+    classifier is trained to be invariant to exactly the kind of small
+    positional shift that distinguishes two Ms. Pac-Man states.  That
+    invariance is a plausible *disadvantage* for a memory key, and it is the
+    hypothesis this arm contributes, not a defect in it.
+
+    Parameters
+    ----------
+    obs_shape        : (C, H, W) per-sample observation shape.
+    embedding_dim    : output width, i.e. ``algorithm.embedding_dim``.
+    weights_path     : local ``torch.save(state_dict)`` of the trunk.  ``None``
+        lets torchvision resolve ``IMAGENET1K_V1``, which **downloads** into
+        ``~/.cache/torch`` on first use — set a path on an offline node, the
+        same way the MFEC arm's ``resnet_weights_path`` has to be set.  A local
+        path wins over the download.
+    model_name       : any torchvision ResNet entrypoint — ``resnet18`` (512-d
+        pool, the default), ``resnet34`` (512-d), ``resnet50`` (2048-d).
+    pretrained       : ``False`` builds the architecture untrained.  The
+        random-init control arm; not exposed in the YAML on purpose (see
+        ``mae_finetune.yaml``'s closing note for the same decision).
+    image_size       : trunk input size.  Must be ≥ 32 — ResNet downsamples by
+        32 overall, so anything smaller leaves an empty feature map before the
+        pool.  See the guard in ``__init__``.
+    interpolation    : resize mode.  ``"bilinear"`` is torchvision's own
+        ImageNet preprocessing and matches ``ResNetEncoder``; set
+        ``"bicubic"`` to hold resizing identical to the CLIP arm.
+    normalize_features : L2-normalise the pooled trunk output before the head.
+        Same rationale as :class:`CLIPEmbedding`, and it matters at least as
+        much here: ``ResNetEncoder``'s docstring records ‖φ(o)‖ ≈ 25.0 measured
+        on 400 real Ms. Pac-Man frames (MFEC's RGB 210×160 env, so treat it as
+        an order of magnitude for this arm's 4×84×84 input rather than as the
+        same number).  Feeding a scale like that into a default-initialised
+        ``nn.Linear`` makes the head's output — and its gradient — depend on a
+        quantity nothing else in NEC controls.  ``False`` ablates it.
+    freeze_backbone  : ``True`` trains only the adapter + head.  Default
+        ``False`` (full finetuning).
+    freeze_batchnorm : hold every BatchNorm in ``eval()`` mode for the whole
+        run.  Default ``True``; see above.
+    backbone_lr_scale : multiplier on the trunk's learning rate relative to the
+        adapter + head.  Untuned; see :meth:`param_groups`.
+    """
+
+    def __init__(
+        self,
+        obs_shape: Sequence[int],
+        embedding_dim: int,
+        *,
+        weights_path: str | None = None,
+        model_name: str = "resnet18",
+        pretrained: bool = True,
+        image_size: int = 224,
+        interpolation: str = "bilinear",
+        normalize_features: bool = True,
+        freeze_backbone: bool = False,
+        freeze_batchnorm: bool = True,
+        backbone_lr_scale: float = 0.1,
+    ) -> None:
+        super().__init__()
+        # torchvision is a hard dependency of this repo (pyproject.toml), not an
+        # optional extra like open_clip/timm, so this import cannot fail the way
+        # CLIPEmbedding's can.  It is still deferred: src/networks.py is
+        # imported by every DQN/DDPG/A2C config too, and none of them need it.
+        import torchvision.models as tvm
+
+        if int(image_size) < 32:
+            raise ValueError(
+                f"image_size={image_size} is too small for a ResNet trunk: "
+                f"conv1 (stride 2), maxpool (stride 2) and layers 2-4 (stride 2 "
+                f"each) downsample by 32 overall, so a {image_size}x{image_size} "
+                f"input reaches the global pool with an empty feature map. "
+                f"Use a multiple of 32 that is at least 32; 224 is ImageNet's "
+                f"own resolution and this arm's default."
+            )
+
+        self.model_name = model_name
+        self.image_size = int(image_size)
+        self.interpolation = interpolation
+        self.normalize_features = bool(normalize_features)
+        self.freeze_batchnorm = bool(freeze_batchnorm)
+        self.backbone_lr_scale = float(backbone_lr_scale)
+
+        # A local file wins over the download; that is the offline-cluster path.
+        if weights_path is not None:
+            backbone = tvm.get_model(model_name, weights=None)
+            sd = torch.load(weights_path, map_location="cpu")
+            backbone.load_state_dict(sd.get("state_dict", sd), strict=True)
+        else:
+            backbone = tvm.get_model(
+                model_name, weights="IMAGENET1K_V1" if pretrained else None
+            )
+
+        # `fc` is the 1000-way ImageNet classifier.  Dropping it leaves the
+        # global-average-pooled trunk output, which is the representation both
+        # this class and ResNetEncoder treat as phi -- and for NEC it is not
+        # merely dead weight: every parameter here goes into RMSProp and into
+        # every checkpoint.
+        #
+        # The attribute check is the difference between naming a non-ResNet
+        # torchvision model here and getting a bare AttributeError three frames
+        # deep: `vgg16` and `efficientnet_b0` call their head `classifier`,
+        # `vit_b_16` calls it `heads`, and none of them pool the way the rest of
+        # this class assumes.
+        if not isinstance(getattr(backbone, "fc", None), nn.Linear):
+            raise ValueError(
+                f"model_name={model_name!r} is not a torchvision ResNet: it has "
+                f"no `fc` Linear head to replace, so this class cannot isolate "
+                f"the pooled trunk output. Use resnet18 (the default), "
+                f"resnet34, resnet50, resnet101 or resnet152."
+            )
+        self.pool_dim = int(backbone.fc.in_features)   # 512 r18/r34, 2048 r50
+        backbone.fc = nn.Identity()
+        self.backbone = backbone
+
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad_(False)
+
+        self._apply_batchnorm_mode()
+
+        self.register_buffer(
+            "_mean",
+            torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_std",
+            torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+        in_channels = int(obs_shape[0])
+        self.channel_adapter: nn.Module = (
+            nn.Identity() if in_channels == 3
+            else nn.Conv2d(in_channels, 3, kernel_size=1)
+        )
+        if isinstance(self.channel_adapter, nn.Conv2d):
+            # Mean over input channels, replicated to R=G=B -- see
+            # DINOv2Embedding for why a random init here throws the pretraining
+            # away.
+            with torch.no_grad():
+                self.channel_adapter.weight.fill_(1.0 / in_channels)
+                self.channel_adapter.bias.zero_()
+
+        self.head = nn.Linear(self.pool_dim, embedding_dim)
+
+    # ------------------------------------------------------------------
+    # BatchNorm mode management
+    # ------------------------------------------------------------------
+
+    def _batchnorm_modules(self) -> list[nn.Module]:
+        return [
+            m
+            for m in self.backbone.modules()
+            if isinstance(m, nn.modules.batchnorm._BatchNorm)
+        ]
+
+    def _apply_batchnorm_mode(self) -> None:
+        """Force BatchNorm to ``eval()``, or warn that it is batch-dependent.
+
+        Called once, from ``__init__``, so the warning fires once.
+        :meth:`train` re-asserts the ``eval()`` half on every transition back
+        into train mode without coming through here, and that re-assert is the
+        load-bearing part: ``nn.Module.train()`` recurses into every submodule,
+        so a single ``net.train()`` anywhere -- the trainer, a test, a resume
+        path -- would otherwise put the BatchNorms back into batch-statistics
+        mode and silently reintroduce the failure the default exists to
+        prevent.
+        """
+        bns = self._batchnorm_modules()
+        if not bns:
+            return                      # a BatchNorm-free trunk; nothing to do
+        if self.freeze_batchnorm:
+            for m in bns:
+                m.eval()
+            return
+        warnings.warn(
+            f"ResNetEmbedding({self.model_name!r}) was built with "
+            f"freeze_batchnorm=False, so its {len(bns)} BatchNorm layers will "
+            f"use batch statistics. NEC trains the embedding network, so it "
+            f"stays in train() mode and the same observation then embeds "
+            f"differently during collection (batch=num_envs), episode "
+            f"re-embedding (batch<=256), gradient steps (batch=batch_size) and "
+            f"evaluation (batch=1, where BatchNorm zeroes every channel mean) "
+            f"-- which destabilises every key in the DND. Keep the default "
+            f"unless you are deliberately ablating this.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    def train(self, mode: bool = True):                  # type: ignore[override]
+        """``nn.Module.train`` + re-assert the frozen-BatchNorm invariant."""
+        super().train(mode)
+        if mode:
+            # Only on the way into train mode: eval() already puts every
+            # BatchNorm where freeze_batchnorm wants it, and re-running the
+            # warning path on each evaluate() would be noise.
+            if self.freeze_batchnorm:
+                for m in self._batchnorm_modules():
+                    m.eval()
+        return self
+
+    # ------------------------------------------------------------------
+    # NECEmbeddingNetwork optional extension
+    # ------------------------------------------------------------------
+
+    def param_groups(self, base_lr: float) -> list[dict]:
+        """Trunk at a scaled LR, adapter + head at ``base_lr``.
+
+        Identical arrangement (and identical caveat) to
+        :meth:`DINOv2Embedding.param_groups` and
+        :meth:`CLIPEmbedding.param_groups`: a randomly-initialised head needs a
+        far larger step than a pretrained trunk, and NEC's RMSProp trio was
+        calibrated on ``NatureEmbedding``, where every parameter is random init.
+        ``backbone_lr_scale`` is **not** a validated number.
+
+        Note that with ``freeze_batchnorm=True`` the BatchNorm affine
+        parameters are still trainable and still land in the backbone group --
+        only the running statistics are frozen, and those are buffers, not
+        parameters, so no optimizer group ever contained them.
+        """
+        backbone = [p for p in self.backbone.parameters() if p.requires_grad]
+        head = [
+            p
+            for module in (self.channel_adapter, self.head)
+            for p in module.parameters()
+            if p.requires_grad
+        ]
+        groups: list[dict] = []
+        if backbone:
+            groups.append({"params": backbone, "lr": base_lr * self.backbone_lr_scale})
+        if head:
+            groups.append({"params": head, "lr": base_lr})
+        return groups
+
+    # ------------------------------------------------------------------
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        x = obs.float().reshape(-1, *obs.shape[-3:])            # (B, C, H, W)
+        # Adapt channels BEFORE the resize: the 1x1 conv is far cheaper at
+        # 84x84 than at 224x224, and the result is identical either way.
+        x = self.channel_adapter(x)                             # (B, 3, H, W)
+        if x.shape[-2:] != (self.image_size, self.image_size):
+            # Whole-frame resize, NOT torchvision's Resize+CenterCrop: a centre
+            # crop of an Atari frame cuts away the left and right of the maze.
+            # Losing pixels is much worse than distorting them when the
+            # embedding is a memory key.
+            x = F.interpolate(
+                x, (self.image_size, self.image_size),
+                mode=self.interpolation, align_corners=False,
+            )
+        x = (x - self._mean) / self._std
+        h = self.backbone(x).float()                            # (B, pool_dim)
+        if self.normalize_features:
+            h = F.normalize(h, dim=-1)
+        return self.head(h)                                     # (B, embedding_dim)

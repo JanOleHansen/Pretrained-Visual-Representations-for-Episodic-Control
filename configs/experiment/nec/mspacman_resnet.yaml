@@ -1,0 +1,96 @@
+# @package _global_
+# NEC on ALE/MsPacman-v5 with a FINETUNED ImageNet ResNet-18 as the embedding
+# network — the SUPERVISED-PVM arm of the Ms. Pac-Man encoder ablation, against
+# nec/mspacman.yaml (NatureEmbedding, the paper's ConvNet),
+# nec/mspacman_dinov2.yaml (self-distilled ViT), nec/mspacman_clip.yaml
+# (contrastive image-text) and nec/mspacman_mae.yaml (masked reconstruction).
+#
+# This is nec/mspacman.yaml with the embedding-network group swapped, and the
+# exact counterpart of nec/mspacman_clip.yaml with the encoder swapped. The
+# env pair, gamma, n_step, reward scale, episode boundaries and exploration
+# schedule are all held identical, so the encoder is the only variable.
+#
+# WHY RESNET. It is the only arm pretrained on human LABELS — the other three
+# PVMs are self-distilled, contrastive or reconstructive — so it is what makes
+# "supervised" a level of the pretraining-objective variable rather than a gap
+# in it. It is also the arm whose pretraining distribution is furthest from the
+# task: an ImageNet classifier is trained to be INVARIANT to small positional
+# shifts, and a small positional shift is exactly what distinguishes two
+# MsPacman states. For a representation whose job is to be a
+# nearest-neighbour memory KEY that invariance is a plausible disadvantage, so a
+# mid- or low-ranking result here is the hypothesis under test, not a defect.
+#
+# Difference from the MFEC ResNet arm (experiment/mfec/resnet.yaml):
+#   * MFEC's ResNet is FROZEN, so it must be fed RGB single frames directly
+#     (the atari_mfec_*_rgb env pair).
+#   * NEC's is FINETUNED, so it keeps the standard NEC env — 4 stacked 84x84
+#     grayscale frames — and adapts them inside the module with a trainable
+#     1x1 conv. That keeps this a clean ablation against nec/mspacman.yaml and
+#     preserves the frame stack, NEC's only source of velocity information.
+#
+# BATCHNORM. This is the only arm whose backbone is not LayerNorm-only, and NEC
+# trains the embedding network in train() mode, where BatchNorm would use batch
+# statistics — different in every NEC phase, and degenerate at the batch=1 of
+# BaseTrainer.evaluate. `freeze_batchnorm: true` (the default, inherited from
+# the group config) holds every BatchNorm at its ImageNet running statistics so
+# phi is batch-independent. Read the long note in
+# configs/algorithm/embedding_network/resnet_finetune.yaml before changing it.
+#
+# NO OPTIONAL DEPENDENCY — torchvision is a core dependency, unlike the clip
+# (`uv sync --extra clip`) and mae (`uv sync --extra mae`) arms.
+defaults:
+  - override /algorithm: nec_atari
+  - override /environment: mspacman_nec_train
+  - override /environment@eval_environment: mspacman_nec_eval
+  - override /algorithm/embedding_network: resnet_finetune
+  - _self_
+
+run:
+  algorithm: nec
+  game: mspacman
+  # See the note in nec/mspacman_dinov2.yaml — without this the run directory
+  # would be nec_mspacman_none_seed42 and collide with the NatureEmbedding arm.
+  encoder: resnet
+
+algorithm:
+  embedding_network:
+    # null -> torchvision downloads IMAGENET1K_V1 into ~/.cache/torch (needs
+    # network). On an offline node, fetch the checkpoint once and point this at
+    # the file. Held identical to the MFEC arm's resnet_weights_path.
+    weights_path: null
+    model_name: resnet18
+    # ImageNet's own resolution, and the same value as the frozen MFEC arm's
+    # resnet_image_size, so the encoder sees the same input size in both
+    # algorithms. Not a throughput knob for a convolutional backbone — see the
+    # group config.
+    image_size: 224
+
+  # Held identical to nec/mspacman.yaml and every other arm of the ablation.
+  num_updates: 100
+  eps_end: 0.001
+  annealing_frames: 10_000
+  init_random_frames: 4_800
+  eval_eps: 0.005
+
+trainer:
+  # Same units and budget as nec/mspacman.yaml: agent steps, action repeat 4,
+  # so 400k raw ALE frames.
+  total_frames: 100_000
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  # 8, matching every other PVM arm. num_envs sets the trunk's inference batch
+  # as well as the process count, and the backbone is resident on the same
+  # device as the DND and the replay buffer.
+  num_envs: 8
+  log_every_n_steps: 5_000
+  # 10_000 agent steps == every 40k raw frames.  Paper §4 evaluates every 200k
+  # raw frames; shortened in proportion to the 100k-step probe budget so a run
+  # still yields ten eval points.
+  eval_every_n_steps: 10_000
+  # DISK: the ResNet-18 trunk is 11.2M params — the SMALLEST backbone in the
+  # study (CLIP ViT-B-32 is 87.8M) — so each checkpoint is ~210 MB: ~45 MB of
+  # weights, an equal RMSProp square_avg, and the DND, which dominates. At the
+  # default checkpoint.save_every_n_steps of 50_000 a 100k-step run writes 2,
+  # i.e. ~420 MB against the CLIP arm's ~1.6 GB.
+  num_eval_episodes: 5

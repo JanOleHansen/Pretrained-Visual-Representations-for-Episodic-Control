@@ -1,0 +1,170 @@
+# NEC embedding network: finetunable ImageNet ResNet-18
+# (src/networks.py::ResNetEmbedding).
+#
+# The NEC counterpart to MFEC's `encoder_name=resnet` (frozen,
+# src/encoders/resnet_encoder.py), and the SUPERVISED arm of the NEC encoder
+# ablation — against `nature` (the paper's ConvNet, random init),
+# `dinov2_finetune` (self-distilled), `clip_finetune` (contrastive image-text)
+# and `mae_finetune` (masked pixel reconstruction).
+#
+# WHAT THIS ARM CONTRIBUTES. It is the only arm pretrained on human LABELS, and
+# the only one whose pretraining distribution has an obvious mismatch with the
+# task: an ImageNet classifier is trained to be INVARIANT to small positional
+# shifts, and a small positional shift is exactly what distinguishes two Ms.
+# Pac-Man states. For a representation whose job is to be a nearest-neighbour
+# memory KEY, that invariance is a plausible disadvantage. A mid- or low-ranking
+# result here is the hypothesis under test, not a defect in the setup.
+#
+#   python src/train.py experiment=nec/mspacman \
+#       algorithm/embedding_network=resnet_finetune \
+#       run.encoder=resnet
+#
+# `configs/experiment/nec/{mspacman,qbert,frostbite}_resnet.yaml` bundle exactly
+# that plus the shared trainer block, so prefer `experiment=nec/mspacman_resnet`
+# and keep this group override for one-off arms on other games.
+#
+# Set `run.encoder` explicitly (as above, or in the experiment config) so the
+# run directory distinguishes it from a `nature` run — `run.encoder` reads
+# `algorithm.encoder_name`, which is an MFEC-only key.
+#
+# NO OPTIONAL DEPENDENCY. Unlike the clip (`open_clip_torch`) and mae (`timm`)
+# arms, torchvision is a core dependency in pyproject.toml, so `uv sync` alone
+# is enough. The import is still deferred into __init__ so the DQN/DDPG/A2C
+# configs that also import src/networks.py pay nothing for it.
+_partial_: true
+_target_: src.networks.ResNetEmbedding
+
+# null -> torchvision downloads IMAGENET1K_V1 into ~/.cache/torch on first use,
+# which needs network access. On an offline node, fetch the checkpoint once
+# elsewhere and point this at the local file. A local path WINS over the
+# download. Same situation as the MFEC arm's `resnet_weights_path`.
+weights_path: null
+
+# Any torchvision ResNet entrypoint. resnet18 (512-d pool) is the default and
+# the same backbone the MFEC arm uses, so the two algorithms are compared on an
+# identical encoder. resnet34 is also 512-d; resnet50 is 2048-d and ~4x the
+# FLOPs — ResNetEmbedding reads the true width off fc.in_features either way, so
+# nothing else needs changing, but a wider pool also widens the head.
+model_name: resnet18
+
+# ---------------------------------------------------------------------------
+# image_size IS NOT THE THROUGHPUT KNOB HERE — and that is the point.
+# ---------------------------------------------------------------------------
+# For the ViT arms, cost is quadratic in the token count and `image_size` is the
+# dominant knob (see dinov2_finetune.yaml and mae_finetune.yaml, which drops to
+# 112 to buy compute parity with CLIP). A ResNet is convolutional: cost is
+# linear in pixels, and the whole backbone is small to begin with.
+#
+#   backbone                     params    ~GFLOPs/frame @224
+#   ResNet-18 trunk (this file)   11.2M           1.8
+#   DINOv2 ViT-S/14               22M             4.6
+#   MAE ViT-B/16 @112             85.7M           4.4
+#   CLIP ViT-B-32 @224            87.8M           4.4
+#
+# (Published architectural figures, NOT measured on our hardware — unlike the
+# millisecond timings in mae_finetune.yaml, which were.)
+#
+# So this arm is the CHEAPEST of the four PVMs at full ImageNet resolution, and
+# 224 is the default for two reasons that happen to agree: it is what the
+# ImageNet weights were trained at, and it matches `resnet_image_size` in
+# configs/algorithm/mfec_atari.yaml, so the same encoder sees the same
+# resolution in both algorithms. There is no compute argument for lowering it.
+#
+# Must be at least 32 — conv1, maxpool and layers 2-4 downsample by 32 overall,
+# so a smaller input reaches the global pool with an empty feature map.
+# ResNetEmbedding rejects it rather than letting torch raise from inside the
+# trunk. Multiples of 32 are the sane choices (32, 64, 96, 128, 160, 192, 224).
+image_size: 224
+
+# torchvision's own ImageNet preprocessing uses bilinear, and this matches
+# src/encoders/resnet_encoder.py. Set "bicubic" to hold resizing identical to
+# the CLIP arm if you would rather control for it than give each backbone its
+# native pipeline.
+interpolation: bilinear
+
+# ---------------------------------------------------------------------------
+# THE ONE SETTING THAT IS NOT A PREFERENCE — read before touching it.
+# ---------------------------------------------------------------------------
+# This is the only arm of the ablation whose backbone is not LayerNorm-only.
+# ResNet has a BatchNorm after every convolution, and NEC keeps the embedding
+# network in train() mode because it is being optimised — so by default those
+# BatchNorms normalise with BATCH statistics. NEC uses a different batch size in
+# every phase:
+#
+#   collection (DNDPolicy.forward)      num_envs   = 8
+#   episode re-embedding (_embed)       <= 256     (_EMBED_CHUNK)
+#   gradient step                       batch_size
+#   BaseTrainer.evaluate                1
+#
+# Keys are WRITTEN in one phase and QUERIED in another, so batch-dependent phi
+# breaks the DND's premise directly (paper §6: keys "remain relatively stable").
+# At batch=1 it is not merely unstable — BatchNorm over a single sample sets
+# every channel mean to zero, destroying the spatial mean of each feature map
+# exactly during evaluation, i.e. in the phase the reported score comes from.
+#
+# true (the default) holds every BatchNorm in eval() mode for the whole run, so
+# it applies the checkpoint's ImageNet running statistics as a fixed affine map
+# and phi is batch-independent everywhere. This is the standard frozen-BN
+# finetuning recipe — small batches cannot estimate BatchNorm statistics anyway.
+#
+# It is NOT the same as freeze_backbone: the convolution weights still train,
+# and the BatchNorm weight/bias affine parameters still receive gradients. Only
+# the running statistics are held fixed.
+#
+# false restores textbook BatchNorm and emits a UserWarning. It is a legitimate
+# ablation — it is also the single most likely explanation if this arm's
+# eval/return_mean sits at random-play level while train/episode_reward climbs,
+# which is the same symptom the MFEC resnet arm produced for an unrelated
+# numerics reason (see src/encoders/factory.py on TF32). Do not report a run
+# made with false alongside the other arms without declaring it.
+freeze_batchnorm: true
+
+freeze_backbone: false        # true -> train only the channel adapter + head
+
+# L2-normalise the pooled trunk output BEFORE the head.
+#
+# Same rationale as clip_finetune.yaml, and the same caveat: this does NOT make
+# the DND's metric cosine-in-ResNet-space, because a learned Linear(512,
+# embedding_dim) head sits in between and NEC normalises the head's output
+# instead. What it buys is a well-scaled head input. src/encoders/resnet_encoder
+# .py records ||phi(o)|| ~ 25.0 measured on 400 real Ms. Pac-Man frames — that
+# was MFEC's RGB 210x160 env, so treat it as an order of magnitude for this
+# arm's 4x84x84 input rather than as the same number, but it is the largest
+# feature norm of any encoder in the study either way (CLIP's tower measures
+# ~10.7). Feeding that into a default-initialised nn.Linear sets the head's
+# output and gradient scale via a quantity nothing else in NEC controls.
+# Set false to ablate.
+normalize_features: true
+
+# Learning-rate multiplier for the pretrained trunk, relative to the
+# randomly-initialised channel adapter + head (which stay at `algorithm.lr`).
+# Same rationale and same caveat as dinov2_finetune.yaml, clip_finetune.yaml and
+# mae_finetune.yaml: NOT a validated number — no run has been used to tune it.
+# 0.1 is the convention; 1.0 restores a single uniform learning rate.
+backbone_lr_scale: 0.1
+
+# ---------------------------------------------------------------------------
+# NO MEASURED INITIALISATION TABLE YET.
+# ---------------------------------------------------------------------------
+# clip_finetune.yaml and mae_finetune.yaml each carry a table of mean pairwise
+# embedding distance at init against the NatureEmbedding baseline, because a
+# PVM whose Atari embeddings start nearly collinear makes `kernel_delta`
+# dominate the DND's inverse-distance kernel. That measurement has NOT been run
+# for this arm — it needs the script that produced the other two, on a box with
+# torch installed.
+#
+# Run it before diagnosing a slow start here as a bug, and note mae_finetune
+# .yaml's comparability caveat: re-measuring CLIP with the MAE script gave 0.030
+# rather than the 0.007 in clip_finetune.yaml, so all three rows must come from
+# ONE script before they go side by side in the writeup.
+#
+# kernel_delta IS DELIBERATELY NOT CHANGED FOR THIS ARM, for the reason
+# mae_finetune.yaml gives: it is learning-relevant, and an arm-specific value
+# would turn a between-arm read into a comparison of kernel bandwidths rather
+# than of encoders.
+#
+# NOT exposed here on purpose: `pretrained`. ResNetEmbedding takes it (False
+# builds the architecture untrained), but a training config has no business
+# selecting it — the same decision mae_finetune.yaml and
+# src/encoders/factory.py make. Use
+# `+algorithm.embedding_network.pretrained=false` for the random-init control.

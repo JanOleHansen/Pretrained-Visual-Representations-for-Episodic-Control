@@ -509,6 +509,11 @@ configs/
                               extra; mean-pooled PATCH tokens, image_size=112 to
                               match the CLIP arm's token count, divisibility by 16
                               is a hard error)
+    resnet_finetune.yaml    — finetunable ImageNet ResNet-18 (NO optional extra —
+                              torchvision is a core dep; the SUPERVISED arm.
+                              freeze_batchnorm=true is the load-bearing default:
+                              it is the only backbone with BatchNorm, and NEC
+                              embeds at four different batch sizes including 1)
   environment/cartpole.yaml — env kwargs (name, transforms)
   environment/pong_train.yaml     — Atari Pong (training transforms incl. EndOfLife + Sign + VecNorm; DQN only)
   environment/pong_mfec_train.yaml — Atari Pong for MFEC (same stack WITHOUT VecNorm; see note below)
@@ -649,20 +654,33 @@ configs/
                               image_size=112 (7x7=49 tokens), matching the CLIP arm's
                               token count so the two PVM arms differ in objective and
                               not in compute
-  experiment/nec/qbert.yaml, qbert_dinov2.yaml, qbert_clip.yaml, qbert_mae.yaml — the
-                              Q*bert arms of the same four-encoder ablation, on
+  experiment/nec/mspacman_resnet.yaml — same task and env pair, with the
+                              embedding_network group swapped to resnet_finetune
+                              (finetuned ImageNet ResNet-18) and run.encoder=resnet.
+                              The SUPERVISED arm — the only encoder in the study
+                              pretrained on labels, and the one whose pretraining
+                              distribution is furthest from the task (ImageNet
+                              invariance to small positional shifts is the opposite
+                              of what a memory key wants).  NO optional extra needed.
+                              weights_path defaults to null (torchvision downloads
+                              IMAGENET1K_V1 — set a local path on an offline node).
+                              Cheapest PVM arm: 11.2M params, ~210 MB checkpoints
+  experiment/nec/qbert.yaml, qbert_dinov2.yaml, qbert_clip.yaml, qbert_mae.yaml,
+  qbert_resnet.yaml — the
+                              Q*bert arms of the same five-encoder ablation, on
                               qbert_nec_train/eval.  6 actions, the cheapest of the
                               three games per gradient step (cost is
                               num_updates x |A| exact kNN scans)
   experiment/nec/frostbite.yaml, frostbite_dinov2.yaml, frostbite_clip.yaml,
-  frostbite_mae.yaml — the
+  frostbite_mae.yaml, frostbite_resnet.yaml — the
                               Frostbite arms, on frostbite_nec_train/eval. 18 actions,
                               the most expensive of the three; the ViT arms here are the
-                              heaviest runs in the study
-                              ALL TWELVE ablation files repeat their shared settings
+                              heaviest runs in the study (the resnet arm is the
+                              lightest arm on the heaviest game)
+                              ALL FIFTEEN ablation files repeat their shared settings
                               verbatim (Hydra experiment configs do not compose with
                               each other) — a change that belongs to the comparison has
-                              to land in all twelve
+                              to land in all fifteen
   logger/{wandb,tensorboard}.yaml
   paths/default.yaml
   train.yaml, eval.yaml, train_vae.yaml
@@ -703,6 +721,16 @@ tests/
                               gradients reaching the backbone, checkpoint round-trip.
                               Second tier (NEC_DINOV2_REAL=1, NEC_DINOV2_REPO_DIR=... if
                               offline) builds the genuine dinov2_vits14
+  test_nec_resnet_finetune.py — ResNetEmbedding: the BatchNorm mode invariant (eval() at
+                              construction, preserved across train()/eval() round trips
+                              and across a real NEC step) and the batch-independence of
+                              phi that it buys, the batch-DEPENDENCE without it, frozen
+                              running statistics, image_size guard, adapter init, param
+                              groups, finetuning through step(), checkpoint round-trip,
+                              and cross-arm config parity against the clip arm.  SINGLE
+                              TIER — it builds the real resnet18 with pretrained=False,
+                              since torchvision is a core dep and an untrained ResNet is
+                              cheap, so there is no stub to drift out of sync
   test_nec_clip_finetune.py — CLIPEmbedding: lazy open_clip import (AST-checked),
                               QuickGELU guard, patch-size divisibility guard,
                               BatchNorm warning, text-tower removal, CLIP-vs-ImageNet
