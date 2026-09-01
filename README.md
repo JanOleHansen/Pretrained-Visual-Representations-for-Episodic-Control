@@ -50,12 +50,23 @@ Two derived rules:
 | NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman_dinov2` (finetuned DINOv2 ViT-S/14) |
 | NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman_clip` (finetuned CLIP ViT-B-32) |
 | NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman_mae` (finetuned MAE ViT-B/16) |
-| NEC       | ALE/Qbert-v5     | `experiment=nec/qbert{,_dinov2,_clip,_mae}` |
-| NEC       | ALE/Frostbite-v5 | `experiment=nec/frostbite{,_dinov2,_clip,_mae}` |
+| NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman_resnet` (finetuned ImageNet ResNet-18) |
+| NEC       | ALE/Qbert-v5     | `experiment=nec/qbert{,_dinov2,_clip,_mae,_resnet}` |
+| NEC       | ALE/Frostbite-v5 | `experiment=nec/frostbite{,_dinov2,_clip,_mae,_resnet}` |
+| NEC       | any ablation game | `experiment=nec/<game>_<pvm>_frozen` — the RQ4 frozen-features control |
 
-The last four rows are the **NEC encoder ablation**: three games x four
-encoders, twelve arms, every learning-relevant setting held identical so that
+The last five rows are the **NEC encoder ablation**: three games x five
+encoders, fifteen arms, every learning-relevant setting held identical so that
 game and encoder are the only variables. See "The NEC encoder ablation" below.
+
+The final row is the **RQ4 frozen control**: the same four PVM arms with
+`freeze_backbone: true`, twelve more arms. `frozen-NEC vs finetuned-NEC` holds
+the algorithm fixed and isolates finetuning; `frozen-NEC vs frozen-MFEC` holds
+the training regime fixed and isolates the algorithm. Note what "frozen" means
+here — the pretrained **trunk** is fixed, while the 1x1 channel adapter and the
+Linear head (randomly initialised, and the only way to key a DND at
+`embedding_dim=64`) still train. That is a frozen-*features* control, not
+MFEC's bit-exact fixed phi. See "The RQ4 frozen control" below.
 
 ## Main technologies
 
@@ -97,6 +108,181 @@ GPU):
 ```shell
 python src/train.py experiment=dqn/pong
 ```
+
+## Reproducing the thesis results
+
+Everything reported in the thesis comes from four sweep commands, one validity
+filter, and one plotting script. This section is the whole path; the sections
+further down explain *why* each arm exists, which you do not need in order to
+re-run them.
+
+**Budget.** 100k agent decisions per run = 400k raw ALE frames (action repeat 4)
+— the Atari-100k probe budget, held identical across every arm and both
+algorithms. This is **not** the budget either source paper reports at: Pritzel
+et al. Table 3 is at 10M frames and Blundell et al. Figure 1 runs to 50M, so
+these runs are a controlled encoder comparison at a fixed small budget, not a
+reproduction of either paper's headline numbers. See "Reproducing MFEC on
+Atari" for what *is* readable against Figure 1.
+
+### 1. The two sweeps
+
+Five seeds per cell — 42–46 — because every reported number is a mean ± one
+standard error over seeds. Do not drop seeds to save time; the seed-to-seed
+spread is large (Q\*bert `rp_gray` is 1995 ± 663) and three seeds will not
+support an ordering claim.
+
+```shell
+# MFEC — 6 arms x 3 games x 5 seeds = 90 runs.
+# The env pair is game-generic, so the game is a sweep token, not a file.
+python src/train.py -m \
+    experiment=mfec/rp_gray,mfec/rp_rgb,mfec/dinov2,mfec/resnet,mfec/clip,mfec/mae \
+    game=MsPacman,Qbert,Frostbite \
+    trainer.seed=42,43,44,45,46
+
+# NEC — 5 arms x 3 games x 5 seeds = 75 runs.
+# NEC's env configs are per-game, so each (game, encoder) is its own file.
+python src/train.py -m \
+    experiment=nec/mspacman,nec/qbert,nec/frostbite \
+    trainer.seed=42,43,44,45,46
+python src/train.py -m \
+    experiment=nec/mspacman_dinov2,nec/qbert_dinov2,nec/frostbite_dinov2 \
+    trainer.seed=42,43,44,45,46
+python src/train.py -m \
+    experiment=nec/mspacman_clip,nec/qbert_clip,nec/frostbite_clip \
+    trainer.seed=42,43,44,45,46
+python src/train.py -m \
+    experiment=nec/mspacman_mae,nec/qbert_mae,nec/frostbite_mae \
+    trainer.seed=42,43,44,45,46
+python src/train.py -m \
+    experiment=nec/mspacman_resnet,nec/qbert_resnet,nec/frostbite_resnet \
+    trainer.seed=42,43,44,45,46
+```
+
+`uv sync --extra clip` is required for the two CLIP arms and `--extra mae` for
+MFEC's MAE arm; the rest need only `uv sync`.
+
+### 1b. The RQ4 frozen control
+
+A third sweep, **not** part of the two grids above and not reported in the
+thesis's results: 4 arms x 3 games x 5 seeds = **60 runs**. It exists because
+RQ4 (does finetuning beat frozen features?) is unanswerable from the two grids
+— MFEC is frozen in all 90 of its runs and NEC is finetuned in all 75 of its
+own, so algorithm and training regime move together.
+
+```shell
+# RQ4 — 4 frozen PVM arms x 3 games x 5 seeds = 60 runs.
+python src/train.py -m \
+    experiment=nec/mspacman_resnet_frozen,nec/qbert_resnet_frozen,nec/frostbite_resnet_frozen \
+    trainer.seed=42,43,44,45,46
+python src/train.py -m \
+    experiment=nec/mspacman_dinov2_frozen,nec/qbert_dinov2_frozen,nec/frostbite_dinov2_frozen \
+    trainer.seed=42,43,44,45,46
+python src/train.py -m \
+    experiment=nec/mspacman_clip_frozen,nec/qbert_clip_frozen,nec/frostbite_clip_frozen \
+    trainer.seed=42,43,44,45,46
+python src/train.py -m \
+    experiment=nec/mspacman_mae_frozen,nec/qbert_mae_frozen,nec/frostbite_mae_frozen \
+    trainer.seed=42,43,44,45,46
+```
+
+These write to `nec_<game>_<pvm>_frozen[_seed<n>]`, distinct from the finetuned
+arms' `nec_<game>_<pvm>`, so the two never share a run directory or a W&B group.
+`tests/test_nec_frozen_control.py` pins that, and pins that `freeze_backbone` is
+the only setting that differs from the finetuned counterpart.
+
+**Run one sweep at a time.** Wall-clock is dominated by the collector, which is
+CPU-bound, so overlapping sweeps costs more than it buys: measured across 129
+runs, median runtime goes 29 min with nothing else in flight, 47 min with one,
+86 min with two, 143 min with three. Four concurrent sweeps do not finish four
+times faster — they finish at roughly the same total throughput with every
+individual run taking 5x as long, which makes partial results useless for days.
+
+### 2. What is actually in the reported results
+
+`experiment=` names an arm; it does not mean the arm has data. Current state,
+counting only runs that survive the validity filter in §3:
+
+**MFEC** (`mfec/<arm>`, with `game=` as a sweep token)
+
+| arm | Ms. Pac-Man | Q\*bert | Frostbite | reported |
+|---|---|---|---|---|
+| `rp_gray` | 5/5 | 5/5 | 5/5 | yes |
+| `rp_rgb` | 5/5 | 5/5 | 5/5 | yes |
+| `dinov2` | 5/5 | 5/5 | 5/5 | yes |
+| `resnet` | 5/5 | 5/5 | 5/5 | yes |
+| `mae` | 5/5 | 5/5 | 5/5 | yes |
+| `clip` | 5/5 | 2/5 | 2/5 | partial |
+| `vae` | — | — | — | **no — never run** |
+
+**NEC** (`nec/<game>[_<encoder>]`)
+
+| arm | Ms. Pac-Man | Q\*bert | Frostbite | reported |
+|---|---|---|---|---|
+| `<game>` (ConvNet) | 5/5 | 5/5 | 5/5 | yes |
+| `<game>_dinov2` | 5/5 | 5/5 | 5/5 | yes |
+| `<game>_clip` | 2/5 | 5/5 | 5/5 | partial |
+| `<game>_mae` | — | — | — | **no — never run** |
+| `<game>_resnet` | — | — | — | **no — never run** |
+
+Consequences to know before reading the tables:
+
+- **The results table is Ms. Pac-Man and Q\*bert only.** Frostbite is held back
+  because `mfec/clip` has 2 of 5 seeds there. Three runs
+  (`experiment=mfec/clip game=Frostbite trainer.seed=42,43,44`) close it.
+- `mfec/vae`, `nec/*_mae` and `nec/*_resnet` are implemented, tested and
+  documented below, but **no run exists for any of them** — they are not in the
+  ablation as reported, and the sweep commands above deliberately omit them.
+  Adding an arm to a published comparison means running it on all three games
+  at five seeds, not one.
+- `make_thesis_figures.py` drops any cell with fewer than three seeds, so a
+  partial arm may be silently absent from a figure rather than visibly thin.
+  Cells with fewer than five carry a `*` in the results table.
+
+### 3. The validity filter — read this before comparing to old runs
+
+`src/encoders/factory.py::pin_fp32_conv_precision()` forces true FP32
+convolutions for every MFEC encoder. Before it landed
+(**2026-08-19T08:52:59Z**), cuDNN's TF32 default ran φ at a 10-bit mantissa,
+which is ~16x over MFEC's near-exact-match rescue budget and made the episodic
+memory unreadable — `eval/memory_hit_rate` identically 0.000 on the `mfec/resnet`
+Ms. Pac-Man runs. See "Vet a new encoder before you train with it" for the
+measurement.
+
+**Every MFEC run created on or before that timestamp is excluded from the
+reported results**, except `rp_gray` and `rp_rgb`, which use no convolution and
+are therefore exempt. `make_figures.py` applies this automatically
+(`TF32_FIX`, `TF32_EXEMPT`); `--include-pre-fix` disables it and should only be
+used to inspect the old regime, never to fill a thin cell. This is why
+`mfec/clip` on Q\*bert reports two seeds despite five runs existing: seeds 42–44
+were all launched inside the forty minutes before the fix landed, so the filter
+drops them and only seeds 45–46 survive.
+
+NEC is unaffected — it never calls `make_encoder`, so no NEC run needs
+excluding. Checkpoints do not cross the boundary either: a QEC written under
+TF32 holds keys from a different numerics regime, so re-run rather than resume.
+
+### 4. Figures and tables
+
+The thesis figures are built from a local cache of the W&B runs
+(`LatentLab/torchrl-hydra-template`), not from the run directories:
+
+```shell
+cd ../Bachelorthesis
+python make_thesis_figures.py --refresh                      # re-pull, then plot
+python make_thesis_figures.py                                # plot from cache
+python make_thesis_figures.py --games MsPacman Qbert Frostbite
+```
+
+It writes `figures/*.pdf` and `figures/*.tex`, which `sections/Experiments.tex`
+`\input`s — **do not edit those by hand**. The arm vocabulary, the colour map,
+the validity filter and `MIN_SEEDS` all live in `../PresentatonLaTex/make_figures.py`
+and are imported, so the deck and the thesis cannot disagree about which runs
+count. Change them there or not at all.
+
+`scripts/aggregate_results.py` is a *different* tool — cross-game mean/median/IQM
+HNS with bootstrap CIs, pulled live from the W&B API. It did not produce the
+thesis figures. Use it for the aggregate numbers described under "Paper-ready
+metrics"; use `make_thesis_figures.py` for anything that appears in the document.
 
 ## Architecture
 
@@ -397,9 +583,12 @@ configs/
     └── nec/
         ├── pong.yaml       <- NEC on Pong (40M raw frames)
         ├── hero.yaml       <- NEC on H.E.R.O. (40M raw frames; unclipped rewards)
-        ├── mspacman{,_dinov2,_clip,_mae}.yaml  <- encoder ablation, Ms. Pac-Man (400k raw frames)
-        ├── qbert{,_dinov2,_clip,_mae}.yaml     <- encoder ablation, Q*bert (400k raw frames)
-        └── frostbite{,_dinov2,_clip,_mae}.yaml <- encoder ablation, Frostbite (400k raw frames)
+        ├── mspacman{,_dinov2,_clip,_mae,_resnet}.yaml  <- encoder ablation, Ms. Pac-Man (400k raw frames)
+        ├── qbert{,_dinov2,_clip,_mae,_resnet}.yaml     <- encoder ablation, Q*bert (400k raw frames)
+        ├── frostbite{,_dinov2,_clip,_mae,_resnet}.yaml <- encoder ablation, Frostbite (400k raw frames)
+        └── {mspacman,qbert,frostbite}_{dinov2,clip,mae,resnet}_frozen.yaml
+                                <- RQ4 control: the same PVM arms with the
+                                   pretrained trunk frozen (adapter + head still train)
 ```
 
 > **Frames vs. agent steps.** Every count in these configs (`total_frames`,
@@ -619,21 +808,26 @@ python src/train.py -m experiment=mfec/clip game=Assault,BankHeist,RoadRunner
 ```
 
 **MFEC on Frostbite is this and nothing else** — there is no
-`experiment=mfec/frostbite`, and there should not be one. The seven arms below are
-game-generic, so the Frostbite ablation is the same seven configs with the token
+`experiment=mfec/frostbite`, and there should not be one. The arms below are all
+game-generic, so the Frostbite ablation is the same configs with the token
 swapped:
 
 ```shell
 python src/train.py experiment=mfec/rp_gray game=Frostbite
-# the whole 7-arm ablation on the three recommended games (21 runs):
+# the reported ablation on the three recommended games, five seeds (90 runs):
 python src/train.py -m \
-    experiment=mfec/rp_gray,mfec/rp_rgb,mfec/vae,mfec/dinov2,mfec/resnet,mfec/clip,mfec/mae \
-    game=MsPacman,Qbert,Frostbite
+    experiment=mfec/rp_gray,mfec/rp_rgb,mfec/dinov2,mfec/resnet,mfec/clip,mfec/mae \
+    game=MsPacman,Qbert,Frostbite \
+    trainer.seed=42,43,44,45,46
 ```
+
+`mfec/vae` is deliberately **not** in that command — the config exists and is
+tested, but no run of it does, so it is not part of the reported comparison.
+See "Reproducing the thesis results" for the arm-by-arm status.
 
 `run.name` comes out as `mfec_Frostbite_<encoder>_seed42`, so the arms and games
 do not collide on disk or in W&B. Note this is the *opposite* layout from the
-NEC ablation, whose twelve arms are twelve files (`experiment=nec/frostbite`, …)
+NEC ablation, whose fifteen arms are fifteen files (`experiment=nec/frostbite`, …)
 because its env configs are per-game — NEC needs `EndOfLifeTransform` and a
 frame stack, MFEC does not, so only MFEC's env pair could be made generic.
 
@@ -664,24 +858,25 @@ would raise.
 
 ## The encoder ablation
 
-Seven arms over **two** env pairs, on whichever `game` you select. Everything that is not φ is held equal —
-100k decisions, `num_envs: 4`, `eval_every: 10_000`, `buffer_size: 100_000` —
-so a between-arm difference is an encoder difference and nothing else.
-Pinned by `tests/test_encoder_factory.py`.
+Seven arms over **two** env pairs, on whichever `game` you select — **six of
+which are in the reported results**; `mfec/vae` has never been run. Everything
+that is not φ is held equal — 100k decisions, `num_envs: 4`,
+`eval_every: 10_000`, `buffer_size: 100_000` — so a between-arm difference is an
+encoder difference and nothing else. Pinned by `tests/test_encoder_factory.py`.
 
-The same seven arms cover every game; the recommended set for a joint MFEC/NEC
+The same arms cover every game; the recommended set for a joint MFEC/NEC
 study is **Ms. Pac-Man, Q\*bert, Frostbite** (see "Choosing the game" above for
 the sweep command and why no `mfec/frostbite.yaml` exists).
 
-| experiment | observations | φ | d | role |
-|---|---|---|---|---|
-| `mfec/rp_gray` | 84×84 **grayscale** | random projection | 64 | **paper baseline** — Blundell et al. §3's exact φ, readable against Figure 1 |
-| `mfec/vae` | 84×84 grayscale | frozen ConvVAE | 64 | the paper's *other* φ; first half of C1 |
-| `mfec/rp_rgb` | 210×160 **RGB** | random projection | 64 | **encoder control** for the PVM arms |
-| `mfec/dinov2` | 210×160 RGB | DINOv2 ViT-S/14 | 384 | self-supervised PVM |
-| `mfec/resnet` | 210×160 RGB | ImageNet ResNet-18 | 512 | supervised PVM |
-| `mfec/clip` | 210×160 RGB | CLIP ViT-B-32 | 512 | contrastive PVM |
-| `mfec/mae` | 210×160 RGB | MAE ViT-B/16 | 768 | **reconstruction** PVM — the only non-similarity objective |
+| experiment | observations | φ | d | role | reported |
+|---|---|---|---|---|---|
+| `mfec/rp_gray` | 84×84 **grayscale** | random projection | 64 | **paper baseline** — Blundell et al. §3's exact φ, readable against Figure 1 | yes |
+| `mfec/vae` | 84×84 grayscale | frozen ConvVAE | 64 | the paper's *other* φ; first half of C1 | **never run** |
+| `mfec/rp_rgb` | 210×160 **RGB** | random projection | 64 | **encoder control** for the PVM arms | yes |
+| `mfec/dinov2` | 210×160 RGB | DINOv2 ViT-S/14 | 384 | self-supervised PVM | yes |
+| `mfec/resnet` | 210×160 RGB | ImageNet ResNet-18 | 512 | supervised PVM | yes |
+| `mfec/clip` | 210×160 RGB | CLIP ViT-B-32 | 512 | contrastive PVM | partial (2/5 seeds on Q\*bert, Frostbite) |
+| `mfec/mae` | 210×160 RGB | MAE ViT-B/16 | 768 | **reconstruction** PVM — the only non-similarity objective | yes |
 
 Read it as two independent steps:
 
@@ -947,12 +1142,17 @@ shared settings are repeated verbatim in all fifteen files.
 The four PVM arms are not four flavours of one idea — each varies the
 **pretraining objective**, which is the causal variable the study is about:
 
-| arm | objective | compares two images? | labels? |
-|---|---|---|---|
-| `dinov2_finetune` | self-distilled view agreement | yes | no |
-| `clip_finetune` | image-text contrastive | yes | weak (captions) |
-| `mae_finetune` | masked pixel reconstruction | **no** | no |
-| `resnet_finetune` | ImageNet-1k classification | no | **yes** |
+| arm | objective | compares two images? | labels? | reported |
+|---|---|---|---|---|
+| `dinov2_finetune` | self-distilled view agreement | yes | no | yes |
+| `clip_finetune` | image-text contrastive | yes | weak (captions) | partial (2/5 seeds on Ms. Pac-Man) |
+| `mae_finetune` | masked pixel reconstruction | **no** | no | **never run** |
+| `resnet_finetune` | ImageNet-1k classification | no | **yes** | **never run** |
+
+Two of those four are implemented and tested but have **no runs**, so the NEC
+ablation as reported is three arms, not five — the ConvNet baseline,
+`dinov2_finetune`, and `clip_finetune`. See "Reproducing the thesis results"
+for the per-cell seed counts and the sweep commands that produced them.
 
 `mae_finetune` is the arm that separates "similarity" from "not similarity";
 `resnet_finetune` is the arm that separates "labels" from "no labels", and it is
@@ -973,13 +1173,14 @@ the same set also serves an MFEC comparison. All six `*_nec_*` env configs drop
 `SignTransform` (NEC does not clip rewards), drop `VecNorm`, disable v5 sticky
 actions, and cap episodes at the full 27,000 agent steps (30 min).
 
-Held identical across all twelve: `total_frames: 100_000` agent steps (= 400k
+Held identical across all fifteen: `total_frames: 100_000` agent steps (= 400k
 raw frames, the shared probe budget), `num_updates: 100`, `eps_end: 0.001`,
 `annealing_frames: 10_000`, `init_random_frames: 4_800`, `eval_eps: 0.005`,
 `num_envs: 8`, `num_eval_episodes: 5`, `log_every_n_steps: 5_000`,
 `eval_every_n_steps: 10_000`, `seed: 42`. **Do not tune a single arm in
-isolation**; a change that belongs to the comparison has to land in all twelve.
-`tests/test_nec_ablation_parity.py` enforces that.
+isolation**; a change that belongs to the comparison has to land in all fifteen
+— and in the twelve frozen RQ4 arms below, which are held to the same values.
+`tests/test_nec_ablation_parity.py` enforces that across all 27.
 
 Two of those were wrong until recently, and both are worth knowing about if you
 are reading older runs:
@@ -1000,7 +1201,7 @@ are reading older runs:
   a trailing partial episode are never written — a loss proportional to
   `num_envs` — and MFEC measured that 16 envs keep 39% fewer unique states than
   4 at equal frames. The baseline was being handicapped against the encoders it
-  is compared to. All twelve now run 8 (and `num_eval_episodes: 5`, which was
+  is compared to. All fifteen now run 8 (and `num_eval_episodes: 5`, which was
   10 on the ConvNet arms and gave them a different standard error).
 
 ```shell
@@ -1010,10 +1211,64 @@ python src/train.py experiment=nec/frostbite
 # The whole game sweep for one encoder, five seeds each:
 python src/train.py -m experiment=nec/mspacman,nec/qbert,nec/frostbite \
     trainer.seed=42,43,44,45,46
+
+# The same for a PVM arm — swap the suffix (_dinov2 / _clip / _mae / _resnet):
+python src/train.py -m \
+    experiment=nec/mspacman_dinov2,nec/qbert_dinov2,nec/frostbite_dinov2 \
+    trainer.seed=42,43,44,45,46
 ```
+
+The three sweeps behind the reported NEC results are listed together under
+"Reproducing the thesis results".
 
 Run directories are `nec_{game}_{encoder}_seed{n}`, and `run.game` / `run.encoder`
 are set explicitly in every file so a multirun cannot collide.
+
+### The RQ4 frozen control — the same four PVMs, trunk frozen
+
+`configs/experiment/nec/{game}_{pvm}_frozen.yaml`, twelve files, one per
+(game, PVM). Each is its finetuned counterpart with exactly one functional line
+changed:
+
+```yaml
+algorithm:
+  embedding_network:
+    freeze_backbone: true
+```
+
+**Why it exists.** RQ4 asks whether finetuning a pretrained encoder beats
+keeping its features fixed, and neither reported grid can answer it: every MFEC
+run is frozen and every finetuned-NEC run is finetuned, so `algorithm` and
+`training regime` are bundled. These twelve arms unbundle them —
+frozen-NEC vs finetuned-NEC isolates finetuning with the algorithm held fixed;
+frozen-NEC vs frozen-MFEC isolates the algorithm with the regime held fixed.
+
+**What "frozen" does and does not mean.** `freeze_backbone` freezes the
+*pretrained trunk* only. The 1x1 channel adapter and the `Linear(trunk_dim, 64)`
+head are randomly initialised, not pretrained, and they keep training — NEC has
+no other way to key a DND at `embedding_dim=64`. `param_groups` then drops the
+now-empty backbone group, so the optimizer sees a single group at
+`algorithm.lr` and `backbone_lr_scale` becomes inert. Verified on the real
+ImageNet ResNet-18: 0 of 11,176,512 trunk parameters receive a gradient or
+change after an RMSProp step, while the 32,847 adapter + head parameters do.
+
+So this is a frozen-**features** control, not MFEC's bit-exact fixed phi, whose
+keys never move at all. Say so whenever the two are compared.
+
+```shell
+# One arm:
+python src/train.py experiment=nec/frostbite_dinov2_frozen
+
+# The whole game sweep for one frozen PVM, five seeds each:
+python src/train.py -m \
+    experiment=nec/mspacman_mae_frozen,nec/qbert_mae_frozen,nec/frostbite_mae_frozen \
+    trainer.seed=42,43,44,45,46
+```
+
+Guarded by `tests/test_nec_frozen_control.py` (freeze flag set, exactly one
+setting differs from the finetuned arm, no run-name or W&B-group collision
+across all 27 NEC arms) and by `tests/test_nec_ablation_parity.py`, which holds
+the frozen arms to the same learning knobs as every other arm.
 
 ### The contract
 
@@ -1028,7 +1283,12 @@ factory(obs_shape: Sequence[int], embedding_dim: int, **kwargs) -> nn.Module
 `(B, *obs_shape) -> (B, embedding_dim)` float32. **All parameters must be
 trainable by default** — `NECAlgorithm.setup()` hands
 `embedding_net.parameters()` straight to the optimizer, so a frozen
-parameter is a dead one. The output must not be pre-normalised: NEC
+parameter is a dead one. (A network that *defines* `param_groups` is the
+exception: `_build_optimizer` prefers it and it filters out
+`requires_grad=False` params, which is what makes the opt-in
+`freeze_backbone: true` of the RQ4 control sound rather than a silent
+dead-parameter bug. Default-off remains the rule — the four PVM group configs
+all ship `freeze_backbone: false`.) The output must not be pre-normalised: NEC
 L2-normalises before every DND read/write, and that normalisation is what
 keeps the inverse-distance kernel from collapsing (see
 `tests/test_nec_kernel_scale.py`).
@@ -1248,7 +1508,7 @@ embedding norm pretrained against 0.44 % at random init — a 1.5× gap, where
 CLIP's is 10×. That is this arm's headline result at initialisation: masked
 pixel reconstruction does not organise Atari frames the way a similarity
 objective does. `kernel_delta` is deliberately **not** changed for this arm; if
-it needs to move it moves for all twelve, and gets declared.
+it needs to move it moves for all fifteen, and gets declared.
 
 Checkpoints are 686 MB (85.7 M params plus RMSProp state) and ~801 MB once the
 DND fills, so ~16 GB per 1M-step run at the default checkpoint interval.

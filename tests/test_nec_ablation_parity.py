@@ -1,9 +1,18 @@
-"""The twelve NEC encoder-ablation arms must differ ONLY in the encoder.
+"""The NEC encoder-ablation arms must differ ONLY in the encoder.
 
-3 games x 4 encoders (`nature`, `dinov2_finetune`, `clip_finetune`,
-`mae_finetune`).  Hydra experiment configs do not compose with each other, so
-every shared setting is repeated verbatim in all twelve files and nothing but a
-test keeps them in step.
+3 games x 9 arms: the `nature` baseline, the four finetuned PVMs
+(`resnet_finetune`, `dinov2_finetune`, `clip_finetune`, `mae_finetune`) and the
+four frozen-PVM RQ4 controls (the same four groups with
+`freeze_backbone: true`).  Hydra experiment configs do not compose with each
+other, so every shared setting is repeated verbatim in all 27 files and nothing
+but a test keeps them in step.
+
+`_resnet` was absent from ``ENCODERS`` until the frozen controls landed, so the
+three supervised arms were shipped unguarded — they did in fact match, but by
+luck rather than by test.  The frozen arms are guarded from the start:
+`freeze_backbone` lives under `algorithm.embedding_network`, not in
+``ALGORITHM_KNOBS``, so a frozen arm is required to match its `nature` baseline
+on every knob below exactly like a finetuned one.
 
 ``tests/test_nec_mae_finetune.py::test_the_mae_arm_holds_every_learning_knob_identical``
 already pinned the algorithm-side knobs for the three ``_mae`` files.  This
@@ -32,7 +41,9 @@ import itertools
 import pytest
 
 GAMES = ("mspacman", "qbert", "frostbite")
-ENCODERS = ("", "_dinov2", "_clip", "_mae")
+PVMS = ("_resnet", "_dinov2", "_clip", "_mae")
+#: "" is the `nature` baseline; the `_frozen` suffixes are the RQ4 controls.
+ENCODERS = ("", *PVMS, *(f"{p}_frozen" for p in PVMS))
 
 #: Everything that moves the learning curve.  A knob added to the ablation
 #: belongs here, not in a comment.

@@ -1,0 +1,91 @@
+# @package _global_
+# NEC on ALE/Frostbite-v5 with a FROZEN ImageNet ResNet-18 as the embedding network
+# — the Frostbite cell of the RQ4 frozen-vs-finetuned control.
+#
+# This is nec/frostbite_resnet.yaml with exactly ONE functional knob flipped:
+# `algorithm.embedding_network.freeze_backbone: true`. The env pair, gamma,
+# n_step, reward scale, episode boundaries, exploration schedule, trainer budget
+# and the encoder's own weights/resolution are all held identical, so the only
+# variable against nec/frostbite_resnet.yaml is whether the pretrained trunk
+# receives gradients.
+#
+# WHY THIS ARM EXISTS. RQ4 asks whether finetuning a pretrained encoder beats
+# keeping its features fixed. In the grids the thesis reports that question is
+# not answerable: MFEC is frozen in all 90 of its runs and NEC is finetuned in
+# all 60 of its own, so `algorithm` and `training regime` are bundled and no
+# contrast isolates the regime. This file is the missing cell. With it:
+#
+#   * frozen-NEC vs finetuned-NEC (nec/frostbite_resnet.yaml) holds the ALGORITHM
+#     fixed and isolates finetuning — the RQ4 contrast;
+#   * frozen-NEC vs frozen-MFEC (experiment/mfec/resnet.yaml) holds the TRAINING
+#     REGIME fixed and isolates the algorithm — the contrast the thesis
+#     currently cannot make cleanly either.
+#
+# WHAT "FROZEN" MEANS HERE, PRECISELY — do not overstate it. `freeze_backbone`
+# freezes the PRETRAINED TRUNK only. The 1x1 channel adapter and the Linear head
+# are randomly initialised, not pretrained, and they keep training: NEC has no
+# other way to key a DND at embedding_dim=64. `param_groups` then drops the
+# empty backbone group, the optimizer sees a single group at `algorithm.lr`, and
+# `backbone_lr_scale` becomes inert. So this is a frozen-FEATURES control, NOT
+# the bit-exact fixed phi of the MFEC arms, whose keys never move at all. State
+# that whenever the two are put side by side.
+#
+# RUN NAMING. `run.encoder: resnet_frozen` makes the run directory and the W&B
+# group `nec_frostbite_resnet_frozen`, which must NOT be shortened back to
+# `resnet`: that is the finetuned arm's name, and reusing it would overwrite its
+# checkpoints and average two different arms into one mean +/- SEM curve.
+#
+# NUM_ENVS STAYS AT 8. A frozen trunk needs no backward pass and would tolerate
+# more envs, but `num_envs` is learning-relevant for NEC (writes happen at
+# episode end) and tests/test_nec_ablation_parity.py pins it across every arm.
+# Raising it here would buy throughput by voiding the comparison.
+#
+# BATCHNORM. `freeze_batchnorm: true` (the group default) already held every
+# BatchNorm at its ImageNet running statistics. With the trunk frozen as well,
+# this backbone is now fully deterministic: no weight receives a gradient and no
+# running statistic updates, so phi(o) depends on nothing but o and the
+# trainable 1x1 adapter in front of it.
+#
+# NO OPTIONAL DEPENDENCY — torchvision is a core dependency, unlike the clip
+# (`uv sync --extra clip`) and mae (`uv sync --extra mae`) arms.
+defaults:
+  - override /algorithm: nec_atari
+  - override /environment: frostbite_nec_train
+  - override /environment@eval_environment: frostbite_nec_eval
+  - override /algorithm/embedding_network: resnet_finetune
+  - _self_
+
+run:
+  algorithm: nec
+  game: frostbite
+  # See RUN NAMING above — this must stay distinct from nec/frostbite_resnet.yaml.
+  encoder: resnet_frozen
+
+algorithm:
+  embedding_network:
+    # THE RQ4 KNOB. This is the only functional line that differs from
+    # nec/frostbite_resnet.yaml.
+    freeze_backbone: true
+    weights_path: null
+    model_name: resnet18
+    image_size: 224
+
+  # Held identical to nec/frostbite.yaml and every other arm of the ablation.
+  num_updates: 100
+  eps_end: 0.001
+  annealing_frames: 10_000
+  init_random_frames: 4_800
+  eval_eps: 0.005
+
+trainer:
+  # Identical to nec/frostbite_resnet.yaml — see that file for the reasoning behind
+  # each value. total_frames counts AGENT STEPS at action-repeat 4, so this is
+  # 400k raw ALE frames.
+  total_frames: 100_000
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  num_envs: 8
+  log_every_n_steps: 5_000
+  eval_every_n_steps: 10_000
+  num_eval_episodes: 5

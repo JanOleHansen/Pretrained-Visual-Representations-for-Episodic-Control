@@ -1,0 +1,87 @@
+# @package _global_
+# NEC on ALE/Qbert-v5 with a FROZEN DINOv2 ViT-S/14 as the embedding network
+# — the Q*bert cell of the RQ4 frozen-vs-finetuned control.
+#
+# This is nec/qbert_dinov2.yaml with exactly ONE functional knob flipped:
+# `algorithm.embedding_network.freeze_backbone: true`. The env pair, gamma,
+# n_step, reward scale, episode boundaries, exploration schedule, trainer budget
+# and the encoder's own weights/resolution are all held identical, so the only
+# variable against nec/qbert_dinov2.yaml is whether the pretrained trunk
+# receives gradients.
+#
+# WHY THIS ARM EXISTS. RQ4 asks whether finetuning a pretrained encoder beats
+# keeping its features fixed. In the grids the thesis reports that question is
+# not answerable: MFEC is frozen in all 90 of its runs and NEC is finetuned in
+# all 60 of its own, so `algorithm` and `training regime` are bundled and no
+# contrast isolates the regime. This file is the missing cell. With it:
+#
+#   * frozen-NEC vs finetuned-NEC (nec/qbert_dinov2.yaml) holds the ALGORITHM
+#     fixed and isolates finetuning — the RQ4 contrast;
+#   * frozen-NEC vs frozen-MFEC (experiment/mfec/dinov2.yaml) holds the TRAINING
+#     REGIME fixed and isolates the algorithm — the contrast the thesis
+#     currently cannot make cleanly either.
+#
+# WHAT "FROZEN" MEANS HERE, PRECISELY — do not overstate it. `freeze_backbone`
+# freezes the PRETRAINED TRUNK only. The 1x1 channel adapter and the Linear head
+# are randomly initialised, not pretrained, and they keep training: NEC has no
+# other way to key a DND at embedding_dim=64. `param_groups` then drops the
+# empty backbone group, the optimizer sees a single group at `algorithm.lr`, and
+# `backbone_lr_scale` becomes inert. So this is a frozen-FEATURES control, NOT
+# the bit-exact fixed phi of the MFEC arms, whose keys never move at all. State
+# that whenever the two are put side by side.
+#
+# RUN NAMING. `run.encoder: dinov2_frozen` makes the run directory and the W&B
+# group `nec_qbert_dinov2_frozen`, which must NOT be shortened back to
+# `dinov2`: that is the finetuned arm's name, and reusing it would overwrite its
+# checkpoints and average two different arms into one mean +/- SEM curve.
+#
+# NUM_ENVS STAYS AT 8. A frozen trunk needs no backward pass and would tolerate
+# more envs, but `num_envs` is learning-relevant for NEC (writes happen at
+# episode end) and tests/test_nec_ablation_parity.py pins it across every arm.
+# Raising it here would buy throughput by voiding the comparison.
+defaults:
+  - override /algorithm: nec_atari
+  - override /environment: qbert_nec_train
+  - override /environment@eval_environment: qbert_nec_eval
+  - override /algorithm/embedding_network: dinov2_finetune
+  - _self_
+
+run:
+  algorithm: nec
+  game: qbert
+  # See RUN NAMING above — this must stay distinct from nec/qbert_dinov2.yaml.
+  encoder: dinov2_frozen
+
+algorithm:
+  embedding_network:
+    # THE RQ4 KNOB. This is the only functional line that differs from
+    # nec/qbert_dinov2.yaml.
+    freeze_backbone: true
+    # Same checkpoint as the finetuned arm and as MFEC's frozen dinov2 arm.
+    # Override on the CLI if your copy lives elsewhere:
+    #   algorithm.embedding_network.weights_path=/path/dinov2_vits14_pretrain.pth
+    weights_path: /datahome/rschwinger/models/dinov2_vits14_pretrain.pth
+    # Set to a local clone of facebookresearch/dinov2 on a host with no
+    # outbound network; torch.hub also reuses an already-downloaded
+    # ~/.cache/torch/hub checkout without touching the network.
+    repo_dir: null
+
+  # Held identical to nec/qbert.yaml and every other arm of the ablation.
+  num_updates: 100
+  eps_end: 0.001
+  annealing_frames: 10_000
+  init_random_frames: 4_800
+  eval_eps: 0.005
+
+trainer:
+  # Identical to nec/qbert_dinov2.yaml — see that file for the reasoning behind
+  # each value. total_frames counts AGENT STEPS at action-repeat 4, so this is
+  # 400k raw ALE frames.
+  total_frames: 100_000
+  seed: 42
+  accelerator: gpu
+  devices: [0]
+  num_envs: 8
+  log_every_n_steps: 5_000
+  eval_every_n_steps: 10_000
+  num_eval_episodes: 5

@@ -20,13 +20,23 @@ Implemented experiments:
 | MFEC      | ALE/Qbert-v5     | `experiment=mfec/qbert`        |
 | MFEC      | any ALE game     | `experiment=mfec/{rp_gray,rp_rgb,vae,dinov2,resnet,clip,mae} game=<Game>` |
 | NEC       | ALE/Pong-v5      | `experiment=nec/pong`          |
-| NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman{,_dinov2,_clip,_mae}` |
-| NEC       | ALE/Qbert-v5     | `experiment=nec/qbert{,_dinov2,_clip,_mae}`    |
-| NEC       | ALE/Frostbite-v5 | `experiment=nec/frostbite{,_dinov2,_clip,_mae}` |
+| NEC       | ALE/MsPacman-v5  | `experiment=nec/mspacman{,_dinov2,_clip,_mae,_resnet}` |
+| NEC       | ALE/Qbert-v5     | `experiment=nec/qbert{,_dinov2,_clip,_mae,_resnet}`    |
+| NEC       | ALE/Frostbite-v5 | `experiment=nec/frostbite{,_dinov2,_clip,_mae,_resnet}` |
+| NEC (RQ4) | the 3 above      | `experiment=nec/<game>_{dinov2,clip,mae,resnet}_frozen` — same arms, `freeze_backbone: true` |
 
-The last three rows are the **NEC encoder ablation**: 3 games x 4 encoders,
-twelve arms, all learning-relevant settings held identical. See "The NEC encoder
-ablation" below before touching any of them.
+Rows 4-6 are the **NEC encoder ablation**: 3 games x 5 encoders, fifteen arms,
+all learning-relevant settings held identical. See "The NEC encoder ablation"
+below before touching any of them.
+
+The last row is the **RQ4 frozen control**: the same four PVM arms with the
+pretrained trunk frozen, twelve more files, 60 runs. It is NOT part of the
+reported grids. `freeze_backbone` freezes the trunk only — the 1x1 adapter and
+the Linear head still train, so it is a frozen-*features* control, not MFEC's
+bit-exact fixed phi. `tests/test_nec_frozen_control.py` pins that each frozen
+file differs from its finetuned counterpart in that one setting and nothing
+else, and that `run.encoder: <pvm>_frozen` keeps the run directory and W&B group
+off the finetuned arm's.
 
 The MFEC row is the **MFEC encoder ablation**: 7 encoders x whichever `game` is
 passed, run over the same three games (Ms. Pac-Man, Q\*bert, Frostbite). It has
@@ -677,7 +687,14 @@ configs/
                               the most expensive of the three; the ViT arms here are the
                               heaviest runs in the study (the resnet arm is the
                               lightest arm on the heaviest game)
-                              ALL FIFTEEN ablation files repeat their shared settings
+  experiment/nec/{mspacman,qbert,frostbite}_{dinov2,clip,mae,resnet}_frozen.yaml — the
+                              RQ4 frozen control: each is its finetuned counterpart with
+                              algorithm.embedding_network.freeze_backbone: true and
+                              run.encoder: <pvm>_frozen, nothing else. Trunk frozen,
+                              1x1 adapter + Linear head still trained (param_groups drops
+                              the empty backbone group, so backbone_lr_scale is inert).
+                              NOT part of the reported grids; 60 runs.
+                              ALL TWENTY-SEVEN ablation files repeat their shared settings
                               verbatim (Hydra experiment configs do not compose with
                               each other) — a change that belongs to the comparison has
                               to land in all fifteen
@@ -703,7 +720,17 @@ tests/
                               rounding at 1e9 (ULP 64.0) and stay above the trainer's 1e8
                               sentinel threshold, and FINITE estimates must stay
                               bit-identical across calls (eval determinism)
-  test_nec_ablation_parity.py — the twelve encoder-ablation arms differ ONLY in the
+  test_nec_frozen_control.py — the twelve RQ4 frozen arms: freeze_backbone is set, the
+                              embedding_network block differs from the finetuned
+                              counterpart on freeze_backbone and NOTHING else, and
+                              run.name / run.group are unique across all 27 NEC arms
+                              (a collision would overwrite the finetuned arm's
+                              checkpoints and average two arms into one W&B curve).
+                              Freeze MECHANICS are not retested here — they live in the
+                              four test_nec_*_finetune.py files, which have the stub
+                              backbones needed to build a network without a download
+  test_nec_ablation_parity.py — all 27 encoder-ablation arms (nature + 4 finetuned PVMs
+                              + 4 frozen PVMs, x 3 games) differ ONLY in the
                               encoder: every algorithm- and trainer-side knob is compared
                               arm-vs-nature-baseline and across games (this is what
                               catches a num_envs or num_eval_episodes drift), plus the
@@ -2541,8 +2568,9 @@ per-env raw-pixel carry, on top of the DND).
 Now 5 everywhere.
 
 Parity is guarded by `tests/test_nec_ablation_parity.py`, which checks every
-algorithm- and trainer-side knob for all twelve arms against their `nature`
-baseline **and** across games.
+algorithm- and trainer-side knob for all 27 arms — the `nature` baseline, the
+four finetuned PVMs and the four frozen RQ4 controls, on each of the three
+games — against their `nature` baseline **and** across games.
 `tests/test_nec_mae_finetune.py::test_the_mae_arm_holds_every_learning_knob_identical`
 is the older, narrower version of the same check for the three `_mae` files.
 
