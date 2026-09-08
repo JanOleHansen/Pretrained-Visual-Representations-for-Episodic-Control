@@ -30,3 +30,10 @@ htmlcov/
 
 # OS
 .DS_Store
+
+# Embedding analysis (scripts/build_probe_set.py, scripts/extract_embeddings.py).
+# probe_sets/ is ~1.2 GB per game of raw frames and stays on the cluster;
+# embeddings/ is the ~2 GB of per-run npz the figures are built from. Both are
+# regenerable from the checkpoints -- see Bachelorthesis/EMBEDDING_ANALYSIS.md.
+probe_sets/
+embeddings/
