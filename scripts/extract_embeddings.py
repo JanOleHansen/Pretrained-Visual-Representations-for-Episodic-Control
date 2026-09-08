@@ -106,6 +106,22 @@ def parse_run_name(name: str) -> dict:
     return d
 
 
+def in_study(name: str) -> bool:
+    """Is this run part of the encoder ablation this analysis is about?
+
+    The cluster holds more than the study: BankHeist and H.E.R.O. arms, and the
+    ``*_frozen_*`` NEC controls that were never completed.  They are skipped
+    rather than failed on -- a run outside the grid is not an error, and letting
+    it raise would bury the real failures in a wall of tracebacks at the end of
+    an hour-long pass.
+    """
+    try:
+        info = parse_run_name(name)
+    except ValueError:
+        return False
+    return "_frozen" not in info["encoder"]
+
+
 # ---------------------------------------------------------------------------
 # Memory contents
 # ---------------------------------------------------------------------------
@@ -415,8 +431,13 @@ def main() -> int:
     if args.run_dir:
         run_dirs = [Path(args.run_dir)]
     else:
-        run_dirs = sorted(d for d in Path(args.run_root).iterdir()
-                          if d.is_dir() and _RUN_RE.match(d.name))
+        candidates = sorted(d for d in Path(args.run_root).iterdir()
+                            if d.is_dir() and _RUN_RE.match(d.name))
+        run_dirs = [d for d in candidates if in_study(d.name)]
+        skipped = len(candidates) - len(run_dirs)
+        if skipped:
+            print(f"skipping {skipped} run(s) outside the encoder ablation "
+                  f"(other games, or *_frozen_* controls)")
     if args.only:
         run_dirs = [d for d in run_dirs if any(s in d.name for s in args.only)]
     if not run_dirs:

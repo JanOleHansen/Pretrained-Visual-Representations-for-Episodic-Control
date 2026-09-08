@@ -112,18 +112,27 @@ def _env_from_config(config_name: str, game: str, seed: int):
     from omegaconf import OmegaConf
 
     cfg = OmegaConf.load(CONFIG_DIR / f"{config_name}.yaml")
+
+    # Whether this config is game-generic has to be read from the RAW node.
+    # `resolve=True` collapses `ALE/${oc.select:game,MsPacman}-v5` to
+    # `ALE/MsPacman-v5` -- the interpolation is gone by then, so a check made on
+    # the resolved string cannot tell a generic config from one that really is
+    # pinned to Ms. Pac-Man, and would reject the generic MFEC envs for every
+    # game except the default.
+    raw_name = str(OmegaConf.to_container(cfg, resolve=False).get("name", ""))
+    generic = "${" in raw_name
+
     kwargs = {k: v for k, v in OmegaConf.to_container(cfg, resolve=True).items()
               if k != "_target_"}
 
     want = f"ALE/{game}-v5"
-    if kwargs.get("name") not in (want, None) and "${" not in str(kwargs.get("name")):
-        # A per-game config that names a different game: the caller mapped the
-        # game to the wrong file, which would silently probe the wrong ROM.
-        if not kwargs["name"].startswith(f"ALE/{game}"):
-            raise SystemExit(
-                f"{config_name}.yaml names {kwargs['name']!r}, not {want!r} — "
-                "GAME_SLUG and the config file disagree about the game."
-            )
+    if not generic and not str(kwargs.get("name", "")).startswith(f"ALE/{game}"):
+        # A per-game config (the NEC envs hard-code their own name) paired with
+        # the wrong game: without this it would silently probe the wrong ROM.
+        raise SystemExit(
+            f"{config_name}.yaml names {kwargs.get('name')!r}, not {want!r} — "
+            "GAME_SLUG and the config file disagree about the game."
+        )
     kwargs["name"] = want
 
     return make_env(**kwargs, num_envs=1, device="cpu", seed=seed)
@@ -302,6 +311,23 @@ def main() -> int:
     g1,  complete = returns_to_go(rewards, dones, 1.0)
     g099, _       = returns_to_go(rewards, dones, 0.99)
     episodes = episode_index(dones)
+
+    # Downstream the probe's cross-validation folds are GROUPED BY EPISODE, and
+    # with fewer episodes than folds it silently falls back to a shuffled split
+    # -- which leaks adjacent near-identical frames across the split and inflates
+    # every R^2 toward 1.  A probe set that cannot support the grouping is worse
+    # than no probe set, so refuse to write one here rather than let the
+    # inflation surface as a suspiciously good result an hour later.
+    n_complete = int(complete.sum())
+    n_episodes = int(dones.sum())
+    if n_episodes < 8 or n_complete < 500:
+        raise SystemExit(
+            f"only {n_episodes} complete episode(s) and {n_complete} usable rows "
+            f"in {args.frames} frames — too few to group cross-validation folds "
+            f"by episode.\nRaise --frames (a random policy needs roughly "
+            f"500 agent steps per episode on these games; 10000 frames gives "
+            f"~20-30 episodes)."
+        )
 
     # Bioacoustics-style classification target: does a reward land within the
     # next H steps?  A linear probe's balanced accuracy on this is the direct
