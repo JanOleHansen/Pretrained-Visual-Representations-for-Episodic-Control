@@ -107,13 +107,22 @@ def parse_run_name(name: str) -> dict:
 
 
 def in_study(name: str) -> bool:
-    """Is this run part of the encoder ablation this analysis is about?
+    """Is this run part of the *embedding* analysis?
 
-    The cluster holds more than the study: BankHeist and H.E.R.O. arms, and the
-    ``*_frozen_*`` NEC controls that were never completed.  They are skipped
-    rather than failed on -- a run outside the grid is not an error, and letting
-    it raise would bury the real failures in a wall of tracebacks at the end of
-    an hour-long pass.
+    Skipped rather than failed on -- a run outside this analysis is not an
+    error, and letting it raise would bury the real failures in a wall of
+    tracebacks at the end of an hour-long pass.
+
+    Two different exclusions live here.  BankHeist and H.E.R.O. arms are not
+    part of the thesis at all.  The ``*_frozen_*`` NEC runs *are* -- they are
+    the RQ4 control and the grid is complete as of 2026-09-11 -- but they are
+    excluded from the embedding extraction deliberately: the matched probe set
+    is built from uniform-random frames, which is off distribution for any
+    network trained on its own policy's states, and
+    Section~\\ref{sec:embedding-geometry} makes no claim from NEC for exactly
+    that reason.  Extracting them would cost an hour of ViT passes to produce
+    numbers the thesis does not use.  Drop the ``_frozen`` clause below if that
+    changes.
     """
     try:
         info = parse_run_name(name)
