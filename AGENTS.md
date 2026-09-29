@@ -3019,6 +3019,33 @@ and for warm-starting early training.
 The same VecNorm restriction that applies to MFEC applies to NEC
 environments — use `pong_mfec_train.yaml` (no VecNorm) for NEC Pong.
 
+## Analysis (`analysis/`)
+
+Every figure, table and quoted number in the thesis is produced by a script in
+`analysis/`, reading only `analysis/data/` (plus `embeddings/` and
+`probe_sets/` for the two scripts that need raw embeddings). The README's
+"Reproducing the thesis results" section has the figure-to-script table.
+
+- `analysis/make_figures.py::load()` is the **single** definition of which runs
+  count (finished; MFEC runs with `eval/memory_hit_rate == 0` over a non-empty
+  buffer dropped; latest duplicate wins). Every other script imports it. Do not
+  add a second filter anywhere else, and do not reintroduce a date-based one.
+- Three environments, on purpose: `requirements-figures.txt`,
+  `requirements-rliable.txt` (rliable needs `arch<8`, which needs pandas 2.x)
+  and `requirements-embedding.txt` (scikit-learn, umap-learn). Do not merge them.
+- The bootstrap resamples seeds only (`task_bootstrap` left at its default);
+  games are held fixed. Do not describe it as resampling games.
+- Outputs go to `analysis/figures/` (thesis sizing) and
+  `analysis/figures/deck/` (defence deck). The thesis and deck versions share
+  file names, so never point both at one directory.
+- `make_embedding_figures.py --skip-metrics --skip-umap` rebuilds Fig. 16,
+  Table 4 and `embedding_numbers.txt` from the bundled
+  `data/embedding_metrics.csv` and `data/probe_labels/` without the 4 GB of
+  embeddings. Keep that path working.
+- After changing any analysis script, rerun it and diff its `.tex`/`.txt`
+  outputs against the committed versions. Compare PDFs by rasterising them,
+  because the bytes contain timestamps.
+
 ## What not to do
 
 - Do not place learning-affecting knobs on `trainer:` or `environment:` configs.

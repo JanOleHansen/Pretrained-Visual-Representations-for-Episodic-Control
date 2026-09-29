@@ -1,0 +1,46 @@
+RQ4 -- NEC, fine-tuned vs frozen (freeze_backbone the only difference)
+  20000 bootstrap resamples, 5 seeds x 3 games
+
+P(fine-tuned > frozen), [95% CI]:
+  All games
+    ResNet           0.507  [0.307, 0.720]
+    DINOv2           0.667  [0.493, 0.827]
+    CLIP             0.580  [0.360, 0.800]
+    MAE              0.627  [0.400, 0.827]
+  MsPacman
+    ResNet           0.280  [0.000, 0.640]
+    DINOv2           0.800  [0.400, 1.000]
+    CLIP             0.600  [0.200, 1.000]
+    MAE              0.640  [0.240, 1.000]
+  Qbert
+    ResNet           0.680  [0.320, 1.000]
+    DINOv2           0.280  [0.000, 0.640]
+    CLIP             0.420  [0.020, 0.800]
+    MAE              0.800  [0.400, 1.000]
+  Frostbite
+    ResNet           0.560  [0.160, 0.920]
+    DINOv2           0.920  [0.680, 1.000]
+    CLIP             0.720  [0.320, 1.000]
+    MAE              0.440  [0.000, 0.840]
+
+human-normalized score per cell (%), mean +- sd over seeds:
+  ResNet
+    MsPacman   fine-tuned   7.41+- 4.62   frozen  12.12+- 3.97   delta  -4.71
+    Qbert      fine-tuned   3.31+- 1.09   frozen   2.32+- 1.26   delta  +0.99
+    Frostbite  fine-tuned  13.71+-11.82   frozen  12.74+-12.76   delta  +0.96
+    mean delta over games: -0.92
+  DINOv2
+    MsPacman   fine-tuned   9.16+- 1.93   frozen   6.86+- 1.30   delta  +2.29
+    Qbert      fine-tuned   3.39+- 0.74   frozen   4.01+- 0.67   delta  -0.62
+    Frostbite  fine-tuned  17.50+-12.14   frozen   3.74+- 0.97   delta +13.76
+    mean delta over games: +5.15
+  CLIP
+    MsPacman   fine-tuned  10.01+- 6.47   frozen   6.91+- 5.27   delta  +3.10
+    Qbert      fine-tuned   3.07+- 1.09   frozen   2.84+- 1.71   delta  +0.23
+    Frostbite  fine-tuned  11.55+-11.56   frozen   3.06+- 0.63   delta  +8.49
+    mean delta over games: +3.94
+  MAE
+    MsPacman   fine-tuned   9.36+- 6.63   frozen   6.23+- 2.32   delta  +3.13
+    Qbert      fine-tuned   3.39+- 0.48   frozen   2.24+- 1.14   delta  +1.16
+    Frostbite  fine-tuned   3.34+- 0.75   frozen   3.48+- 0.74   delta  -0.13
+    mean delta over games: +1.39

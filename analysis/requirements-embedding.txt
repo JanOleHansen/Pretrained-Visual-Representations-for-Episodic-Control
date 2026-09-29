@@ -1,0 +1,8 @@
+# Embedding-geometry analysis (make_embedding_figures.py,
+# make_umap_thumbnails.py, make_collapse_numbers.py). Python 3.12.
+numpy==2.2.6
+pandas==3.0.5
+scipy==1.18.1
+matplotlib==3.11.1
+scikit-learn==1.9.0
+umap-learn==0.5.12

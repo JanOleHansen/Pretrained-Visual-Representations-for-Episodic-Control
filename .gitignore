@@ -37,3 +37,12 @@ htmlcov/
 # regenerable from the checkpoints -- see Bachelorthesis/EMBEDDING_ANALYSIS.md.
 probe_sets/
 embeddings/
+
+# Stray run logs at the repository root (Hydra logs go under logs/)
+*.log
+
+# Per-user Claude Code settings
+.claude/settings.local.json
+
+# Analysis environments (see analysis/requirements-*.txt)
+analysis/.venv-*/

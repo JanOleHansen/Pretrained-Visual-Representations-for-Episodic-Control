@@ -1,0 +1,2 @@
+time/collect,train/episode_length,train/episode_reward,train/dnd_blend_rate,_runtime,train/epsilon,train/dnd_size,_step,time/step,train/q_values,train/episodes_completed,_timestamp,time/speed
+9.096655514091253,485,271.25,0.09713375796178345,64.396057873,0.8721280097961426,395.6666666666667,6400,4.502366644330323,0,8,1787006904.1847513,117.65551826894811

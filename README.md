@@ -1,15 +1,224 @@
-<div align="center">
+# Pretrained Visual Representations for Episodic Control
 
-# TorchRL Hydra Template
+Code, experiment configurations and analysis scripts for the bachelor thesis
+*Pretrained Visual Representations for Episodic Control* (Jan Ole Hansen,
+Intelligent Systems Group, Kiel University, 2026; supervised by
+Prof. Dr. Sven Tomforde and M.Sc. Raphael Schwinger).
 
-A clean, modular template for deep reinforcement learning research.<br>
-Click on [<kbd>Use this template</kbd>](https://github.com/raphaelschwinger/torchrl-hydra-template/generate) to initialize a new repository.
+The thesis swaps the state encoder φ of Model-Free Episodic Control (MFEC) and
+Neural Episodic Control (NEC) between two random projections, NEC's
+from-scratch ConvNet and four pretrained vision backbones — ResNet-18,
+DINOv2 ViT-S/14, CLIP ViT-B/32 and MAE ViT-B/16 — on three Atari 100k games
+(Ms. Pac-Man, Q\*bert, Frostbite), five seeds per cell, 225 runs in total.
 
-_Suggestions are always welcome!_
+The code is built on the
+[TorchRL Hydra template](https://github.com/raphaelschwinger/torchrl-hydra-template)
+by Raphael Schwinger; its framework documentation follows the thesis section
+below ("About the framework").
 
-</div>
+## Repository layout
 
-## Philosophy
+| Path | Contents |
+|---|---|
+| `src/` | Algorithms (`mfec.py`, `nec.py`, …), encoders (`src/encoders/`), NEC embedding networks (`src/networks.py`), trainer, environments |
+| `configs/` | Hydra configs; `configs/experiment/mfec/*` and `configs/experiment/nec/*` are the thesis arms |
+| `tests/` | Unit tests, including the parity tests that pin "φ is the only thing that varies" |
+| `scripts/` | Embedding extraction for Section 6 (`build_probe_set.py`, `extract_embeddings.py`, `extract_all.sh`, `export_probe_frames.py`) and encoder diagnostics |
+| `analysis/` | Every script that produces a figure, table or quoted number in the thesis, plus the cached run data they read (`analysis/data/`) |
+| `analysis/figures/` | Script output, sized for the thesis; `analysis/figures/deck/` holds the defence-deck variants |
+
+## Installation
+
+```shell
+git clone https://github.com/JanOleHansen/Pretrained-Visual-Representations-for-Episodic-Control
+cd Pretrained-Visual-Representations-for-Episodic-Control
+uv sync --extra clip --extra mae      # training; clip/mae extras are needed for those arms
+```
+
+The analysis scripts use three small, separate environments (below), because
+rliable and pandas 3 cannot share one.
+
+## Reproducing the thesis results
+
+There are three independent stages. Stage 2 is the one most readers need: it
+rebuilds every figure, table and interval in the thesis from data that ships
+with this repository, in minutes, on a CPU.
+
+1. **Train** the 225 runs (GPU, days). Only needed to regenerate the run data.
+2. **Figures and numbers** from the bundled run cache (CPU, minutes; the
+   bootstrap takes about 40 min).
+3. **Embedding extraction** for Section 6 from the training checkpoints
+   (cluster). Only needed to recompute the embedding metrics or to redraw
+   Fig. 15; everything else in Section 6 is rebuilt from bundled data in
+   stage 2.
+
+### 1. Training runs
+
+Every run gets 100k agent decisions = 400k emulator frames (frame skip 4), the
+Atari 100k budget, with seeds 42–46. All three grids are complete.
+
+| Grid | Arms | Runs | Answers |
+|---|---|---|---|
+| MFEC, frozen φ | `rp_gray`, `rp_rgb`, `resnet`, `dinov2`, `clip`, `mae` | 6 × 3 × 5 = 90 | RQ1, RQ3 |
+| NEC, fine-tuned | ConvNet (`nec/<game>`), `_resnet`, `_dinov2`, `_clip`, `_mae` | 5 × 3 × 5 = 75 | RQ2 |
+| NEC, frozen backbone | `_resnet_frozen`, `_dinov2_frozen`, `_clip_frozen`, `_mae_frozen` | 4 × 3 × 5 = 60 | RQ4 |
+
+```shell
+# MFEC -- 90 runs. The env pair is game-generic, so the game is a sweep token.
+python src/train.py -m \
+    experiment=mfec/rp_gray,mfec/rp_rgb,mfec/resnet,mfec/dinov2,mfec/clip,mfec/mae \
+    game=MsPacman,Qbert,Frostbite \
+    trainer.seed=42,43,44,45,46
+
+# NEC, fine-tuned -- 75 runs. NEC's env configs are per game.
+for enc in "" _resnet _dinov2 _clip _mae; do
+  python src/train.py -m \
+      experiment=nec/mspacman$enc,nec/qbert$enc,nec/frostbite$enc \
+      trainer.seed=42,43,44,45,46
+done
+
+# NEC, frozen backbone (the RQ4 control) -- 60 runs. Differs from the
+# fine-tuned arm in freeze_backbone and nothing else
+# (pinned by tests/test_nec_frozen_control.py).
+for pvm in resnet dinov2 clip mae; do
+  python src/train.py -m \
+      experiment=nec/mspacman_${pvm}_frozen,nec/qbert_${pvm}_frozen,nec/frostbite_${pvm}_frozen \
+      trainer.seed=42,43,44,45,46
+done
+```
+
+Runs log to Weights & Biases (project `LatentLab/torchrl-hydra-template`);
+the analysis reads a cached export of that project, not the run directories.
+`configs/experiment/mfec/vae.yaml` exists but the VAE arm was **not run** and
+is not part of the thesis.
+
+**Run one sweep at a time.** The collector is CPU-bound, so concurrent sweeps
+do not add throughput: measured over 129 runs, the median runtime was 29 min
+with nothing else in flight, 47 min with one other sweep, 86 min with two and
+143 min with three.
+
+**Which runs count.** A run enters the analysis if it finished. For
+MFEC it must also have a readable memory: a run whose evaluation
+memory hit rate is exactly 0 over a non-empty buffer is dropped. That zero
+is the signature of the TF32 failure described in thesis Section 5.1. The
+rule is applied uniformly to all arms, and under it **no run is excluded**.
+The MFEC hit rate ranges from 0.017 to 0.363. Duplicates of the same
+(algorithm, game, encoder, seed) keep the latest run. The rule is `load()` in
+`analysis/make_figures.py`; it is the single definition every analysis script
+imports.
+
+### 2. Figures, tables and quoted numbers
+
+Everything in this stage runs from `analysis/`, reads `analysis/data/`, and
+writes to `analysis/figures/`.
+
+**Environments** (Python 3.12, versions pinned to the ones that produced the
+thesis):
+
+```shell
+cd analysis
+uv venv .venv-figures   --python 3.12 && uv pip install -p .venv-figures   -r requirements-figures.txt
+uv venv .venv-rliable   --python 3.12 && uv pip install -p .venv-rliable   -r requirements-rliable.txt
+uv venv .venv-embedding --python 3.12 && uv pip install -p .venv-embedding -r requirements-embedding.txt
+```
+
+**Commands**, in this order:
+
+```shell
+.venv-figures/bin/python   make_thesis_figures.py        # Figs 2-5, 14; Tables 2, 3      (~1 min)
+.venv-rliable/bin/python   make_rliable_figures.py       # Figs 6-13 + all interval numbers (~40 min)
+.venv-rliable/bin/python   make_convergence_numbers.py   # Section 5.3.3 numbers
+.venv-embedding/bin/python make_embedding_figures.py --skip-metrics --skip-umap
+                                                          # Fig 16, Table 4, Section 6 numbers
+# Need the extracted embeddings from stage 3 (not in the repository):
+.venv-embedding/bin/python make_umap_thumbnails.py       # Fig 15
+.venv-embedding/bin/python make_collapse_numbers.py      # Section 7.2 collapse numbers
+```
+
+`make_figures.py` is the shared run loader (validity rule, arm names,
+colours) that the other scripts import. Run on its own, it draws the
+defence-deck versions into `figures/deck/`.
+
+**Where each item in the thesis comes from:**
+
+| Thesis | Output file | Script |
+|---|---|---|
+| Fig. 1 (approach diagram) | drawn in TikZ in the thesis source | – |
+| Fig. 2 | `fig_summary.pdf` | `make_thesis_figures.py` |
+| Fig. 3 | `fig_mfec_curves.pdf` | `make_thesis_figures.py` |
+| Fig. 4 | `fig_nec_curves.pdf` | `make_thesis_figures.py` |
+| Fig. 5 | `fig_hns.pdf` | `make_thesis_figures.py` |
+| Table 2 | `tab_results.tex` | `make_thesis_figures.py` |
+| Table 3 | `tab_cost.tex` | `make_thesis_figures.py` |
+| Fig. 14 | `fig_retrieval.pdf` | `make_thesis_figures.py` |
+| Fig. 6 | `fig_rliable_aggregate.pdf` | `make_rliable_figures.py` |
+| Fig. 7 | `fig_rliable_profile.pdf` | `make_rliable_figures.py` |
+| Fig. 8 | `fig_rliable_poi.pdf` | `make_rliable_figures.py` |
+| Fig. 9 | `fig_rliable_aggregate_nec.pdf` | `make_rliable_figures.py` |
+| Fig. 10 | `fig_rliable_poi_nec.pdf` | `make_rliable_figures.py` |
+| Fig. 11 | `fig_rliable_aggregate_frozen.pdf` | `make_rliable_figures.py` |
+| Fig. 12 | `fig_rliable_poi_frozen.pdf` | `make_rliable_figures.py` |
+| Fig. 13 | `fig_rliable_rq4.pdf` | `make_rliable_figures.py` |
+| Intervals and PoI values quoted in Sections 5.3.2–5.3.5, 7, 8 | `rliable_numbers.txt`, `rliable_numbers_nec.txt`, `rliable_numbers_frozen.txt`, `rliable_numbers_rq4.txt` | `make_rliable_figures.py` |
+| Mid-budget vs. final scores, Section 5.3.3 | `convergence_numbers.txt` | `make_convergence_numbers.py` |
+| Fig. 15 | `embedding_retrieval_neighbours.pdf` | `make_umap_thumbnails.py` (needs stage 3) |
+| Fig. 16 | `embedding_probe_probe.pdf` | `make_embedding_figures.py` |
+| Table 4 | `embedding_table_probe.tex` | `make_embedding_figures.py` |
+| R², coherence, p-values and variance shares in Section 6 | `embedding_numbers.txt` | `make_embedding_figures.py` |
+| Share of embedding norm per arm, Section 7.2 | `collapse_numbers.txt` | `make_collapse_numbers.py` (needs stage 3) |
+| Tables 5, 6 (hyperparameters) | transcribed from `configs/` | – |
+
+The bootstrap is seeded (`--seed 0`, 20,000 resamples), so the interval
+numbers reproduce exactly.
+
+**Bundled data** (`analysis/data/`, about 3 MB):
+
+- `runs/runs_meta.csv` and `runs/wandb_cache/<run_id>.csv` hold the run summaries and evaluation histories. They are exported from W&B. `--refresh` on `make_thesis_figures.py` or `make_figures.py` re-pulls them and needs access to the W&B project.
+- `embedding_metrics.csv` holds the per-run probe and coherence metrics that Section 6 is computed from. This is what `--skip-metrics` reuses.
+- `probe_labels/probe_labels_<game>.npz` holds the returns, rewards and episode ids of the matched frame set. Section 6.1's episode-level variance shares come from these files.
+
+### 3. Embedding extraction (Section 6)
+
+The embeddings are computed from the training checkpoints, which stay on the
+cluster (~120 GB). The result is `embeddings/` (≈4 GB of per-run `.npz`)
+plus the matched frame sets in `probe_sets/` (about 2 GB per game). Both are gitignored.
+
+```shell
+# on the machine that holds the run directories
+RUNS=/path/to/logs/train/runs bash scripts/extract_all.sh
+#   = scripts/build_probe_set.py --game <Game>          (one seeded random-policy rollout per game)
+#   + scripts/extract_embeddings.py --run-root "$RUNS"  (embeds it with every run's encoder)
+
+# for Fig. 15 only: the raw frames of the Ms. Pac-Man probe set
+python scripts/export_probe_frames.py --game MsPacman
+```
+
+Copy `embeddings/` and `probe_sets/` into the repository root, then run
+`make_embedding_figures.py` **without** `--skip-metrics` to recompute
+`analysis/data/embedding_metrics.csv` from them. Run
+`make_umap_thumbnails.py` and `make_collapse_numbers.py` as well. Before it
+draws anything, `make_umap_thumbnails.py` checks that the local frames are
+the exact rollout the embeddings were computed on.
+
+### Numbers quoted from one-off measurements
+
+Some numbers in the thesis come from diagnostics rather than from the
+three grids:
+
+| Thesis statement | Where it is measured |
+|---|---|
+| Near-exact rescue tolerance vs. the nearest distinct frame, 0.307 (Section 4.3) | `scripts/encoder_diagnostics.py`; AGENTS.md, "CORRECTION: the rescue does NOT survive TF32" |
+| ε = 0.005 at evaluation costs MFEC ≈30 % (1038 vs. 1440) (Section 5.1) | `tests/test_mfec_estimator_gap.py`; AGENTS.md, "Why ε at evaluation was wrong" |
+| One fixed action sequence returns {380, 170, 180, 340} (Section 5.1) | AGENTS.md, "`num_eval_episodes` was 1 for a wrong reason" |
+| 16 environments keep 39 % fewer unique states than 4 (Section 5.1) | AGENTS.md, "The NEC encoder ablation"; `tests/test_nec_ablation_parity.py` |
+| (Not in the thesis.) Section 7.3 notes that the rescue tolerance was checked on ResNet-18 only; this measures it for every backbone | `scripts/thesis_followups.sh`, stage 1 |
+
+## About the framework
+
+The sections from here on document the TorchRL Hydra template the thesis code
+is built on, and the design decisions behind each thesis arm.
+
+### Philosophy
 
 Reinforcement learning code tends to become monolithic — training loop, environment
 setup, network construction, replay buffer, and update rule all tangled together.
@@ -68,7 +277,7 @@ Linear head (randomly initialised, and the only way to key a DND at
 `embedding_dim=64`) still train. That is a frozen-*features* control, not
 MFEC's bit-exact fixed phi. See "The RQ4 frozen control" below.
 
-## Main technologies
+### Main technologies
 
 **[TorchRL](https://github.com/pytorch/rl)** — A PyTorch-native library for
 reinforcement learning that provides modular primitives for environments, replay
@@ -81,11 +290,11 @@ that lets you compose hierarchical configs from multiple YAML files and override
 any parameter from the command line. Trivial to launch hyperparameter sweeps and
 keep every experiment setting version-controlled.
 
-## Quick start
+### Quick start
 
 ```shell
-git clone https://github.com/raphaelschwinger/torchrl-hydra-template
-cd torchrl-hydra-template
+git clone https://github.com/JanOleHansen/Pretrained-Visual-Representations-for-Episodic-Control
+cd Pretrained-Visual-Representations-for-Episodic-Control
 
 uv sync
 source .venv/bin/activate
@@ -108,181 +317,6 @@ GPU):
 ```shell
 python src/train.py experiment=dqn/pong
 ```
-
-## Reproducing the thesis results
-
-Everything reported in the thesis comes from four sweep commands, one validity
-filter, and one plotting script. This section is the whole path; the sections
-further down explain *why* each arm exists, which you do not need in order to
-re-run them.
-
-**Budget.** 100k agent decisions per run = 400k raw ALE frames (action repeat 4)
-— the Atari-100k probe budget, held identical across every arm and both
-algorithms. This is **not** the budget either source paper reports at: Pritzel
-et al. Table 3 is at 10M frames and Blundell et al. Figure 1 runs to 50M, so
-these runs are a controlled encoder comparison at a fixed small budget, not a
-reproduction of either paper's headline numbers. See "Reproducing MFEC on
-Atari" for what *is* readable against Figure 1.
-
-### 1. The two sweeps
-
-Five seeds per cell — 42–46 — because every reported number is a mean ± one
-standard error over seeds. Do not drop seeds to save time; the seed-to-seed
-spread is large (Q\*bert `rp_gray` is 1995 ± 663) and three seeds will not
-support an ordering claim.
-
-```shell
-# MFEC — 6 arms x 3 games x 5 seeds = 90 runs.
-# The env pair is game-generic, so the game is a sweep token, not a file.
-python src/train.py -m \
-    experiment=mfec/rp_gray,mfec/rp_rgb,mfec/dinov2,mfec/resnet,mfec/clip,mfec/mae \
-    game=MsPacman,Qbert,Frostbite \
-    trainer.seed=42,43,44,45,46
-
-# NEC — 5 arms x 3 games x 5 seeds = 75 runs.
-# NEC's env configs are per-game, so each (game, encoder) is its own file.
-python src/train.py -m \
-    experiment=nec/mspacman,nec/qbert,nec/frostbite \
-    trainer.seed=42,43,44,45,46
-python src/train.py -m \
-    experiment=nec/mspacman_dinov2,nec/qbert_dinov2,nec/frostbite_dinov2 \
-    trainer.seed=42,43,44,45,46
-python src/train.py -m \
-    experiment=nec/mspacman_clip,nec/qbert_clip,nec/frostbite_clip \
-    trainer.seed=42,43,44,45,46
-python src/train.py -m \
-    experiment=nec/mspacman_mae,nec/qbert_mae,nec/frostbite_mae \
-    trainer.seed=42,43,44,45,46
-python src/train.py -m \
-    experiment=nec/mspacman_resnet,nec/qbert_resnet,nec/frostbite_resnet \
-    trainer.seed=42,43,44,45,46
-```
-
-`uv sync --extra clip` is required for the two CLIP arms and `--extra mae` for
-MFEC's MAE arm; the rest need only `uv sync`.
-
-### 1b. The RQ4 frozen control
-
-A third sweep, **not** part of the two grids above and not reported in the
-thesis's results: 4 arms x 3 games x 5 seeds = **60 runs**. It exists because
-RQ4 (does finetuning beat frozen features?) is unanswerable from the two grids
-— MFEC is frozen in all 90 of its runs and NEC is finetuned in all 75 of its
-own, so algorithm and training regime move together.
-
-```shell
-# RQ4 — 4 frozen PVM arms x 3 games x 5 seeds = 60 runs.
-python src/train.py -m \
-    experiment=nec/mspacman_resnet_frozen,nec/qbert_resnet_frozen,nec/frostbite_resnet_frozen \
-    trainer.seed=42,43,44,45,46
-python src/train.py -m \
-    experiment=nec/mspacman_dinov2_frozen,nec/qbert_dinov2_frozen,nec/frostbite_dinov2_frozen \
-    trainer.seed=42,43,44,45,46
-python src/train.py -m \
-    experiment=nec/mspacman_clip_frozen,nec/qbert_clip_frozen,nec/frostbite_clip_frozen \
-    trainer.seed=42,43,44,45,46
-python src/train.py -m \
-    experiment=nec/mspacman_mae_frozen,nec/qbert_mae_frozen,nec/frostbite_mae_frozen \
-    trainer.seed=42,43,44,45,46
-```
-
-These write to `nec_<game>_<pvm>_frozen[_seed<n>]`, distinct from the finetuned
-arms' `nec_<game>_<pvm>`, so the two never share a run directory or a W&B group.
-`tests/test_nec_frozen_control.py` pins that, and pins that `freeze_backbone` is
-the only setting that differs from the finetuned counterpart.
-
-**Run one sweep at a time.** Wall-clock is dominated by the collector, which is
-CPU-bound, so overlapping sweeps costs more than it buys: measured across 129
-runs, median runtime goes 29 min with nothing else in flight, 47 min with one,
-86 min with two, 143 min with three. Four concurrent sweeps do not finish four
-times faster — they finish at roughly the same total throughput with every
-individual run taking 5x as long, which makes partial results useless for days.
-
-### 2. What is actually in the reported results
-
-`experiment=` names an arm; it does not mean the arm has data. Current state,
-counting only runs that survive the validity filter in §3:
-
-**MFEC** (`mfec/<arm>`, with `game=` as a sweep token)
-
-| arm | Ms. Pac-Man | Q\*bert | Frostbite | reported |
-|---|---|---|---|---|
-| `rp_gray` | 5/5 | 5/5 | 5/5 | yes |
-| `rp_rgb` | 5/5 | 5/5 | 5/5 | yes |
-| `dinov2` | 5/5 | 5/5 | 5/5 | yes |
-| `resnet` | 5/5 | 5/5 | 5/5 | yes |
-| `mae` | 5/5 | 5/5 | 5/5 | yes |
-| `clip` | 5/5 | 2/5 | 2/5 | partial |
-| `vae` | — | — | — | **no — never run** |
-
-**NEC** (`nec/<game>[_<encoder>]`)
-
-| arm | Ms. Pac-Man | Q\*bert | Frostbite | reported |
-|---|---|---|---|---|
-| `<game>` (ConvNet) | 5/5 | 5/5 | 5/5 | yes |
-| `<game>_dinov2` | 5/5 | 5/5 | 5/5 | yes |
-| `<game>_clip` | 2/5 | 5/5 | 5/5 | partial |
-| `<game>_mae` | — | — | — | **no — never run** |
-| `<game>_resnet` | — | — | — | **no — never run** |
-
-Consequences to know before reading the tables:
-
-- **The results table is Ms. Pac-Man and Q\*bert only.** Frostbite is held back
-  because `mfec/clip` has 2 of 5 seeds there. Three runs
-  (`experiment=mfec/clip game=Frostbite trainer.seed=42,43,44`) close it.
-- `mfec/vae`, `nec/*_mae` and `nec/*_resnet` are implemented, tested and
-  documented below, but **no run exists for any of them** — they are not in the
-  ablation as reported, and the sweep commands above deliberately omit them.
-  Adding an arm to a published comparison means running it on all three games
-  at five seeds, not one.
-- `make_thesis_figures.py` drops any cell with fewer than three seeds, so a
-  partial arm may be silently absent from a figure rather than visibly thin.
-  Cells with fewer than five carry a `*` in the results table.
-
-### 3. The validity filter — read this before comparing to old runs
-
-`src/encoders/factory.py::pin_fp32_conv_precision()` forces true FP32
-convolutions for every MFEC encoder. Before it landed
-(**2026-08-19T08:52:59Z**), cuDNN's TF32 default ran φ at a 10-bit mantissa,
-which is ~16x over MFEC's near-exact-match rescue budget and made the episodic
-memory unreadable — `eval/memory_hit_rate` identically 0.000 on the `mfec/resnet`
-Ms. Pac-Man runs. See "Vet a new encoder before you train with it" for the
-measurement.
-
-**Every MFEC run created on or before that timestamp is excluded from the
-reported results**, except `rp_gray` and `rp_rgb`, which use no convolution and
-are therefore exempt. `make_figures.py` applies this automatically
-(`TF32_FIX`, `TF32_EXEMPT`); `--include-pre-fix` disables it and should only be
-used to inspect the old regime, never to fill a thin cell. This is why
-`mfec/clip` on Q\*bert reports two seeds despite five runs existing: seeds 42–44
-were all launched inside the forty minutes before the fix landed, so the filter
-drops them and only seeds 45–46 survive.
-
-NEC is unaffected — it never calls `make_encoder`, so no NEC run needs
-excluding. Checkpoints do not cross the boundary either: a QEC written under
-TF32 holds keys from a different numerics regime, so re-run rather than resume.
-
-### 4. Figures and tables
-
-The thesis figures are built from a local cache of the W&B runs
-(`LatentLab/torchrl-hydra-template`), not from the run directories:
-
-```shell
-cd ../Bachelorthesis
-python make_thesis_figures.py --refresh                      # re-pull, then plot
-python make_thesis_figures.py                                # plot from cache
-python make_thesis_figures.py --games MsPacman Qbert Frostbite
-```
-
-It writes `figures/*.pdf` and `figures/*.tex`, which `sections/Experiments.tex`
-`\input`s — **do not edit those by hand**. The arm vocabulary, the colour map,
-the validity filter and `MIN_SEEDS` all live in `../PresentatonLaTex/make_figures.py`
-and are imported, so the deck and the thesis cannot disagree about which runs
-count. Change them there or not at all.
-
-`scripts/aggregate_results.py` is a *different* tool — cross-game mean/median/IQM
-HNS with bootstrap CIs, pulled live from the W&B API. It did not produce the
-thesis figures. Use it for the aggregate numbers described under "Paper-ready
-metrics"; use `make_thesis_figures.py` for anything that appears in the document.
 
 ## Architecture
 
@@ -859,7 +893,8 @@ would raise.
 ## The encoder ablation
 
 Seven arms over **two** env pairs, on whichever `game` you select — **six of
-which are in the reported results**; `mfec/vae` has never been run. Everything
+which are in the reported results** (all 3 games x 5 seeds); `mfec/vae` was not
+run and is not part of the thesis. Everything
 that is not φ is held equal — 100k decisions, `num_envs: 4`,
 `eval_every: 10_000`, `buffer_size: 100_000` — so a between-arm difference is an
 encoder difference and nothing else. Pinned by `tests/test_encoder_factory.py`.
@@ -871,11 +906,11 @@ the sweep command and why no `mfec/frostbite.yaml` exists).
 | experiment | observations | φ | d | role | reported |
 |---|---|---|---|---|---|
 | `mfec/rp_gray` | 84×84 **grayscale** | random projection | 64 | **paper baseline** — Blundell et al. §3's exact φ, readable against Figure 1 | yes |
-| `mfec/vae` | 84×84 grayscale | frozen ConvVAE | 64 | the paper's *other* φ; first half of C1 | **never run** |
+| `mfec/vae` | 84×84 grayscale | frozen ConvVAE | 64 | the paper's *other* φ; first half of C1 | **no — not run** |
 | `mfec/rp_rgb` | 210×160 **RGB** | random projection | 64 | **encoder control** for the PVM arms | yes |
 | `mfec/dinov2` | 210×160 RGB | DINOv2 ViT-S/14 | 384 | self-supervised PVM | yes |
 | `mfec/resnet` | 210×160 RGB | ImageNet ResNet-18 | 512 | supervised PVM | yes |
-| `mfec/clip` | 210×160 RGB | CLIP ViT-B-32 | 512 | contrastive PVM | partial (2/5 seeds on Q\*bert, Frostbite) |
+| `mfec/clip` | 210×160 RGB | CLIP ViT-B-32 | 512 | contrastive PVM | yes |
 | `mfec/mae` | 210×160 RGB | MAE ViT-B/16 | 768 | **reconstruction** PVM — the only non-similarity objective | yes |
 
 Read it as two independent steps:
@@ -1145,14 +1180,13 @@ The four PVM arms are not four flavours of one idea — each varies the
 | arm | objective | compares two images? | labels? | reported |
 |---|---|---|---|---|
 | `dinov2_finetune` | self-distilled view agreement | yes | no | yes |
-| `clip_finetune` | image-text contrastive | yes | weak (captions) | partial (2/5 seeds on Ms. Pac-Man) |
-| `mae_finetune` | masked pixel reconstruction | **no** | no | **never run** |
-| `resnet_finetune` | ImageNet-1k classification | no | **yes** | **never run** |
+| `clip_finetune` | image-text contrastive | yes | weak (captions) | yes |
+| `mae_finetune` | masked pixel reconstruction | **no** | no | yes |
+| `resnet_finetune` | ImageNet-1k classification | no | **yes** | yes |
 
-Two of those four are implemented and tested but have **no runs**, so the NEC
-ablation as reported is three arms, not five — the ConvNet baseline,
-`dinov2_finetune`, and `clip_finetune`. See "Reproducing the thesis results"
-for the per-cell seed counts and the sweep commands that produced them.
+All four are in the reported results, with the ConvNet baseline: five arms x
+three games x five seeds, 75 runs. See "Reproducing the thesis results" for the
+sweep commands.
 
 `mae_finetune` is the arm that separates "similarity" from "not similarity";
 `resnet_finetune` is the arm that separates "labels" from "no labels", and it is
@@ -1237,7 +1271,7 @@ algorithm:
 ```
 
 **Why it exists.** RQ4 asks whether finetuning a pretrained encoder beats
-keeping its features fixed, and neither reported grid can answer it: every MFEC
+keeping its features fixed, and neither of the first two grids can answer it: every MFEC
 run is frozen and every finetuned-NEC run is finetuned, so `algorithm` and
 `training regime` are bundled. These twelve arms unbundle them —
 frozen-NEC vs finetuned-NEC isolates finetuning with the algorithm held fixed;
@@ -1660,3 +1694,7 @@ torchrl SOTA reference at
 The A2C reference implementation in `src/algorithms/a2c.py` is modelled on the
 torchrl SOTA reference at
 [`pytorch/rl/sota-implementations/a2c/a2c_mujoco.py`](https://github.com/pytorch/rl/blob/main/sota-implementations/a2c/a2c_mujoco.py).
+
+The interval estimates, performance profiles and probabilities of improvement in
+`analysis/make_rliable_figures.py` use [rliable](https://github.com/google-research/rliable)
+(Agarwal et al., NeurIPS 2021).

@@ -1,0 +1,7 @@
+# Learning curves, per-game bars, retrieval figure, Tables 2 and 3
+# (make_thesis_figures.py, make_figures.py). Python 3.12.
+# wandb is only needed for --refresh (re-pulling the runs from W&B).
+numpy==2.5.2
+pandas==3.0.5
+matplotlib==3.11.1
+wandb==0.28.2

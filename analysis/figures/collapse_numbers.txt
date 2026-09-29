@@ -1,0 +1,15 @@
+Embedding collapse on real Atari frames
+  matched frame set, MsPacman, one row per MFEC arm
+  residual = mean ||x - mean(x)|| / mean ||x||, in percent.
+  Low means every frame embeds to nearly the same vector.
+  Measured in ONE pass over the stored probe_emb arrays, so the arms
+  are comparable to each other.
+
+  RP (gray)   residual  11.16%   (sd 0.46, n=5 seeds)
+  RP (RGB)    residual  11.81%   (sd 1.02, n=5 seeds)
+  ResNet      residual  11.13%   (sd 0.00, n=5 seeds)
+  DINOv2      residual  13.81%   (sd 0.00, n=5 seeds)
+  CLIP        residual  15.35%   (sd 0.00, n=5 seeds)
+  MAE         residual   2.43%   (sd 0.00, n=5 seeds)
+
+  CLIP / MAE ratio: 6.3x

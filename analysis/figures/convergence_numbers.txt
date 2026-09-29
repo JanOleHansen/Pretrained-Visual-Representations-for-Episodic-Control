@@ -1,0 +1,69 @@
+Convergence at the 100k cutoff
+  mean human-normalized score (%) over 5 seeds at each evaluation point
+  'half' is the mid-budget evaluation; 'final' is the last one.
+  A large final-half gap means the arm was still improving when the
+  budget ran out, so its final score is a learning RATE, not a level.
+
+MFEC / MsPacman
+    RP (gray)   eval1   6.57   half  27.19   final  35.44   (final-half  +8.25)
+    RP (RGB)    eval1   2.99   half  21.02   final  30.50   (final-half  +9.48)
+    ResNet      eval1   5.28   half  25.69   final  41.07   (final-half +15.38)
+    DINOv2      eval1   7.99   half  35.56   final  37.70   (final-half  +2.14)
+    CLIP        eval1  13.68   half  36.49   final  41.73   (final-half  +5.24)
+    MAE         eval1   7.78   half  35.47   final  51.24   (final-half +15.77)
+    ordering at half : CLIP > DINOv2 > MAE > RP (gray) > ResNet > RP (RGB)
+    ordering at final: MAE > CLIP > ResNet > DINOv2 > RP (gray) > RP (RGB)
+    same ordering: False
+
+MFEC / Qbert
+    RP (gray)   eval1   2.23   half   6.97   final  13.78   (final-half  +6.81)
+    RP (RGB)    eval1   2.08   half  16.00   final  17.24   (final-half  +1.24)
+    ResNet      eval1   1.85   half   5.43   final   6.37   (final-half  +0.94)
+    DINOv2      eval1   1.51   half   5.91   final   6.78   (final-half  +0.87)
+    CLIP        eval1   3.24   half   8.62   final   9.04   (final-half  +0.41)
+    MAE         eval1   1.29   half   7.27   final  10.05   (final-half  +2.78)
+    ordering at half : RP (RGB) > CLIP > MAE > RP (gray) > DINOv2 > ResNet
+    ordering at final: RP (RGB) > RP (gray) > MAE > CLIP > DINOv2 > ResNet
+    same ordering: False
+
+MFEC / Frostbite
+    RP (gray)   eval1   1.37   half   2.83   final   4.44   (final-half  +1.61)
+    RP (RGB)    eval1   1.33   half   2.27   final   2.64   (final-half  +0.37)
+    ResNet      eval1   0.75   half   6.71   final  13.21   (final-half  +6.50)
+    DINOv2      eval1   1.12   half   2.47   final   3.43   (final-half  +0.96)
+    CLIP        eval1   2.05   half   2.65   final   3.18   (final-half  +0.52)
+    MAE         eval1   1.35   half   2.98   final  10.09   (final-half  +7.11)
+    ordering at half : ResNet > MAE > RP (gray) > CLIP > DINOv2 > RP (RGB)
+    ordering at final: ResNet > MAE > RP (gray) > DINOv2 > CLIP > RP (RGB)
+    same ordering: False
+
+NEC / MsPacman
+    ConvNet     eval1   2.74   half   5.54   final   8.28   (final-half  +2.74)
+    ResNet      eval1   2.27   half   5.61   final   7.41   (final-half  +1.80)
+    DINOv2      eval1   1.33   half   7.25   final   9.16   (final-half  +1.91)
+    CLIP        eval1   1.23   half   9.11   final  10.01   (final-half  +0.90)
+    MAE         eval1   1.18   half   6.69   final   9.36   (final-half  +2.67)
+    ordering at half : CLIP > DINOv2 > MAE > ResNet > ConvNet
+    ordering at final: CLIP > MAE > DINOv2 > ConvNet > ResNet
+    same ordering: False
+
+NEC / Qbert
+    ConvNet     eval1   0.41   half   2.72   final   3.79   (final-half  +1.06)
+    ResNet      eval1   0.77   half   3.23   final   3.31   (final-half  +0.08)
+    DINOv2      eval1   1.66   half   3.27   final   3.39   (final-half  +0.12)
+    CLIP        eval1   1.11   half   3.08   final   3.07   (final-half  -0.01)
+    MAE         eval1   0.40   half   2.57   final   3.39   (final-half  +0.83)
+    ordering at half : DINOv2 > ResNet > CLIP > ConvNet > MAE
+    ordering at final: ConvNet > DINOv2 > MAE > ResNet > CLIP
+    same ordering: False
+
+NEC / Frostbite
+    ConvNet     eval1   2.08   half   3.71   final   3.68   (final-half  -0.03)
+    ResNet      eval1   1.03   half  14.97   final  13.71   (final-half  -1.26)
+    DINOv2      eval1   1.53   half  12.07   final  17.50   (final-half  +5.43)
+    CLIP        eval1   0.60   half   5.48   final  11.55   (final-half  +6.07)
+    MAE         eval1   1.38   half   3.27   final   3.34   (final-half  +0.07)
+    ordering at half : ResNet > DINOv2 > CLIP > ConvNet > MAE
+    ordering at final: DINOv2 > ResNet > CLIP > ConvNet > MAE
+    same ordering: False
+

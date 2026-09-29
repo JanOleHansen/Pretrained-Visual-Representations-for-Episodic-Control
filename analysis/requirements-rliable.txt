@@ -1,0 +1,10 @@
+# Stratified-bootstrap figures and interval numbers (make_rliable_figures.py,
+# make_convergence_numbers.py). Python 3.12.
+# Kept separate on purpose: rliable 1.2 needs arch<8, and arch 7.x does not
+# import under pandas 3, so this environment pins pandas 2.3.
+rliable==1.2.0
+arch==7.2.0
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.18.1
+matplotlib==3.11.1
