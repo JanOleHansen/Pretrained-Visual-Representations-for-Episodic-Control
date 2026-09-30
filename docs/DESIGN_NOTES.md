@@ -1,4 +1,4 @@
-# Agent instructions for torchrl-hydra-template
+# Design notes and measurements
 
 ## Project overview
 
@@ -792,7 +792,7 @@ tests/
    `_partial_` / nested `_target_` blocks for factories. Use `instantiate`-
    compatible patterns (see DQN: replay buffer + partial `MLP`).
 4. Create `configs/experiment/my_algo/<env>.yaml` composing your algo + env.
-5. **Update `README.md` and `AGENTS.md`.**
+5. **Update `README.md` and `docs/DESIGN_NOTES.md`.**
 6. Add a smoke test in `tests/test_smoke.py`.
 
 ## VecNorm + MFEC incompatibility
@@ -2721,7 +2721,7 @@ flow, Hydra-composition architecture regression, config-swap end-to-end).
    show the pattern), and put anything a stub structurally cannot check —
    real state_dict loading, real patch grids, real gradient paths — behind an
    opt-in env var as a second tier.
-7. **Update `README.md` and `AGENTS.md`** (this table).
+7. **Update `README.md` and `docs/DESIGN_NOTES.md`** (this table).
 
 #### `dinov2_finetune` — finetunable DINOv2 ViT
 

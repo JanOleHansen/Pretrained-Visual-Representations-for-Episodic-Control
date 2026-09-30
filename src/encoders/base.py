@@ -2,15 +2,14 @@ from __future__ import annotations
 import torch
 
 class Encoder:
-    """"
-    Maps observations to fixed-dim state embeddings for episodic memory.and
-        
+    """Maps observations to fixed-dim state embeddings for episodic memory.
+
     Contract:
-        mbed(obs) -> (B, d) float32 on obs.device
-      obs is (..., C, H, W); leading dims are flattened to B.
-      Must be deterministic: identical pixels -> identical embedding,
-      or the QEC exact-hit hash path breaks.
-"""
+        embed(obs) -> (B, d) float32 on obs.device
+        obs is (..., C, H, W); leading dims are flattened to B.
+        Must be deterministic: identical pixels -> identical embedding,
+        or the QEC exact-hit hash path breaks.
+    """
 
     state_dim: int
 

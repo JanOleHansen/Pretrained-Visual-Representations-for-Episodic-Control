@@ -7,21 +7,16 @@ four frozen-PVM RQ4 controls (the same four groups with
 other, so every shared setting is repeated verbatim in all 27 files and nothing
 but a test keeps them in step.
 
-`_resnet` was absent from ``ENCODERS`` until the frozen controls landed, so the
-three supervised arms were shipped unguarded — they did in fact match, but by
-luck rather than by test.  The frozen arms are guarded from the start:
 `freeze_backbone` lives under `algorithm.embedding_network`, not in
 ``ALGORITHM_KNOBS``, so a frozen arm is required to match its `nature` baseline
 on every knob below exactly like a finetuned one.
 
 ``tests/test_nec_mae_finetune.py::test_the_mae_arm_holds_every_learning_knob_identical``
-already pinned the algorithm-side knobs for the three ``_mae`` files.  This
-widens that to all twelve arms and adds the two trainer-side knobs that were
-NOT previously guarded and had in fact drifted:
+pins the algorithm-side knobs for the three ``_mae`` files.  This widens that
+to every arm and adds two trainer-side knobs:
 
 ``num_envs``
-    was 16 on the three `nature` arms against 8 on the nine PVM arms.  It is
-    **learning-relevant for episodic control**, not a pure resource knob: NEC
+    is **learning-relevant for episodic control**, not a pure resource knob: NEC
     writes to the DND only at EPISODE END, so frames sitting in a trailing
     partial episode when the run stops are never written at all, and the loss is
     ~``num_envs x (mean episode length / 2)`` — absolute, so it bites hardest at
@@ -30,9 +25,8 @@ NOT previously guarded and had in fact drifted:
     states than 4 at equal frames, because the envs share one memory and a low
     epsilon and largely retread one trajectory.
 ``num_eval_episodes``
-    was 10 on the `nature` arms against 5 on the PVM arms, which gave the
-    baseline's ``eval/return_mean`` a different standard error from the arms it
-    is plotted against.
+    sets the standard error of ``eval/return_mean``, which must be the same
+    for the baseline and the arms it is plotted against.
 """
 from __future__ import annotations
 

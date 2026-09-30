@@ -85,7 +85,7 @@ Cost — this is the most expensive arm in the study
 the CLIP arm's ViT-B/32 **49 + 1 = 50**.  Same depth and width (12 layers,
 d=768), so the transformer cost is ~4x the CLIP arm's per frame, and φ is this
 pipeline's bottleneck.  ``state_dim=768`` also makes the eager QEC allocation
-1.5x the 512-d arms' (see "QEC memory is sized by state_dim" in AGENTS.md).
+1.5x the 512-d arms' (see "QEC memory is sized by state_dim" in docs/DESIGN_NOTES.md).
 There is no ViT-B/32 MAE checkpoint to fall back on; ``image_size=112`` would
 cut the token count to 49 but interpolates the positional embeddings away from
 the pretraining resolution, so 224 is the default and the cost is accepted.
@@ -100,7 +100,7 @@ other float32 arm — does not.  ``key b/s`` reading 0.000 in
 
 is expected, is not fixable by lowering ``key_scale``, and costs only the O(1)
 lookup path at evaluation (the near-exact rescue returns the same value).  See
-"MEASURED: every float32 encoder fails key stability on CUDA" in AGENTS.md.
+"MEASURED: every float32 encoder fails key stability on CUDA" in docs/DESIGN_NOTES.md.
 """
 from __future__ import annotations
 

@@ -3,8 +3,7 @@
 #
 # Uses hero_nec_train.yaml, NOT hero_train.yaml: the latter applies
 # SignTransform, and the paper names H.E.R.O. explicitly among the games where
-# NEC's lack of reward clipping is what produces the result (§4). This config
-# pointed at hero_train until the mismatch was caught in review.
+# NEC's lack of reward clipping is what produces the result (§4).
 #
 # Neither config uses VecNorm, for the same reason as MFEC: the exact-match dict
 # keys the DND on quantised CNN embeddings; VecNorm changes raw pixel values
@@ -23,12 +22,8 @@ defaults:
 # defaults wholesale, including num_updates: 400 (paper §4's rate — the twelve
 # ablation arms override that DOWN to 100, this one does not).
 #
-# That inheritance used to be a bug rather than a choice. nec_atari.yaml carried
-# annealing_frames: 4_000_000 and init_random_frames: 50_000, both sized for a
-# paper-scale 10M-step run, so against the 100k probe budget below this config
-# spent half the run on a uniform random policy and reached only eps = 0.975 by
-# the end — the whole run was random play. Those defaults are now sized for the
-# shared probe budget; see the comments on them in nec_atari.yaml. H.E.R.O.'s
+# nec_atari.yaml's annealing_frames / init_random_frames are sized for the
+# shared probe budget; see the comments on them there. H.E.R.O.'s
 # random-policy episodes measure 656 agent steps (mean of 7, median 370), so the
 # 18 tables pass k = 50 during the anneal.
 trainer:
@@ -43,12 +38,11 @@ trainer:
   # 8, matching every other NEC config — see the canonical note in
   # nec/mspacman.yaml for why num_envs is learning-relevant here (NEC writes to
   # the DND only at episode end, so trailing partial episodes are stranded in
-  # proportion to num_envs). This was 16, which nec/mspacman.yaml documents as
-  # OOMing on a 32 GB host: NEC adds a 100k-transition float32 replay buffer
+  # proportion to num_envs). 16 OOMs on a 32 GB host (see nec/mspacman.yaml):
+  # NEC adds a 100k-transition float32 replay buffer
   # (~11.3 GB preallocated) plus a per-env raw-pixel carry buffer on top of the
   # DND. H.E.R.O. is the heaviest case on the DND side — 18 actions at
-  # dnd_capacity 5e4 is 18 x 5e4 x 64 x 4 B = 230 MB of keys. (An earlier note
-  # here said 2.3 GB; that was against the old dnd_capacity of 5e5.)
+  # dnd_capacity 5e4 is 18 x 5e4 x 64 x 4 B = 230 MB of keys.
   num_envs: 8
   log_every_n_steps: 5_000
   # 10_000 agent steps == every 40k raw frames.  Paper §4 ("We evaluate MFEC and

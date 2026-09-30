@@ -37,7 +37,7 @@ stratified within each game; the set of games is held fixed.  In Agarwal et
 al.'s own words that "captures the statistical uncertainty ... if the
 experiment is repeated using a different set of runs (e.g., changing seeds) on
 the same set of tasks" -- it is NOT a statement about a larger population of
-games.  Describe it that way in prose: with three games, `task_bootstrap=True`
+games.  With three games, `task_bootstrap=True`
 produces intervals so wide that nothing separates from anything (measured: the
 NEC DINOv2-vs-ConvNet pooled lower bound falls from 0.51 to ~0.34), which is
 the honest consequence of three tasks and the reason the per-game panels carry
@@ -71,7 +71,7 @@ from rliable import library as rly, metrics
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The shared run loader (make_figures.py) sits next to this script in
-# analysis/; "DECK" is kept as the name for where it lives.
+# analysis/; DECK is that directory.
 DECK = HERE
 sys.path.insert(0, DECK)
 import make_figures as mf          # noqa: E402
@@ -103,9 +103,9 @@ def glabel(g):
 # pw/ph size the performance profile, which is the one square-ish figure here:
 # the thesis runs it at full text width like every other thesis figure, the
 # deck keeps it narrow so it sits on a slide beside a bullet list.
-# `term` is the word the axis label uses for one encoder configuration.  The
-# deck stopped calling those "arms" after the 2026-08-28 supervisor pass; the
-# thesis prose still does, and a figure must match the document it sits in.
+# `term` is the word the axis label uses for one encoder configuration: the
+# thesis prose calls it an "arm", the deck an "encoder", and each figure
+# matches the document it sits in.
 TARGETS = {
     "thesis": dict(dir=os.path.join(HERE, "figures"), width=5.95, fs=9,
                    pw=1.0, ph=2.7, term="arm"),
@@ -118,9 +118,8 @@ def score_matrices(meta, algo="MFEC"):
     """arm -> (num_seeds, num_games) human-normalized scores, complete cells only.
 
     rliable needs a rectangular matrix: the aggregate metrics reduce over a full
-    (seeds x games) array and a single NaN poisons the whole estimate.  (Not,
-    as this used to say, because games are resampled -- task_bootstrap is off;
-    see the module docstring.)  An arm short of a seed anywhere is reported and
+    (seeds x games) array and a single NaN poisons the whole estimate (games
+    are not resampled -- task_bootstrap is off; see the module docstring).  An arm short of a seed anywhere is reported and
     dropped rather than silently padded.
     """
     s = meta[meta.algo == algo]
@@ -180,9 +179,8 @@ def est_poi_paired(mats, reps, pairs):
     the statistic isolates fine-tuning with the algorithm, the backbone, the key
     width and every hyperparameter held fixed.
 
-    This is NOT a substitute for comparing the frozen arms against the ConvNet
-    -- an earlier version of this note claimed that comparison would "re-answer
-    RQ2 with extra steps", which was wrong.  RQ2 as run compares *fine-tuned*
+    This is NOT a substitute for comparing the frozen arms against the ConvNet.
+    RQ2 as run compares *fine-tuned*
     arms against the ConvNet, so it cannot say whether a Frostbite separation
     comes from fine-tuning or from the pretrained features.  Only frozen-vs-
     ConvNet decides that, and it is computed separately (``--frozen-vs-base``,

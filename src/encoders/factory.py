@@ -31,7 +31,7 @@ def pin_fp32_conv_precision() -> None:
 
     Why that is fatal rather than cosmetic.  The hash path is lost either way at
     d ≫ 1 (measured ``key b/s = 0.000`` for every float32 encoder on CUDA — see
-    AGENTS.md).  What is supposed to catch it is ``QEC``'s near-exact rescue,
+    docs/DESIGN_NOTES.md).  What is supposed to catch it is ``QEC``'s near-exact rescue,
     which accepts the top-1 neighbour within ``3e-5 · (1 + ‖q‖)``.  Measured on
     400 real Ms. Pac-Man frames with ``resnet18``:
 
@@ -59,24 +59,23 @@ def pin_fp32_conv_precision() -> None:
     ``random_projection`` is unaffected either way (no convolution, and it
     already accumulates in float64 for exactly this reason).
 
-    Two things this changes that are worth knowing:
+    Consequences:
 
     * **It is slower.**  TF32 is roughly a 2x throughput win on conv-bound work,
       and φ is the bottleneck for every PVM arm.  That cost is held equal across
       arms and is the price of a memory that can be read back.
-    * **Checkpoints do not cross it.**  A QEC written before this change holds
-      keys from the TF32 regime; resuming into an FP32 process re-embeds the
-      same frames to different keys and every stored entry becomes unreachable.
-      Re-run rather than resume.
+    * **Checkpoints do not cross precision regimes.**  A QEC written under TF32
+      holds keys that an FP32 process re-embeds differently, so every stored
+      entry becomes unreachable.  Re-run rather than resume.
 
-    Do not "optimise" this back on.  ``eval/memory_hit_rate`` near 0 on a
-    non-empty QEC is the signature if it ever is.
+    ``eval/memory_hit_rate`` near 0 on a non-empty QEC is the signature of
+    TF32 being active.
     """
     # Both setters exist and are safe on a CPU-only build; they are plain
     # globals, so this is a no-op there rather than a guard-and-skip.
     torch.backends.cudnn.allow_tf32 = False
     # Already the default, pinned so a future default flip — or anything else
-    # in the process setting it globally — cannot reintroduce the same failure
+    # in the process setting it globally — cannot cause the same failure
     # through the ViT arms' GEMMs instead of their patch-embed convolution.
     torch.backends.cuda.matmul.allow_tf32 = False
 

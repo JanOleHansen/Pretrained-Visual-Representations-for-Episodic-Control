@@ -30,15 +30,13 @@ class EvalEGreedyModule(EGreedyModule):
        replay the same trajectory and ``num_eval_episodes`` buys less than N
        independent samples.  Observed on both algorithms.
 
-       **But do not read that as "the eval sample is one number".**  This
-       previously claimed Ms. Pac-Man's opening is insensitive to
-       ``NoopResetEnv``; it is not.  Measured on ``atari_mfec_eval_rgb``, the
-       1–30 no-op draw leaves **7 of 8 resets with a different first
+       The start state is not fixed, though: Ms. Pac-Man's opening is
+       sensitive to ``NoopResetEnv``.  Measured on ``atari_mfec_eval_rgb``,
+       the 1–30 no-op draw leaves **7 of 8 resets with a different first
        observation**, and a fixed action sequence returns
        ``[380, 170, 180, 340]``.  ``eval/return_std == 0`` is therefore
-       evidence that a *particular closed-loop policy* re-converged, not proof
-       that the start state is fixed — and it is not a reason to set
-       ``num_eval_episodes: 1``, which is what the claim was used for.
+       evidence that a *particular closed-loop policy* re-converged, and not
+       a reason to set ``num_eval_episodes: 1``.
     2. **The argmax policy is not the policy being trained.**  Both methods
        act ε-greedily and store returns generated that way.  MFEC's QEC values
        are max-over-returns and never decrease (Eq. 1), so exploiting them with

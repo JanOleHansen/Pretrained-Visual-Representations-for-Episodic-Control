@@ -47,7 +47,7 @@ gym_kwargs:
 # the env spec in NECAlgorithm.setup()), but note two consequences: the DND holds
 # 18 tables rather than Ms. Pac-Man's 9, and the per-batch cost is
 # num_updates x |A| exact kNN scans, so this game is ~2x Ms. Pac-Man and ~3x
-# Q*bert per gradient step. Measured raw-frame repeat rate is 22% (AGENTS.md,
+# Q*bert per gradient step. Measured raw-frame repeat rate is 22% (docs/DESIGN_NOTES.md,
 # "Which games MFEC can work on at all"), i.e. the same as Ms. Pac-Man, so the
 # DND has plenty to retrieve.
 transforms:

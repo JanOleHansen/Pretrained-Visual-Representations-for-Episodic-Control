@@ -23,7 +23,7 @@ below ("About the framework").
 | `src/` | Algorithms (`mfec.py`, `nec.py`, …), encoders (`src/encoders/`), NEC embedding networks (`src/networks.py`), trainer, environments |
 | `configs/` | Hydra configs; `configs/experiment/mfec/*` and `configs/experiment/nec/*` are the thesis arms |
 | `tests/` | Unit tests, including the parity tests that pin "φ is the only thing that varies" |
-| `scripts/` | Embedding extraction for Section 6 (`build_probe_set.py`, `extract_embeddings.py`, `extract_all.sh`, `export_probe_frames.py`) and encoder diagnostics |
+| `scripts/` | Embedding extraction for Section 6 (`build_probe_set.py`, `extract_embeddings.py`, `extract_all.sh`, `export_probe_frames.py`), encoder diagnostics (`encoder_diagnostics.py`), cluster follow-up measurements (`thesis_followups.sh`) and a W&B cross-game aggregator (`aggregate_results.py`) |
 | `analysis/` | Every script that produces a figure, table or quoted number in the thesis, plus the cached run data they read (`analysis/data/`) |
 | `analysis/figures/` | Script output, sized for the thesis; `analysis/figures/deck/` holds the defence-deck variants |
 
@@ -207,10 +207,10 @@ three grids:
 
 | Thesis statement | Where it is measured |
 |---|---|
-| Near-exact rescue tolerance vs. the nearest distinct frame, 0.307 (Section 4.3) | `scripts/encoder_diagnostics.py`; AGENTS.md, "CORRECTION: the rescue does NOT survive TF32" |
-| ε = 0.005 at evaluation costs MFEC ≈30 % (1038 vs. 1440) (Section 5.1) | `tests/test_mfec_estimator_gap.py`; AGENTS.md, "Why ε at evaluation was wrong" |
-| One fixed action sequence returns {380, 170, 180, 340} (Section 5.1) | AGENTS.md, "`num_eval_episodes` was 1 for a wrong reason" |
-| 16 environments keep 39 % fewer unique states than 4 (Section 5.1) | AGENTS.md, "The NEC encoder ablation"; `tests/test_nec_ablation_parity.py` |
+| Near-exact rescue tolerance vs. the nearest distinct frame, 0.307 (Section 4.3) | `scripts/encoder_diagnostics.py`; docs/DESIGN_NOTES.md, "CORRECTION: the rescue does NOT survive TF32" |
+| ε = 0.005 at evaluation costs MFEC ≈30 % (1038 vs. 1440) (Section 5.1) | `tests/test_mfec_estimator_gap.py`; docs/DESIGN_NOTES.md, "Why ε at evaluation was wrong" |
+| One fixed action sequence returns {380, 170, 180, 340} (Section 5.1) | docs/DESIGN_NOTES.md, "`num_eval_episodes` was 1 for a wrong reason" |
+| 16 environments keep 39 % fewer unique states than 4 (Section 5.1) | docs/DESIGN_NOTES.md, "The NEC encoder ablation"; `tests/test_nec_ablation_parity.py` |
 | (Not in the thesis.) Section 7.3 notes that the rescue tolerance was checked on ResNet-18 only; this measures it for every backbone | `scripts/thesis_followups.sh`, stage 1 |
 
 ## About the framework
@@ -311,8 +311,8 @@ ablations, whose backbone packages are opt-in extras: `uv sync --extra clip`
 A full training run (500k frames, ~7 minutes on CPU) reproduces the torchrl SOTA
 reference for DQN-CartPole.
 
-For Atari Pong (mirrors the torchrl SOTA `dqn_atari.py` reference, 40M frames on
-GPU):
+For Atari Pong (network and preprocessing mirror the torchrl SOTA `dqn_atari.py`
+reference; the config runs the shared 100k-step budget, see "Trainer" below):
 
 ```shell
 python src/train.py experiment=dqn/pong
@@ -390,17 +390,16 @@ This buys three things:
 3. **Discoverability** — opening `dqn.py` shows every knob without YAML lookups.
 
 `replay_buffer` and `network` are `Callable` factories rather than scalars because
-they encode design decisions (which storage backend, what MLP shape). Their bodies
-sit at the top of `dqn.py` as `default_replay_buffer` and `default_network`. To
-swap them, edit those functions or pass a different factory in code.
+they encode design decisions (which storage backend, what MLP shape). Their
+defaults are set in the `__init__` signature; in YAML they are `_partial_: true`
+blocks with nested `_target_` nodes (see `configs/algorithm/dqn.yaml`).
 
-`train.py` unpacks `cfg.algorithm` as `**kwargs`, so YAML values override defaults
-and CLI overrides override YAML:
+`train.py` builds the algorithm with Hydra's `instantiate`, so nested factory
+configs become real callables, YAML values override the Python defaults, and
+CLI overrides override YAML:
 
 ```python
-alg_kwargs = {k: v for k, v in OmegaConf.to_container(cfg.algorithm, resolve=True).items()
-              if k != "_target_"}
-algorithm = AlgClass(device=None, **alg_kwargs)
+algorithm = instantiate(cfg.algorithm, device=None)
 ```
 
 ### Environment
@@ -534,7 +533,7 @@ Trainer config knobs (`total_frames`, `seed`, `accelerator`, `devices`,
 only control how training runs, never what is learned. Set `eval_every_n_steps`
 to `null` to disable periodic evaluation (see `EvalCallback` below).
 
-**Shared probe budget.** `configs/train.yaml` and *every* config under
+**Shared probe budget.** `configs/train.yaml` and every Atari config under
 `configs/experiment/` hold these three identical, so any two runs are read off
 the same x-axis at the same sample points:
 
@@ -592,9 +591,11 @@ configs/
 │   ├── qbert_eval.yaml     <- Q*Bert eval transforms
 │   ├── mspacman_train.yaml <- Ms. Pac-Man training transforms
 │   ├── mspacman_eval.yaml  <- Ms. Pac-Man eval transforms
-│   ├── mspacman_train_singleframe.yaml <- same, no CatFrames (paper-exact VAE encoder)
-│   ├── mspacman_eval_singleframe.yaml  <- eval counterpart, no CatFrames
-│   └── halfcheetah.yaml    <- HalfCheetah-v4 (DoubleToFloat + InitTracker)
+│   ├── atari_mfec_{train,eval}.yaml     <- paper-faithful MFEC pair, any game (84x84 grayscale)
+│   ├── atari_mfec_{train,eval}_rgb.yaml <- same, single RGB frame (MFEC PVM arms)
+│   ├── {mspacman,qbert,frostbite,hero}_nec_{train,eval}.yaml <- NEC pairs (unclipped rewards)
+│   ├── halfcheetah.yaml    <- HalfCheetah-v4 (DoubleToFloat + InitTracker)
+│   └── ...                 <- further per-game variants not used by the thesis grids
 ├── logger/
 │   ├── wandb.yaml
 │   └── tensorboard.yaml
@@ -608,15 +609,12 @@ configs/
     ├── a2c/
     │   └── halfcheetah.yaml <- composed A2C HalfCheetah experiment
     ├── mfec/
-    │   ├── pong.yaml       <- MFEC on Pong (40M frames)
-    │   ├── breakout.yaml   <- MFEC on Breakout (1M frames)
-    │   ├── qbert.yaml      <- MFEC on Q*Bert (40M frames)
-    │   ├── mspacman.yaml   <- MFEC on Ms. Pac-Man (paper-faithful; 12.5M decisions = 50M frames)
-    │   ├── mspacman_vae.yaml <- same, with the paper-exact VAE encoder
-    │   └── mspacman_dinov2.yaml <- same, with a frozen DINOv2 ViT-S/14 as the encoder
+    │   ├── {rp_gray,rp_rgb,resnet,dinov2,clip,mae}.yaml <- MFEC encoder ablation (game-generic; game=<Game>)
+    │   ├── vae.yaml        <- paper-exact VAE encoder (not run for the thesis)
+    │   └── {pong,breakout,qbert,hero}.yaml <- per-game MFEC on DQN-style env stacks
     └── nec/
-        ├── pong.yaml       <- NEC on Pong (40M raw frames)
-        ├── hero.yaml       <- NEC on H.E.R.O. (40M raw frames; unclipped rewards)
+        ├── pong.yaml       <- NEC on Pong (400k raw frames)
+        ├── hero.yaml       <- NEC on H.E.R.O. (400k raw frames; unclipped rewards)
         ├── mspacman{,_dinov2,_clip,_mae,_resnet}.yaml  <- encoder ablation, Ms. Pac-Man (400k raw frames)
         ├── qbert{,_dinov2,_clip,_mae,_resnet}.yaml     <- encoder ablation, Q*bert (400k raw frames)
         ├── frostbite{,_dinov2,_clip,_mae,_resnet}.yaml <- encoder ablation, Frostbite (400k raw frames)
@@ -696,13 +694,12 @@ to get it, cheapest first:
 
 - **In W&B, no script:** group runs by `run.encoder` (or `run.group`) and plot
   the mean of the `eval/hns` summary — a grouped bar of mean HNS per encoder
-  across games and seeds. Enough for the talk.
+  across games and seeds.
 - **Publication-grade:** `scripts/aggregate_results.py` pulls the runs via the
   W&B API and emits mean/median/IQM HNS with 95 % stratified-bootstrap CIs
   (Agarwal et al. 2021), a LaTeX table, a per-encoder cost table, and optional
   learning-curve CSVs. It recomputes `eval/hns` from `eval/return_mean` for runs
-  that predate the metric, so **runs finished before this change need no
-  re-running**.
+  that did not log it.
 
   ```shell
   python scripts/aggregate_results.py --entity <you> --project <proj> --plot --curves
@@ -751,17 +748,13 @@ ALE as `frameskip` and *overrides* the `ALE/*-v5` registry default, so omitting
 it yields 1 emulator frame per decision rather than falling back to v5's 4.
 Keep `frame_skip: 4` in every Atari config.
 
-The remaining Atari MFEC experiments (`pong`, `breakout`, `qbert`) still use
-the DQN-style env configs and have **not** been given the same treatment; they
-pick up the corrected `gamma`/`eps` defaults from `mfec_atari.yaml` but still
-clip rewards, stack 4 frames and run with sticky actions.
+The per-game MFEC experiments (`pong`, `breakout`, `qbert`, `hero`) are not part
+of the thesis grid and use DQN-style env configs; they pick up the `gamma`/`eps`
+defaults from `mfec_atari.yaml` but clip rewards and stack 4 frames.
 
-**Evaluation is greedy: `algorithm.eval_eps: 0.0`, `trainer.num_eval_episodes: 1`.**
-This reverses an earlier default of ε = 0.005 (Blundell et al. §4.1), which was
-there so that `num_eval_episodes` produced more than one distinct sample — MFEC
-needs `repeat_action_probability=0.0`, so ALE is deterministic and a greedy
-rollout repeats itself. Measured cost of doing it that way, against one QEC
-(Ms. Pac-Man, 6 episodes each):
+**Evaluation is greedy: `algorithm.eval_eps: 0.0`, `trainer.num_eval_episodes: 5`.**
+Evaluating at the paper's ε = 0.005 (Blundell et al. §4.1) instead is costly.
+Measured against one QEC (Ms. Pac-Man, 6 episodes each):
 
 | `eval_eps` | returns | mean | min |
 |---|---|---|---|
@@ -774,8 +767,12 @@ leaves `eval/return_max` as the only honest statistic, and pins
 `eval/return_min` near the floor **permanently** — it becomes the worst of N
 ε-derailments rather than anything about the memory. Nothing is lost by
 evaluating greedily: the ε = 0.005 score the paper reports is the *collector's*,
-already logged as `train/episode_reward`. `eval/return_std == 0` is therefore
-now expected, not a symptom. See `AGENTS.md` for the full argument.
+already logged as `train/episode_reward`.
+
+Greedy evaluation is still not deterministic: `NoopResetEnv` draws 1–30 no-ops
+per reset, and on Ms. Pac-Man 7 of 8 resets give a different first observation
+(one fixed action sequence returns `[380, 170, 180, 340]`). That is why every
+MFEC experiment uses `num_eval_episodes: 5`.
 
 **Evaluation preprocesses observations on the training env's device.** With
 `trainer.num_envs > 1` the training envs live in `ParallelEnv` workers, which
@@ -828,7 +825,7 @@ episodes (action 0 for 499/500 states on an empty QEC, then action 1 once
 action 0 filled) and seeded the memory with degenerate single-action
 trajectories. Real Q-values are never perturbed, so a populated QEC evaluates
 deterministically. See "Optimistic init must be tie-broken RANDOMLY" in
-AGENTS.md.
+docs/DESIGN_NOTES.md.
 
 ## Choosing the game: the `game` variable
 
@@ -880,10 +877,8 @@ Two consequences worth knowing:
   `100_000`, 18 × 100k × 512 × 4 = 3.7 GB. Eviction cannot fire, by an exact
   rule rather than by headroom — capacity is pinned equal to `total_frames`, you
   cannot insert more than `total_frames` entries in total, and they spread over
-  `|A|` tables, so the per-action peak *falls* as `|A|` rises. (It was `150_000`
-  against a 1M-decision budget, sized off a measured ~72k peak on the busiest
-  action; the pin supersedes that.) Raise it in lockstep if you raise
-  `total_frames`.
+  `|A|` tables, so the per-action peak *falls* as `|A|` rises. Raise it in
+  lockstep if you raise `total_frames`.
 
 The default is `MsPacman`, and it is written as `${oc.select:game,MsPacman}`
 rather than `${game}` on purpose: `scripts/encoder_diagnostics.py` loads these
@@ -946,9 +941,9 @@ MFEC's state embedding is pluggable (`algorithm.encoder_name`):
 - `vae` — a frozen convolutional VAE (`src/models/conv_vae.py`), matching
   Blundell et al. 2016 ("Model-Free Episodic Control"), Appendix D exactly:
   a single 84×84 grayscale frame in, embedding = `mean ⊕ log-std` of a
-  32-dim latent (64 values total). Because the input is a single frame (not
-  this repo's usual 4-frame stack), it needs a "singleframe" environment
-  variant — see `experiment/mfec/vae.yaml`. Pretrain a checkpoint
+  32-dim latent (64 values total). The input is a single frame, which the
+  paper-faithful `atari_mfec_train.yaml` already provides — see
+  `experiment/mfec/vae.yaml`. Pretrain a checkpoint
   with `src/train_vae.py` (defaults: 1M random-policy frames, RMSProp,
   lr=1e-5, batch=100, 400,000 steps — also matching the paper), then run:
 
@@ -1111,10 +1106,9 @@ key stability, and it is not fixable by tuning:
 | `resnet` resnet18 | 512 | **0.000** | 0.991 | 0.690 |
 | `clip` ViT-B-32-quickgelu | 512 | **0.000** | 0.990 | 0.728 |
 
-(`mae` is not in this table because it was added after the measurement and has
-not been run on a GPU yet — run `--mae` on the training card before trusting it.
-Expect `key b/s = 0.000` for the same reason as the other float32 ViTs; that is
-documented, not a defect.)
+(`mae` is not in this table; `scripts/thesis_followups.sh` stage 1 measures it
+with `--mae` on the training GPU. Expect `key b/s = 0.000` for the same reason
+as the other float32 ViTs.)
 
 cuBLAS picks float32 GEMM kernels by batch size, so `φ(x)` in a 16-row batch
 differs from `φ(x)` alone in the last bits, and a key survives only if all `d`
@@ -1123,7 +1117,7 @@ coordinates escape rounding — probability `(1 − 2·drift·key_scale)^d`, i.e
 evaluation the exact-hash path is replaced by the near-exact rescue, which
 resolves to the same entry and returns the same value. Read
 `eval/memory_hit_rate`, not `eval/exact_hit_rate`, when comparing encoders.
-Details and the reason lowering `key_scale` is *not* the fix are in AGENTS.md.
+Details and the reason lowering `key_scale` is *not* the fix are in docs/DESIGN_NOTES.md.
 
 > **The rescue only holds at true FP32, and that is not the PyTorch default.**
 > `torch.backends.cudnn.allow_tf32` defaults to `True`, running every
@@ -1133,10 +1127,10 @@ Details and the reason lowering `key_scale` is *not* the fix are in AGENTS.md.
 > `mfec/resnet` Ms. Pac-Man run logged `eval/memory_hit_rate` **identically
 > 0.000** on every seed: both retrieval paths dead, every Q-estimate a
 > k-neighbour mean, `eval/return_mean` pinned at random play (~400) while
-> `train/episode_reward` passed 2000. `src/encoders/factory.py` now pins FP32
-> convolutions for every MFEC encoder before φ is built. The PVM arms are
-> correspondingly slower, and **checkpoints written before the change cannot be
-> resumed across it** — their QEC keys are from the TF32 regime. Note
+> `train/episode_reward` passed 2000. `src/encoders/factory.py` therefore pins
+> FP32 convolutions for every MFEC encoder before φ is built. The PVM arms are
+> correspondingly slower, and **a checkpoint written under TF32 cannot be
+> resumed under FP32** — its QEC keys are from the other regime. Note
 > `key b/s = 0.000` in the table above does *not* distinguish the safe drift
 > regime from the fatal one; only the L2 drift against the rescue budget does.
 
@@ -1202,7 +1196,7 @@ representation used as a nearest-neighbour memory key.
 | Frostbite | `frostbite_nec_{train,eval}` | 18 | 22 % | 0.41 |
 
 The three games are the intersection of "MFEC demonstrably works" (measured — see
-AGENTS.md, *Which games MFEC can work on at all*) and "in the Atari-100k 26", so
+docs/DESIGN_NOTES.md, *Which games MFEC can work on at all*) and "in the Atari-100k 26", so
 the same set also serves an MFEC comparison. All six `*_nec_*` env configs drop
 `SignTransform` (NEC does not clip rewards), drop `VecNorm`, disable v5 sticky
 actions, and cap episodes at the full 27,000 agent steps (30 min).
@@ -1216,27 +1210,19 @@ isolation**; a change that belongs to the comparison has to land in all fifteen
 — and in the twelve frozen RQ4 arms below, which are held to the same values.
 `tests/test_nec_ablation_parity.py` enforces that across all 27.
 
-Two of those were wrong until recently, and both are worth knowing about if you
-are reading older runs:
+Two of those are worth explaining:
 
-* **The exploration schedule did not follow the budget down.**
-  `annealing_frames: 50_000` and `init_random_frames: 12_500` were sized for a
-  1M-step run and survived the cut to 100k, where they became 50% and 12.5% of
-  it — **26.6% of every collected frame took a uniform random action**, and the
-  policy was only near-greedy for the second half of the run. Worse,
-  `nec/pong.yaml` and `nec/hero.yaml` carry no `algorithm:` block and inherited
-  `nec_atari.yaml`'s paper-scale defaults (`annealing_frames: 4_000_000`,
-  `init_random_frames: 50_000`), so ε reached only 0.975 by step 100k — those
-  two were essentially random-play runs. Both are now sized against the probe
-  budget; see AGENTS.md, *Shared probe budget*, for the arithmetic and the
-  measured random-policy episode lengths behind the floor.
-* **`num_envs` is not a free resource knob.** The ConvNet arms ran 16 against
-  the ViT arms' 8. NEC writes to the DND only at episode end, so frames left in
-  a trailing partial episode are never written — a loss proportional to
-  `num_envs` — and MFEC measured that 16 envs keep 39% fewer unique states than
-  4 at equal frames. The baseline was being handicapped against the encoders it
-  is compared to. All fifteen now run 8 (and `num_eval_episodes: 5`, which was
-  10 on the ConvNet arms and gave them a different standard error).
+* **The exploration schedule is sized against the budget.** At
+  `annealing_frames: 10_000` / `init_random_frames: 4_800` about 6 % of
+  collected frames are uniform random actions; schedules sized for a 1M-step
+  or paper-scale run would make most of a 100k run random play. See
+  `configs/algorithm/nec_atari.yaml` for the arithmetic and the measured
+  random-policy episode lengths behind the floor.
+* **`num_envs` is not a free resource knob.** NEC writes to the DND only at
+  episode end, so frames left in a trailing partial episode are never written —
+  a loss proportional to `num_envs` — and MFEC measured that 16 envs keep 39 %
+  fewer unique states than 4 at equal frames. Every arm therefore runs 8 (and
+  `num_eval_episodes: 5`, so every arm has the same standard error).
 
 ```shell
 # One arm:
@@ -1334,7 +1320,7 @@ rates (`DINOv2Embedding` uses it for its pretrained trunk). Modules without
 the attribute are unaffected.
 
 The contract is written up as `src.networks.NECEmbeddingNetwork` (a
-documentation `Protocol`); AGENTS.md § "Adding a new NEC embedding network"
+documentation `Protocol`); docs/DESIGN_NOTES.md § "Adding a new NEC embedding network"
 has the step-by-step, including how to persist extra checkpoint state via
 `_get_training_state` / `_load_training_state`.
 
@@ -1381,8 +1367,8 @@ Three things worth knowing before running it:
   14 that does not downsample an 84×84 frame). The default is 224 for parity
   with MFEC's frozen arm. Checkpoints are ~177 MB rather than a few MB.
 
-Unlike the MFEC DINOv2 arm — which needs the RGB `mspacman_mfec_*_dinov2`
-env pair because a frozen ViT cannot adapt channels — this keeps the standard
+Unlike the MFEC DINOv2 arm — which needs the RGB `atari_mfec_*_rgb` env pair
+because a frozen ViT cannot adapt channels — this keeps the standard
 4×84×84 NEC env, so the encoder is the only variable against
 `experiment=nec/mspacman` and NEC keeps the frame stack it gets velocity from.
 
@@ -1391,8 +1377,7 @@ Tested in `tests/test_nec_dinov2_finetune.py` against a stub backbone
 arrival at the backbone, checkpoint round-trip) and, opt-in via
 `NEC_DINOV2_REAL=1`, against the genuine ViT-S/14 (real state_dict loading,
 every documented `image_size`, gradients into the transformer blocks, NEC
-end-to-end). **What is not tested is whether it scores better than `nature`**
-— no full training run has been completed. That is the experiment.
+end-to-end). How it scores against `nature` is reported in the thesis.
 
 ### `clip_finetune` — a finetuned CLIP vision tower
 
@@ -1464,8 +1449,8 @@ interval.
 
 Tested in `tests/test_nec_clip_finetune.py` against a stub tower, opt-in via
 `NEC_CLIP_REAL=1` against the genuine `ViT-B-32-quickgelu`, and via
-`CLIP_WEIGHTS=` against the real OpenAI checkpoint. **Whether it beats
-`nature` or `dinov2_finetune` is untested** — that is the experiment.
+`CLIP_WEIGHTS=` against the real OpenAI checkpoint. How it scores against the
+other arms is reported in the thesis.
 
 ### `mae_finetune` — a finetuned MAE ViT
 
@@ -1553,8 +1538,8 @@ gradient arrival at the backbone, checkpoint round-trip) and, opt-in via
 `NEC_MAE_REAL=1`, against the genuine ViT-B/16 (real patch grid, batch
 independence, gradients into the transformer blocks, NEC end-to-end), plus a
 pretrained-weights tier (`MAE_WEIGHTS=` or `NEC_MAE_DOWNLOAD=1`) that pins the
-`pos_embed` resampling and the local-file path. **Whether it beats `nature`,
-`dinov2_finetune` or `clip_finetune` is untested** — that is the experiment.
+`pos_embed` resampling and the local-file path. How it scores against the
+other arms is reported in the thesis.
 
 ### `resnet_finetune` — a finetuned ImageNet ResNet
 
@@ -1621,8 +1606,7 @@ an untrained ResNet is cheap to build, so there is no stub to drift out of sync)
 Covers the BatchNorm mode invariant and the batch-independence it buys, the
 size guard, adapter init, param groups, finetuning through NEC's `step()`,
 gradient arrival at the trunk, and checkpoint round-trip including running
-statistics. **Whether it beats `nature`, `dinov2_finetune`, `clip_finetune` or
-`mae_finetune` is untested** — that is the experiment.
+statistics. How it scores against the other arms is reported in the thesis.
 
 ## Reading a NEC run
 
@@ -1638,7 +1622,7 @@ hit rate.
 | `eval/dnd_nn_dist` | Mean L2 to the nearest stored key. Embeddings are unit-norm so this is bounded by 2; drifting upward means stored keys go stale faster than `dnd_key_lr` refreshes them. |
 | `eval/dnd_optimistic_rate` | Fraction of *(state, action)* pairs still answered with the `+inf` sentinel. Above 0 late in a run means a starved action is capturing the argmax. |
 | `train/dnd_blend_rate` | **Not** expected near 0 on Atari. Duplicate frames (the opening freeze, the pause after each death) are 17.6 % of a Ms. Pac-Man rollout, and they blend legitimately. 0.1–0.5 is normal here. |
-| `train/updates` | Should equal `num_updates` (400 for action-repeat-4 Atari: one update per 16 raw frames, per paper §4). A lower flat line means the run was launched with an override and is under-trained per frame. |
+| `train/updates` | Gradient updates that actually ran in the batch. Should equal `num_updates` (400 in `nec_atari.yaml`, one update per 16 raw frames per paper §4; 100 in the ablation arms). Lower means updates were skipped (replay buffer below `batch_size`, or every sampled action's DND table still at/below `k`), e.g. right after a resume. |
 
 A gap where `eval/return_mean` is well below `train/episode_reward` **at the
 same `eval/episode_length`** is a scoring-rate gap, not a survival gap, and
@@ -1646,13 +1630,10 @@ points at the policy being evaluated rather than at the environment. The two
 Ms. Pac-Man env configs and `BaseTrainer.evaluate`'s rollout loop are verified
 byte-identical to a plain `env.rollout`.
 
-> **Retracted:** this used to add that `NoopResetEnv` alone produces exactly
-> zero return variance on this game, and therefore that a non-zero
-> `eval/return_std` proves evaluation ran with a real ε. It does not. The 1–30
-> no-op draw moves the start state — 7 of 8 resets give a different first
-> observation, and one fixed action sequence returns `[380, 170, 180, 340]` — so
-> eval returns vary with ε off. Read `eval/epsilon` instead. This is also why
-> every MFEC experiment now uses `num_eval_episodes: 5` rather than 1.
+> A non-zero `eval/return_std` does not prove evaluation ran with a real ε: the
+> 1–30 no-op draw of `NoopResetEnv` moves the start state (7 of 8 resets give a
+> different first observation), so eval returns vary with ε off. Read
+> `eval/epsilon` instead.
 
 ## Adding a new algorithm
 
@@ -1664,7 +1645,7 @@ byte-identical to a plain `env.rollout`.
 3. Add `configs/algorithm/my_algo.yaml` mirroring scalar defaults from `__init__`.
 4. Add `configs/experiment/my_algo/<env>.yaml` composing your algorithm + env.
 5. Add a smoke test in `tests/test_smoke.py`.
-6. Update `README.md` and `AGENTS.md`.
+6. Update `README.md` and `docs/DESIGN_NOTES.md`.
 
 ## Smoke test
 
@@ -1698,3 +1679,9 @@ torchrl SOTA reference at
 The interval estimates, performance profiles and probabilities of improvement in
 `analysis/make_rliable_figures.py` use [rliable](https://github.com/google-research/rliable)
 (Agarwal et al., NeurIPS 2021).
+
+## License
+
+MIT — see [`LICENSE`](LICENSE). The TorchRL Hydra template is © Raphael
+Schwinger; the episodic-control algorithms, encoders and thesis analysis are
+© Jan Ole Hansen.

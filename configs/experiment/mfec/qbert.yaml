@@ -20,7 +20,7 @@
 #
 #     python src/train.py experiment=mfec/rp_gray game=Qbert
 #
-# See "The encoder ablation" in AGENTS.md.
+# See "The encoder ablation" in docs/DESIGN_NOTES.md.
 # ============================================================================
 
 # MFEC on ALE/Qbert-v5 — same hyperparameters as the Pong run.

@@ -21,7 +21,7 @@
 #
 #     python src/train.py experiment=mfec/rp_gray game=Pong
 #
-# See "The encoder ablation" in AGENTS.md.
+# See "The encoder ablation" in docs/DESIGN_NOTES.md.
 # ============================================================================
 
 # MFEC on Atari Pong — mirrors the torchrl SOTA reference

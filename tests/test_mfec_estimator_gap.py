@@ -1,11 +1,9 @@
 """MFEC evaluates greedily, and reports the Eq. (2) estimator gap.
 
-Two related regressions are guarded here.
+Two related properties are guarded here.
 
-1. ``eval_eps`` defaults to 0.0.
-   It used to be the paper's 0.005, so that ``num_eval_episodes`` produced
-   more than one distinct sample on a deterministic ALE.  Measured cost of
-   that (Ms. Pac-Man, one QEC, 6 episodes each)::
+1. ``eval_eps`` defaults to 0.0, not the paper's 0.005.  Measured cost of
+   evaluating at 0.005 (Ms. Pac-Man, one QEC, 6 episodes each)::
 
        eval_eps=0.000   [1440, 1440, 1440, 1440, 1440, 1440]   mean 1440
        eval_eps=0.005   [ 490, 1440,  870,  550, 1440, 1440]   mean 1038

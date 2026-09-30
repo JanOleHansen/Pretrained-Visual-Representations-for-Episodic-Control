@@ -32,7 +32,7 @@ from ``encoder_state`` (which is what pins the random projection's matrix, so an
 RP arm is reconstructed exactly rather than re-drawn from its seed).  For NEC
 the fine-tuned ``embedding_net`` is rebuilt from the run's Hydra config and
 loaded from ``policy_state_dict``, then L2-normalised — NEC normalises at the
-DND boundary (nec.py:1295), so the un-normalised head output is not what the
+DND boundary (``NECAlgorithm._embed``), so the un-normalised head output is not what the
 memory is keyed on.
 
 Because the frozen MFEC encoders are identical across seeds and games, probe
@@ -81,7 +81,7 @@ _RUN_RE = re.compile(r"^(?P<algo>mfec|nec)_(?P<game>[A-Za-z]+)_"
 #: The two algorithms spell the game differently in ``run.name``.  MFEC's
 #: experiment configs set ``run.game: ${game}``, so they inherit the ALE id
 #: ("MsPacman"); NEC's name their env explicitly and set ``run.game: mspacman``
-#: (configs/experiment/nec/mspacman.yaml:30).  Both forms are directory names on
+#: (configs/experiment/nec/mspacman.yaml).  Both forms are directory names on
 #: the cluster, and the probe sets are keyed by the ALE id, so the token is
 #: normalised on the way in rather than special-cased at every use.
 GAME_CANON = {"mspacman": "MsPacman", "qbert": "Qbert", "frostbite": "Frostbite"}
@@ -115,12 +115,12 @@ def in_study(name: str) -> bool:
 
     Two different exclusions live here.  BankHeist and H.E.R.O. arms are not
     part of the thesis at all.  The ``*_frozen_*`` NEC runs *are* -- they are
-    the RQ4 control and the grid is complete as of 2026-09-11 -- but they are
+    the RQ4 control -- but they are
     excluded from the embedding extraction deliberately: the matched probe set
     is built from uniform-random frames, which is off distribution for any
     network trained on its own policy's states, and
-    Section~\\ref{sec:embedding-geometry} makes no claim from NEC for exactly
-    that reason.  Extracting them would cost an hour of ViT passes to produce
+    the thesis's embedding-geometry section makes no claim from NEC for
+    exactly that reason.  Extracting them would cost an hour of ViT passes to produce
     numbers the thesis does not use.  Drop the ``_frozen`` clause below if that
     changes.
     """
@@ -139,7 +139,7 @@ def read_memory(extra: dict) -> dict:
     """Flatten a serialised QEC/DND into (keys, values, action) arrays.
 
     Both memories emit one array per action with only the live slots filled
-    (``mfec.py:1474``, ``nec.py:1078``), so the per-action lists are simply
+    (``QEC.__getstate__``, ``DND.__getstate__``), so the per-action lists are simply
     concatenated and an action id carried alongside.  An action whose table is
     empty contributes nothing and is recorded in ``sizes`` as 0.
     """
@@ -214,7 +214,7 @@ def load_run_config(run_dir: Path):
 def build_mfec_encoder(cfg, encoder_state, obs_shape, device):
     """Rebuild MFEC's frozen φ and restore its saved state.
 
-    Mirrors ``MFECAlgorithm.setup`` (mfec.py:320): the algorithm object is
+    Mirrors ``MFECAlgorithm.setup``: the algorithm object is
     instantiated from the run's own config so every encoder keyword comes from
     one place, then ``make_encoder`` is called off its attributes.  Loading
     ``encoder_state`` afterwards is what makes a random-projection arm exact —
@@ -265,7 +265,8 @@ def build_nec_encoder(cfg, policy_state_dict, obs_shape, device):
     """Rebuild NEC's fine-tuned embedding network from this run's weights.
 
     ``F.normalize`` is applied because NEC does: the DND is read and written
-    through ``F.normalize(h, dim=-1)`` (nec.py:1295, :1800, :2158), so the raw
+    through ``F.normalize(h, dim=-1)`` (``DNDPolicy.forward``,
+    ``NECAlgorithm._embed``, ``NECAlgorithm._gradient_step``), so the raw
     head output is not the space the memory is keyed on and probing it would
     describe a geometry the algorithm never uses.
     """

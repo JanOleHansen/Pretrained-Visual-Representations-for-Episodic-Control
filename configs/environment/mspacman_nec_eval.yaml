@@ -37,8 +37,8 @@ transforms:
   - _target_: torchrl.envs.RewardSum
   - _target_: torchrl.envs.StepCounter
     # 27,000 decisions x 4 emulator frames = the standard 108,000-frame (30 min)
-    # ALE episode cap, matching the MFEC configs.  Was 4,500 (5 min), inherited
-    # from the DQN-style configs: that cuts a competent agent off mid-game and
-    # caps the return the DND can ever observe.  MFEC was fixed; NEC was not.
+    # ALE episode cap, matching the MFEC configs.  The DQN-style configs' 4,500
+    # (5 min) would cut a competent agent off mid-game and cap the return the
+    # DND can ever observe.
     max_steps: 27_000
   - _target_: torchrl.envs.DoubleToFloat

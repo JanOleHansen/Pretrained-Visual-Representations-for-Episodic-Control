@@ -147,8 +147,7 @@ def real_arch(monkeypatch):
 
     The original ``get_model`` must be captured *before* the patch is applied:
     calling ``tvm.get_model`` from inside the replacement re-enters the patched
-    function and recurses until the stack blows (which is what this fixture did
-    until it was caught — every test in this section errored out).
+    function and recurses until the stack overflows.
     """
     import torchvision.models as tvm
 

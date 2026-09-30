@@ -56,7 +56,7 @@ Usage
 -----
     python scripts/encoder_diagnostics.py                       # random projection only
     python scripts/encoder_diagnostics.py \
-        --dinov2-weights /datahome/rschwinger/models/dinov2_vits14_pretrain.pth
+        --dinov2-weights /path/to/dinov2_vits14_pretrain.pth
     python scripts/encoder_diagnostics.py --clip --resnet --mae  # every PVM arm
     python scripts/encoder_diagnostics.py --clip --device cuda  # key stability!
     python scripts/encoder_diagnostics.py --mae --mae-pooling cls  # pooling ablation
@@ -316,11 +316,8 @@ def build_encoders(args) -> list[tuple[str, object, str]]:
 
         out.append((label, enc, "atari_mfec_train_rgb"))
 
-    # NOTE: this block is deliberately at function scope, NOT nested inside the
-    # DINOv2 branch above.  Nesting it there (as it was until this was caught)
-    # made the ResNet arms unreachable without DINOv2 flags, and made its `else`
-    # bind to the *DINOv2* `if` — so a plain `--dinov2_weights` run fell into
-    # the ResNet constructor with the import skipped, i.e. a NameError.
+    # At function scope, not nested inside the DINOv2 branch above, so the
+    # ResNet arms are reachable without DINOv2 flags.
     if args.resnet or args.resnet_random_init:
         from src.encoders.resnet_encoder import ResNetEncoder
 
@@ -444,7 +441,7 @@ def main() -> int:
     p.add_argument("--dinov2-model", default="dinov2_vits14")
     p.add_argument("--dinov2-repo-dir", default=None)
     p.add_argument("--dinov2-image-size", type=int, default=224)
-    #resnet
+    # resnet
     p.add_argument("--resnet", action="store_true",
                    help="add an ImageNet-pretrained ResNet arm (torchvision "
                         "downloads the weights unless --resnet-weights is given)")
@@ -455,7 +452,7 @@ def main() -> int:
     p.add_argument("--resnet-model", default="resnet18",
                    help="any torchvision resnet: resnet18/34/50/101/152")
     p.add_argument("--resnet-image-size", type=int, default=224)
-    # clip -- needs the optional `open_clip_torch` package (uv add open_clip_torch)
+    # clip -- needs the optional `open_clip_torch` package (uv sync --extra clip)
     p.add_argument("--clip", action="store_true",
                    help="add a CLIP vision-tower arm (open_clip downloads the "
                         "weights unless --clip-weights is given)")

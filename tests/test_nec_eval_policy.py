@@ -114,8 +114,7 @@ def test_zero_eval_eps_restores_deterministic_argmax():
     on the finite-estimate path only: an empty or under-populated table answers
     ``+inf`` for every action, and ``DNDPolicy`` deliberately jitters those so
     the argmax does not collapse onto action 0 for a whole rollout.  Asserting
-    determinism on an EMPTY DND — which this test used to do — was asserting
-    exactly that collapse.
+    determinism on an EMPTY DND would assert exactly that collapse.
     """
     torch.manual_seed(0)
     assert len(_actions_under_mode(_make(0.0))) == 1
@@ -140,7 +139,7 @@ def test_eval_eps_is_constant_not_annealed():
 class _MockParallelEnv:
     """Mimics ParallelEnv(E, fn): the specs carry the env batch dim.
 
-    `_MockAtariEnv` above is unbatched, which is why it never caught this —
+    `_MockAtariEnv` above is unbatched, so it cannot exercise this case —
     `setup()` is handed the TRAINING env, and with num_envs>1 its action_spec
     has shape [E] while `BaseTrainer.evaluate()` builds a single env whose
     action is a scalar of shape [].

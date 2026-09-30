@@ -58,7 +58,7 @@ gym_kwargs:
 #
 # VecNorm is omitted for the usual MFEC reason: its running statistics make the
 # same raw frame embed differently at different timesteps, which drives
-# train/exact_hit_rate to 0.  See "VecNorm + MFEC incompatibility" in AGENTS.md.
+# train/exact_hit_rate to 0.  See "VecNorm + MFEC incompatibility" in docs/DESIGN_NOTES.md.
 #
 # NOTE — reward scale: with SignTransform gone, train/episode_reward is the
 # true game score and is directly comparable to eval/return_mean and to the

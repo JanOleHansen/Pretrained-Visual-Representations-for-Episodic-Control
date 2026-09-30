@@ -12,7 +12,7 @@
 # by `algorithm.encoder_name`, NEC's is trained jointly with the DND. This
 # config uses the default (`nature`), the network from the paper.
 #
-# Ms. Pac-Man has 9 actions, so the nec_atari defaults (dnd_capacity=5e5 per
+# Ms. Pac-Man has 9 actions, so the nec_atari defaults (dnd_capacity=5e4 per
 # action, k=50, embedding_dim=64, kernel_delta=1e-3, n_step=100, gamma=0.99)
 # apply without change.
 #
@@ -37,27 +37,23 @@ algorithm:
   # used 100, and the run that raised it to 400 plateaued at ~1000 by 270k steps
   # — worse, despite also getting the better eps_end.
   #
-  # CORRECTION to an earlier version of this comment: it claimed "4x the
-  # updates is 4x the encoder drift per collected frame". That is not what
-  # happens. Measured drift per collector batch, in units of the mean
-  # inter-state distance, under the settings in force at the time
-  # (lr=1e-4, alpha=0.99, eps=1e-8, max_grad_norm=10):
+  # More updates do NOT mean proportionally more encoder drift. Measured drift
+  # per collector batch, in units of the mean inter-state distance, under
+  # torch's RMSProp defaults (lr=1e-4, alpha=0.99, eps=1e-8, max_grad_norm=10):
   #
   #     num_updates:   25      50     100     200     400
   #     drift:       4.95x   4.93x   4.97x   5.07x   4.92x
   #
-  # Drift is FLAT — it saturates within ~25 updates, because the clip bound on
-  # 100% of updates and eps=1e-8 then moved every parameter by ~lr regardless
-  # of gradient size. Lowering num_updates never addressed staleness. The fix
-  # was the optimiser trio in nec_atari.yaml (lr=1e-5/0.9/0.01, no clipping),
-  # which takes drift to ~1.1-1.7x at every update count above.
+  # Drift is FLAT — it saturates within ~25 updates, because the clip binds on
+  # 100% of updates and eps=1e-8 then moves every parameter by ~lr regardless
+  # of gradient size. The optimiser trio in nec_atari.yaml (lr=1e-5/0.9/0.01,
+  # no clipping) takes drift to ~1.1-1.7x at every update count above.
   #
-  # This override is therefore kept on its two REAL justifications: the
-  # empirical run evidence above, and throughput — it cuts the dominant cost
-  # (num_updates x num_actions exact kNN scans per batch) by 4x. It remains a
-  # deliberate deviation from §4 and must be declared alongside any comparison
-  # to the paper's curves. Worth re-testing at 400 now that drift is fixed,
-  # since §4's rate is 400 and the two were previously confounded.
+  # This override rests on the empirical run evidence above and on throughput —
+  # it cuts the dominant cost (num_updates x num_actions exact kNN scans per
+  # batch) by 4x. It is a deliberate deviation from §4 and must be declared
+  # alongside any comparison to the paper's curves. The run evidence predates
+  # the optimiser change, so 400 is worth re-testing.
   num_updates: 100
 
   # Training exploration floor. The paper only says "ε-greedy ... with a low ε"
@@ -74,11 +70,8 @@ algorithm:
   # episodes has been written.
   #
   # BOTH VALUES ARE SIZED AGAINST trainer.total_frames BELOW and must move with
-  # it. They were 50_000 / 12_500, set when this file ran at total_frames:
-  # 1_000_000 (5% and 1.25% of the run). The 100k probe budget left them
-  # untouched, which made them 50% and 12.5%: ~26.6% of every collected frame
-  # was a uniform random action and the policy was only near-greedy for the
-  # second half of the run. At 10_000 / 4_800 that falls to ~6.2%.
+  # it. At 10_000 / 4_800 about 6.2% of collected frames are uniform random
+  # actions (50_000 / 12_500 would make that ~26.6% at this budget).
   #
   # The floor is set by when the DND becomes usable. Measured episode length
   # under a random policy on mspacman_nec_train: 498 agent steps (mean of 12).
@@ -86,7 +79,7 @@ algorithm:
   # first episode inside it and the 9 tables hold ~440 entries each — well past
   # k — before the first gradient step. 4_800 is also exactly 3 collector
   # batches at frames_per_batch: 1_600; torchrl rounds init_random_frames UP to
-  # a batch multiple, so the old 12_500 was silently 12_800.
+  # a batch multiple (e.g. 12_500 becomes 12_800).
   annealing_frames: 10_000
   init_random_frames: 4_800
 
@@ -110,7 +103,7 @@ trainer:
   #   2_500_000         10M frames      4142.8      (Table 3, directly comparable)
   #
   # 100_000 is the SHARED PROBE BUDGET held identical across every experiment in
-  # this repo (see AGENTS.md) — short enough to run the whole encoder grid, and
+  # this repo (see docs/DESIGN_NOTES.md) — short enough to run the whole encoder grid, and
   # far short of the paper's. Scores off this budget are NOT comparable to
   # Table 3; raise it to 2_500_000 for that.
   total_frames: 100_000
@@ -120,11 +113,9 @@ trainer:
   # PARALLEL ENVS — HELD IDENTICAL ACROSS ALL TWELVE ABLATION ARMS. This is the
   # canonical note; the other eleven point back here.
   #
-  # It was 16 here (and in nec/qbert.yaml and nec/frostbite.yaml) while the nine
-  # PVM arms ran 8, so the `nature` baseline was being compared against encoders
-  # that had collected their data under a different regime. num_envs is
-  # learning-relevant for episodic control, and the MFEC side measured how (see
-  # the canonical note in experiment/mfec/rp_gray.yaml):
+  # The `nature` baseline and the nine PVM arms must collect data under the same
+  # regime, because num_envs is learning-relevant for episodic control; the MFEC
+  # side measured how (see the canonical note in experiment/mfec/rp_gray.yaml):
   #
   #   * NEC and MFEC write to memory only at EPISODE END, so frames sitting in a
   #     trailing partial episode when the run stops are never written at all.
@@ -150,9 +141,8 @@ trainer:
   # NEC every 200.000 frames") is every 50_000 agent steps; shortened in
   # proportion to the 100k-step probe budget so a run still yields ten points.
   eval_every_n_steps: 10_000
-  # HELD IDENTICAL ACROSS ALL TWELVE ABLATION ARMS. Was 10 here while the nine
-  # PVM arms ran 5, which gave the baseline's eval/return_mean half the standard
-  # error of the arms it is plotted against. 5 rather than 10 because each eval
+  # HELD IDENTICAL ACROSS ALL TWELVE ABLATION ARMS, so every eval/return_mean
+  # carries the same standard error. 5 rather than 10 because each eval
   # episode is a full game (up to StepCounter's 27_000 steps) at batch 1, which
   # is the least amortised inference in the whole run.
   num_eval_episodes: 5

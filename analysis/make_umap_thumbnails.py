@@ -27,9 +27,10 @@ The frames
 The probe set itself (~1.7 GB per game) stays on the cluster; this script
 rebuilds it locally, which is sound only because the rollout is deterministic --
 fixed seed, fixed action stream, `repeat_action_probability=0`, seeded
-`NoopResetEnv`.  That is *verified rather than assumed*: `--verify` checks the
-regenerated reward, done, episode and return arrays against the
-`probe_labels_<game>.npz` that came back from the cluster with the embeddings.
+`NoopResetEnv`.  That is *verified rather than assumed*: by default (skip with
+`--no-verify`) the script checks the regenerated reward, done, episode and
+return arrays against the `probe_labels_<game>.npz` that came back from the
+cluster with the embeddings.
 If they disagree, the local frames are from a different rollout than the
 embeddings were computed on, the thumbnails would be mislabelled, and the
 script refuses to draw anything.
@@ -46,7 +47,7 @@ from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The shared run loader (make_figures.py) sits next to this script in
-# analysis/; "DECK" is kept as the name for where it lives.
+# analysis/; DECK is that directory.
 DECK = HERE
 sys.path.insert(0, DECK)
 import make_figures as mf                      # noqa: E402

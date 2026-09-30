@@ -1,16 +1,14 @@
 """Tests for NEC's pluggable, trainable embedding-network config group.
 
-NEC's φ was always a `Callable` kwarg on `NECAlgorithm.__init__`, but the
-concrete choice was baked into a nested YAML block inside
-`configs/algorithm/nec.yaml` / `nec_atari.yaml`. It is now a first-class
-Hydra config group (`configs/algorithm/embedding_network/`), so swapping is
+NEC's φ is a `Callable` kwarg on `NECAlgorithm.__init__`, selected through
+the Hydra config group `configs/algorithm/embedding_network/`, so swapping is
 `algorithm/embedding_network=<name>` on the CLI.
 
 This is the trainable counterpart to MFEC's frozen `Encoder` system
 (`src/encoders/`, covered by tests/test_mfec_encoder_refactor.py). The two
 contracts are deliberately separate: MFEC's φ must be bit-exact and never
 change (its QEC hash depends on it); NEC's φ is an `nn.Module` optimised
-end-to-end by Adam. The contract is documented as
+end-to-end by RMSProp. The contract is documented as
 `src.networks.NECEmbeddingNetwork`.
 
 Coverage:
@@ -197,7 +195,7 @@ def test_gradient_step_trains_the_embedding_network():
 
     This is the property that distinguishes NEC's embedding network from
     MFEC's frozen encoder. `DND.values` is deliberately NOT in the optimizer
-    (see the AGENTS.md "NEC -- DND values, blend-only" section), so if the
+    (see the docs/DESIGN_NOTES.md "NEC -- DND values, blend-only" section), so if the
     CNN were frozen too, nothing in NEC would learn at all and the smoke
     tests would still pass.
     """
@@ -254,10 +252,11 @@ def test_gradient_step_trains_the_embedding_network():
 
 
 def test_dnd_values_stay_out_of_the_optimizer():
-    """Guard for the documented deviation: only the embedding net is optimised.
+    """Only the embedding net is in the stateful optimiser.
 
-    See AGENTS.md "1. DND `values` tensor is a plain (non-grad) tensor" --
-    re-adding `dnd.values` to Adam is the change that previously drove stored
+    `dnd.values` is a plain (non-grad) tensor updated by stateless SGD in
+    `DND.apply_gradient`; putting it in RMSProp/Adam would let a newly inserted
+    slot inherit the evicted entry's optimiser moments, which drives stored
     Q-values negative.
     """
     alg = _make_minimal_nec(NatureEmbedding, OBS_SHAPE)

@@ -52,15 +52,12 @@ are truncated and wrong.  Those rows are flagged ``complete=False`` and every
 consumer drops them; they are kept in the file only so the frame indices stay
 aligned with the raw rollout.
 
-The behaviour policy is uniform-random by default.  That is a real limitation
-and it is stated rather than hidden: a random policy does not visit the states a
-trained agent visits, so this set measures the geometry of φ over the *reachable
-early-game distribution*, not over the on-policy one.  It buys the thing the
-checkpoint keys cannot give — an identical input set for every arm — and the two
-analyses are meant to be read together.  ``--policy checkpoint`` replays a
-trained agent's greedy policy from one MFEC checkpoint instead, which moves the
-distribution on-policy for *one reference arm* while keeping it identical across
-the encoders being compared.
+The behaviour policy is uniform-random.  That is a real limitation: a random
+policy does not visit the states a trained agent visits, so this set measures
+the geometry of φ over the *reachable early-game distribution*, not over the
+on-policy one.  It buys the thing the checkpoint keys cannot give — an
+identical input set for every arm — and the two analyses are meant to be read
+together.
 
 Usage
 -----

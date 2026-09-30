@@ -1,18 +1,15 @@
 """Gradients must reach the DND, not just the CNN (Pritzel et al. 2017, Fig. 2).
 
 Figure 2's caption is explicit: "Gradients flow through the entire
-architecture."  An earlier version of `nec.py` froze `DND.keys` and
-`DND.values` and trained only the embedding network, which meant a stored key
-was written once and never refreshed.  With `dnd_capacity=5e5` and ~178
-inserts per action per collector batch, an entry survived ~2800 batches —
-over a million gradient steps of CNN drift — while the kNN kept retrieving it
-as though it still lived in the current embedding space.
+architecture."  With a frozen DND a stored key would be written once and never
+refreshed, while the kNN keeps retrieving it as though it still lived in the
+current embedding space.
 
-`DND.apply_gradient` fixes that with a stateless sparse SGD step on the slots
-a minibatch actually retrieved.  These tests pin the four properties that
-make it correct, each of which is a bug if it regresses:
+`DND.apply_gradient` updates the stored keys and values with a stateless
+sparse SGD step on the slots a minibatch actually retrieved.  These tests pin
+the four properties that make it correct:
 
-1. keys AND values move (the fix does what it claims);
+1. keys AND values move;
 2. slots the minibatch did not touch stay bit-identical (no dense pass over
    the table, and no optimiser state silently decaying 5e5 entries per step);
 3. keys stay on the unit sphere (the kernel collapses otherwise —
@@ -145,7 +142,7 @@ def test_untouched_slots_are_bit_identical():
     would allocate a dense num_actions x capacity x d gradient), and using a
     stateful optimiser (whose momentum would decay every slot in the table on
     every step, and whose per-slot state goes stale when the ring buffer
-    overwrites a slot — the bug that previously drove stored values negative).
+    overwrites a slot, which drives stored values negative).
     """
     alg = _make_algorithm(key_lr=1e-2, value_lr=1e-3)
     keys_before = alg.dnd.keys.clone()

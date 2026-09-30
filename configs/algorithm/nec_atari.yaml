@@ -1,10 +1,9 @@
 # NEC on Atari — hyperparameters from Pritzel et al. (2017) §4.
 #
-# NOTE: this file used to cite "Table S1". There is no such table — the paper's
-# only appendix is "A. Scores on Atari Games" and every hyperparameter is prose
-# in §4. What §4 actually states is marked "(paper §4)" below; what it says it
-# SWEPT and never reported is marked "(swept, unreported)". Do not re-add paper
-# authority to the latter.
+# The paper has no hyperparameter table — its only appendix is "A. Scores on
+# Atari Games" and every hyperparameter is prose in §4. What §4 actually states
+# is marked "(paper §4)" below; what it says it SWEPT and never reported is
+# marked "(swept, unreported)".
 #
 # The paper's embedding network is "the same convolutional architecture as DQN"
 # (Mnih et al. 2015) with the Q-head replaced by a dense layer to the embedding
@@ -22,8 +21,7 @@ _target_: src.algorithms.nec.NECAlgorithm
 # 1×10⁵ replay buffer on CPU — "our replay buffer stores the only last 10^5
 # states" (paper §4).  Memory: one obs is 4×84×84 = 28,224 elements, i.e.
 # 28 KB as uint8 and 113 KB as the float32 ToTensorImage produces, so 10⁵
-# transitions is ~11.3 GB (not the ~44 GB an earlier version of this comment
-# claimed — it mistook the float32 per-frame size for the uint8 one).
+# transitions is ~11.3 GB.
 # LazyTensorStorage preallocates, so that RAM is committed up front.
 # Reduce max_size for memory-constrained hosts.
 replay_buffer:
@@ -48,17 +46,13 @@ embedding_dim: 64        # (swept, unreported) — §4 lists "dimensionality of
 # next to keys from the current one. The paper's own ratio is ~1.85 turnovers
 # (10M agent steps -> ~930k inserts/action against 5e5), and 50k reproduces that
 # at 1M steps. It also bounds the exact-kNN cost, which is linear in table size
-# and is the dominant throughput term (see AGENTS.md 5b).
+# and is the dominant throughput term (see docs/DESIGN_NOTES.md 5b).
 #
 # Raise it for longer runs: capacity ~= 0.093 * total_frames / 1.85.
 #
-# NOTE — this value is what makes eviction reachable at all (tables fill at
-# ~450k agent steps, vs ~4.5M at the paper's 5e5), so it is coupled to the
-# eviction POLICY. That policy was FIFO when this was first set to 50k, on a
-# rationale that only held while nothing was ever evicted; it is now LRU per
-# §3.3 (see AGENTS.md 4b). Do not lower this further without re-reading that
-# section — under LRU a small capacity is much safer, because what survives
-# is what the kNN actually retrieves.
+# This value makes eviction reachable (tables fill at ~450k agent steps, vs
+# ~4.5M at the paper's 5e5), so it is coupled to the eviction policy, which is
+# LRU per §3.3: what survives is what the kNN actually retrieves.
 dnd_capacity: 50_000
 k: 50                    # (paper §4) "we set the number of nearest neighbours
                          # p = 50 in all our experiments"
@@ -89,21 +83,21 @@ n_step: 100              # (paper §4) "for the N-step Q estimates we picked a
 #
 # THESE FOUR VALUES MOVE TOGETHER (lr, alpha, eps, max_grad_norm) — see below.
 #
-# They replace torch's defaults (1e-4 / 0.99 / 1e-8 + clip 10), under which the
-# DND was not usable as a memory. Measured encoder drift per collector batch,
-# in units of the mean distance between distinct states:
+# Under torch's defaults (1e-4 / 0.99 / 1e-8 + clip 10) the DND is not usable
+# as a memory. Measured encoder drift per collector batch, in units of the mean
+# distance between distinct states:
 #
-#     num_updates    old (1e-4/.99/1e-8/clip10)    this (1e-5/.90/.01)
+#     num_updates    torch default (1e-4/.99/1e-8/clip10)    this (1e-5/.90/.01)
 #        25                  4.95x                       1.13x
 #       100                  4.97x                       1.66x
 #       400                  4.92x                       1.07x
 #
 # ~5x the inter-state distance exceeds the diameter of the unit sphere the
 # embeddings live on, so keys written one batch pointed nowhere by the next.
-# That is what drove eval/dnd_top_weight toward 1/k, collapsed
-# train/dnd_blend_rate, and made train/q_loss rise rather than converge.
-# Note the old drift is FLAT in num_updates (it saturates within ~25 updates),
-# so lowering num_updates does not address it — only these settings do.
+# That drives eval/dnd_top_weight toward 1/k, collapses train/dnd_blend_rate,
+# and makes train/q_loss rise rather than converge. The default-settings drift
+# is FLAT in num_updates (it saturates within ~25 updates), so lowering
+# num_updates does not address it — only these settings do.
 lr: 1.0e-5
 rmsprop_alpha: 0.9
 rmsprop_eps: 0.01
@@ -111,12 +105,11 @@ gamma: 0.99              # (paper §4) "all algorithms were trained using
                          # discount rate γ = 0.99"
 batch_size: 32           # (paper §4) "with a minibatch of size 32"
 # Gradient clipping, DISABLED — neither the paper nor the reference clips.
-# At the previous threshold of 10 it bound on 100% of updates (median raw grad
-# norm ~1.7e3), making it the de-facto step size: every step became the same
-# magnitude regardless of gradient, which with rmsprop_eps=1e-8 moved every
-# parameter by ~lr every update. That is the mechanism behind the saturating
-# 4.9x drift above. It was only load-bearing because eps=1e-8 damps nothing
-# (removing both at once diverges: q_loss 1.5e3 -> 1.9e4 in three batches);
+# At a threshold of 10 it binds on 100% of updates (median raw grad norm
+# ~1.7e3), making it the de-facto step size: every step has the same magnitude,
+# which with rmsprop_eps=1e-8 moves every parameter by ~lr every update — the
+# mechanism behind the 4.9x drift above. With eps=1e-8 the clip is the only
+# stabiliser (removing it diverges: q_loss 1.5e3 -> 1.9e4 in three batches);
 # eps=0.01 damps the step on its own. Re-enable only with a matching eps.
 max_grad_norm: null
 
@@ -125,12 +118,10 @@ max_grad_norm: null
 #
 # ANNEALING_FRAMES IS SIZED FOR THE SHARED 100k PROBE BUDGET, not for the
 # paper's runs. It counts AGENT STEPS, like trainer.total_frames, so the two
-# are only meaningful relative to each other. This was 4_000_000 — sized for a
-# 10M-agent-step paper-scale run — while configs/train.yaml's shared probe
-# budget is total_frames: 100_000. At that pairing epsilon reaches only
-# 1 - 0.99 * 100e3/4e6 = 0.975 by the END of the run, i.e. the whole run is
-# uniform random play. Any experiment config that did not override it inherited
-# exactly that (nec/pong.yaml and nec/hero.yaml both did, until this was fixed).
+# are only meaningful relative to each other. A paper-scale 4_000_000 against
+# configs/train.yaml's shared probe budget of total_frames: 100_000 would leave
+# epsilon at 1 - 0.99 * 100e3/4e6 = 0.975 by the END of the run, i.e. the whole
+# run would be uniform random play.
 #
 # The binding constraint on the low side is that the anneal must outlast the
 # point where the DND becomes usable: NEC writes only at EPISODE END, and an
@@ -153,9 +144,8 @@ annealing_frames: 10_000
 
 # Evaluation exploration rate (get_policy()). NOT annealed, and deliberately
 # LARGER than the training floor. ALE is deterministic here
-# (repeat_action_probability=0.0) and NoopResetEnv does not perturb the opening,
-# so an episode of length L replays pure argmax with probability
-# (1 - eval_eps)^L: at 0.001 and L=600 that is 55% of episodes identical, which
+# (repeat_action_probability=0.0), and an episode of length L is pure argmax
+# with probability (1 - eval_eps)^L: at 0.001 and L=600 that is 55% of episodes identical, which
 # makes eval/return_min ~= eval/return_max and num_eval_episodes worthless.
 # 0.05 is the Mnih et al. (2015) evaluation rate, whose preprocessing Pritzel
 # et al. §4 adopt; the NEC paper states no evaluation epsilon of its own.
@@ -167,15 +157,14 @@ eval_eps: 0.05
 frames_per_batch: 1_600
 
 # ALSO SIZED FOR THE 100k PROBE BUDGET — read the annealing_frames note above
-# first; the two move together. This was 50_000, i.e. HALF of the shared budget
-# spent on a uniform random policy before the collector ever consults the DND.
+# first; the two move together. 50_000 would spend HALF of the shared budget on
+# a uniform random policy before the collector ever consults the DND.
 #
 # Two constraints fix the value:
 #
 #   * 4_800 = exactly 3 collector batches at frames_per_batch: 1_600. torchrl
 #     warns and rounds UP when init_random_frames is not a multiple of
-#     frames_per_batch (collectors/_single.py), so the previous 12_500 the
-#     experiment configs used was silently 12_800.
+#     frames_per_batch (collectors/_single.py), e.g. 12_500 becomes 12_800.
 #   * At num_envs: 8 that is 600 agent steps per env, which completes the first
 #     episode on every ablation game (Q*bert 314, Frostbite 371, Ms. Pac-Man
 #     498 — see the measured table above), so the DND is non-empty and past
@@ -184,7 +173,7 @@ frames_per_batch: 1_600
 #     annealing_frames is set to outlast them.
 #
 # The paper and the reference implementation have NO warm-up at all — both act
-# epsilon-greedily from step 0 (AGENTS.md, "Deviations that are not
+# epsilon-greedily from step 0 (docs/DESIGN_NOTES.md, "Deviations that are not
 # numerical"). This exists only to keep the optimistic-init argmax off an empty
 # table; it is not a paper-sanctioned knob and should not grow.
 init_random_frames: 4_800
@@ -194,7 +183,6 @@ max_frames_per_traj: -1
 # in the paper are raw ALE frames — fixed by its own remark that 40M frames
 # "corresponds to 185 hours of gameplay" (40e6 / 60fps = 185.2 h).  With
 # action-repeat 4: 1600 agent steps = 6400 raw frames, 6400 / 16 = 400.
-# This was 100 until review — that value assumed 1 agent step == 1 raw frame,
-# which is true for no Atari config in this repo, so pong/hero were doing 4x
-# too few gradient updates.
+# (100 would assume 1 agent step == 1 raw frame, which is true for no Atari
+# config in this repo.)
 num_updates: 400

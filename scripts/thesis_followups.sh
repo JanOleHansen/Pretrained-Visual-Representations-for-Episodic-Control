@@ -35,10 +35,9 @@ echo
 # ---------------------------------------------------------------------------
 # Stage 1 -- per-backbone key stability and near-exact tolerance.
 #
-# Thesis Section 7.3 ("Encoder-internal validity") concedes that the
-# 3e-5 relative tolerance was validated on 400 Ms. Pac-Man frames with
-# ResNet-18 and *assumed* to transfer to the three transformer arms.  This
-# stage measures it for every arm instead of assuming it.
+# The 3e-5 relative near-exact tolerance was validated on 400 Ms. Pac-Man
+# frames with ResNet-18 (thesis Section 7.3, "Encoder-internal validity").
+# This stage measures it for every arm.
 #
 # --device cuda is mandatory: the quantity at issue is whether phi returns
 # identical bits at different batch shapes on the training hardware, which is a
@@ -64,12 +63,9 @@ echo
 # ---------------------------------------------------------------------------
 # Stage 2 -- embeddings for the FROZEN NEC arms.
 #
-# Section 8.3 calls re-running the Section 6 geometry analysis on a frozen and
-# a fine-tuned checkpoint of the same backbone "the most direct continuation of
-# this thesis", and says the runs already exist and only the analysis is
-# missing.  That is true, but the frozen-NEC embeddings were never extracted --
-# embeddings/ currently holds mfec_* and fine-tuned nec_* only.  This stage
-# produces the missing half.
+# Extracts embeddings from the frozen-NEC checkpoints, so the Section 6
+# geometry analysis can be repeated on a frozen and a fine-tuned checkpoint of
+# the same backbone (thesis Section 8.3).
 #
 # If your frozen runs are named differently, fix the --only pattern; the script
 # prints what it matched before doing any work.

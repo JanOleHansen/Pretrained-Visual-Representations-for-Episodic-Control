@@ -1,10 +1,10 @@
 """Training entry point.
 
 Usage:
-    python src/train.py experiment=reinforce/cartpole
+    python src/train.py experiment=dqn/cartpole
     python src/train.py experiment=dqn/cartpole logger=[wandb,tensorboard]
-    python src/train.py experiment=dqn/atari_breakout trainer.accelerator=gpu trainer.devices=[0]
-    python src/train.py experiment=ppo/dmc_humanoid trainer.accelerator=gpu
+    python src/train.py experiment=mfec/pong trainer.accelerator=gpu trainer.devices=[0]
+    python src/train.py experiment=nec/mspacman trainer.accelerator=gpu
 """
 from __future__ import annotations
 

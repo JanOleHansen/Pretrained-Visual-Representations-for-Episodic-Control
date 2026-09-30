@@ -1,7 +1,7 @@
 [project]
 name = "torchrl-hydra-template"
 version = "0.1.0"
-description = "TorchRL + Hydra RL research template"
+description = "Pretrained visual representations as state encoders for Model-Free and Neural Episodic Control (bachelor thesis code, built on a TorchRL + Hydra template)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

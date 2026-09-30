@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """How much of an embedding of an Atari frame is the same for every frame?
 
-Replaces a footnote that quoted MAE at 0.66% and CLIP at 7.4% from two
-different measurement scripts reading two different configuration files.  That
-comparison was not admissible: the numbers were never produced under one
-pipeline, and re-measuring all six arms uniformly moves both the values and
-their ratio (11x -> 6x).  Everything here comes from ONE pass over the stored
-matched-set embeddings, so the arms are comparable to each other.
+Everything here comes from ONE pass over the stored matched-set embeddings,
+so the arms are measured under one pipeline and are comparable to each other.
+(Per-encoder figures quoted elsewhere, e.g. in the NEC embedding-network
+configs, come from different pipelines and are not comparable to these.)
 
 For each encoder, ``probe_emb`` in the run archive holds its embedding of the
 same 10,000 real Ms. Pac-Man frames.  Removing the component common to all of

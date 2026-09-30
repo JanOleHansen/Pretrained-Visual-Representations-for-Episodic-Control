@@ -28,10 +28,11 @@ Key ideas
 * **Dual DND updates**:
   (a) Online write after each episode: blend existing entries
       Q_i ← Q_i + α(Q^(N) − Q_i),  α = dnd_lr;
-      insert novel embeddings via a ring buffer (FIFO eviction of the
-      oldest entry; the paper specifies LRU — see deviations below).
+      insert novel embeddings, evicting the least-recently-retrieved entry
+      once a table is full (LRU, paper §3.3).
   (b) Gradient descent on a regression loss (predicted Q̂ vs. N-step target)
-      backpropagates through both the kernel-weighted combination and the CNN.
+      backpropagates through the kernel-weighted combination into the CNN
+      and the retrieved DND keys/values.
 
 Algorithm pseudocode (matches the paper)
 -----------------------------------------
@@ -53,16 +54,16 @@ At episode end:
         if h_t exact-matches a slot in DND[a_t]:
             DND[a_t][h_t] ← DND[a_t][h_t] + α(Q^(N)_t − DND[a_t][h_t])
         else:
-            insert (h_t, Q^(N)_t) into DND[a_t]  # ring-buffer, FIFO eviction
+            insert (h_t, Q^(N)_t) into DND[a_t]  # LRU eviction when full
         append (s_t, a_t, Q^(N)_t) to D
 
     For each gradient step:
         (s, a, target) ← sample D
         h ← φ(s)
         find k nearest keys in DND[a]   # no_grad
-        Q̂(s, a) ← Σ w_i(h) v_i / Σ w_i(h)  # v_i frozen; grad → φ via ∂w_i/∂h
-        ∇ θ = (Q̂ − target)²
-        update θ (embedding network only — DND values updated by blend rule)
+        Q̂(s, a) ← Σ w_i(h) v_i / Σ w_i(h)
+        L = (Q̂ − target)²
+        update φ (RMSProp) and the retrieved h_i, v_i (sparse SGD)
 
 Reference implementation deviations
 ------------------------------------
@@ -79,60 +80,39 @@ This implementation follows the paper on all three. In particular it does
 ``DND.keys`` and ``DND.values``, as paper Figure 2 requires ("Gradients flow
 through the entire architecture").
 
-An earlier version of this file froze both, because making them
-gradient-enabled Adam parameters conflicted with the ring-buffer's in-place
-overwrites — a newly inserted entry inherited Adam's stale per-slot momentum
-from whatever it evicted, which drove stored values negative. That is fixed
-by construction now: ``DND.apply_gradient`` does a **stateless sparse SGD**
-step on only the slots a minibatch retrieved (``dnd_key_lr`` /
-``dnd_value_lr``), so there is no per-slot optimiser state to go stale and
-untouched slots are left bit-identical. See that method for the two
-invariants it restores (unit-norm keys, exact-match hash validity).
-
-Why this matters more than it looks: stored keys were previously write-once
-and never refreshed, so with ``dnd_capacity`` = 5e5 and ~178 inserts per
-action per collector batch an entry survived ~2800 batches — over a million
-gradient steps of CNN drift — while the kNN kept retrieving it as though it
-still lived in the current embedding space.
+``DND.apply_gradient`` does a **stateless sparse SGD** step on only the slots
+a minibatch retrieved (``dnd_key_lr`` / ``dnd_value_lr``). A stateful
+optimiser would not work here: the ring buffer overwrites slots in place, so
+a newly inserted entry would inherit the per-slot moments of whatever it
+evicted. With stateless SGD there is no optimiser state to go stale and
+untouched slots stay bit-identical. See that method for the two invariants it
+restores (unit-norm keys, exact-match hash validity).
 
 Eviction is **LRU**, as paper §3.3 specifies: "We overwrite the item that has
 least recently shown up as a neighbour when we reach the memory's maximum
 capacity." ``DND._lru`` stamps every slot a kNN returns (and every slot
 written or blended), and ``_insert_novel`` evicts the coldest live slots.
+At ``dnd_capacity`` = 5e4 the tables fill after ~450k agent steps, so the
+eviction policy matters for every Atari run. FIFO would be a poor fit once
+the blend rule is live: a frequently re-encountered state occupies one slot
+whose *value* is refreshed but whose *insertion order* never is, so FIFO
+would discard the most-reused entries on a fixed timer.
 
-This was a plain FIFO ring buffer until the eviction regime became reachable.
-The justification for FIFO was explicitly conditional — "eviction policy has
-no effect at all until a table is full", which at ``dnd_capacity`` = 5e5 and
-~178 inserts per action per batch meant ~4.5M agent steps, beyond any run
-attempted. Cutting ``dnd_capacity`` to 5e4 for throughput voided that
-precondition: tables now fill at ~450k agent steps, and a 900k-step Ms.
-Pac-Man run spent half its life evicting under the wrong policy. The symptom
-was ``train/dnd_size`` flattening against capacity while ``train/q_loss``
-turned around and climbed (1.5e3 -> 8.5e3) even though ``train/q_values``
-had plateaued.
-
-FIFO is specifically wrong once the blend rule is live: a frequently
-re-encountered state occupies ONE slot whose *value* is refreshed by
-blending but whose *insertion order* never is, so FIFO discards precisely the
-best-estimated, most-reused entries on a fixed timer. LRU is what keeps
-them.
-
-One further caveat, caught in review:
+Caveat:
 
 4. The exact-match blend rule (a) above is **largely inert in practice**.
    ``write_batch`` blends only on a bit-level hash match of the quantised
-   64-d embedding, and the CNN takes ``num_updates`` Adam steps between
+   64-d embedding, and the CNN takes ``num_updates`` optimiser steps between
    successive ``step()`` calls, so a state re-encountered in a later batch
    essentially never re-hashes to its stored key. Blends therefore only
    happen between duplicate frames embedded within one ``step()`` call, and
-   the DND behaves close to an insert-only FIFO log. Making the blend rule
-   fire across batches would mean matching within a radius rather than
-   exactly, which is a design change, not a bug fix, and is deliberately NOT
-   done here.
+   the DND behaves close to an insert-only log. Making the blend rule fire
+   across batches would require matching within a radius rather than
+   exactly; that design change is intentionally not made here.
 
-   ``train/dnd_blend_rate`` measures the residual. An earlier version of this
-   note said "expect it near 0"; that is **wrong for Ms. Pac-Man** and reading
-   a healthy run as broken is the cost. Atari has long stretches of
+   ``train/dnd_blend_rate`` measures the residual. It is **not** near 0 on
+   Ms. Pac-Man, and a non-zero value does not indicate a broken run. Atari
+   has long stretches of
    bit-identical frames — the opening "ready" freeze and the pause after each
    death — and those duplicate observations produce duplicate embeddings
    *within* the same ``step()`` call, which is exactly the case the rule does
@@ -153,8 +133,8 @@ buffer of the last 10⁵ states, minibatch 32, one replay update per 16
 observed frames, γ = 0.99, action repeat 4, and no reward clipping.
 Explicitly **swept and never reported**: the SGD learning rate, the
 fast-update rate α (``dnd_lr``), the embedding dimensionality, and the
-ε-greedy exploration rate. Config comments must not claim paper authority
-for those four.
+ε-greedy exploration rate; the values used for those four in this repository
+are not taken from the paper.
 """
 
 from __future__ import annotations
@@ -217,7 +197,7 @@ def _topk_l2_unit(
 # ---------------------------------------------------------------------------
 
 class DND:
-    """Differentiable Neural Dictionary — fused GPU tensors, frozen values.
+    """Differentiable Neural Dictionary — fused GPU tensors, one table per action.
 
     Extends the QEC ring-buffer / exact-match-dict / chunked-kNN pattern from
     mfec.py with two NEC-specific changes:
@@ -279,11 +259,8 @@ class DND:
 
         self.keys: torch.Tensor | None = None  # (A, C, d) — lazy init, no grad
 
-        # Plain (no grad) tensor.  Values are updated only via the in-place
-        # blend rule Q_i ← Q_i + α(G - Q_i) and ring-buffer inserts.
-        # The gradient of the regression loss flows into the CNN embedding
-        # network through the distance term ‖h − h_i‖²; the stored Q-values
-        # act as frozen scalars in that computation.
+        # Plain (no grad) tensor.  Updated by inserts, the in-place blend rule
+        # Q_i ← Q_i + α(G - Q_i), and the sparse SGD step in apply_gradient().
         self.values = torch.zeros(num_actions, capacity, device=device)
 
         self._sizes      = [0] * num_actions
@@ -364,11 +341,8 @@ class DND:
             the memory going stale relative to the CNN.
         ``top_weight``
             mean share of the kernel mass carried by that nearest neighbour,
-            i.e. ``max_i w_i / Σ_i w_i``.  This is the number that separates
-            "the memory holds a bad policy" from "the memory is not being used
-            at all": at ``1/k`` = 0.02 the kernel is a flat average over all
-            ``k`` neighbours, every action of a state scores alike, and the
-            argmax is noise however full the tables are.
+            i.e. ``max_i w_i / Σ_i w_i`` (``1/k`` = 0.02 for a perfectly flat
+            kernel).  See ``NECAlgorithm.eval_metrics`` for how to read it.
         """
         if not self._lookup_queries:
             return {}
@@ -566,15 +540,13 @@ class DND:
         reassociation, not an approximation.
 
         It matters because the ``(A, b, n)`` matrix is by far the largest
-        allocation on this path (266 MB at A=9, b=74, n=1e5), and the previous
-        version walked it **four extra times**: ``2 - 2*sim`` into a fresh
-        tensor, then ``clamp_min_``, then ``sqrt_``, then ``masked_fill`` into
-        yet another 266 MB tensor.  Ranking on ``sim`` costs one in-place mask
-        instead, and the transcendental ``sqrt`` runs over ``(A, b, k)``
-        rather than ``(A, b, n)`` — a factor of ``n/k`` = 2000 fewer elements.
+        allocation on this path (266 MB at A=9, b=74, n=1e5).  Converting the
+        whole matrix to distances first would walk it four extra times
+        (``2 - 2*sim``, ``clamp_min_``, ``sqrt_``, ``masked_fill``).  Ranking on
+        ``sim`` costs one in-place mask instead, and the ``sqrt`` runs over
+        ``(A, b, k)`` rather than ``(A, b, n)`` — ``n/k`` = 2000 fewer elements.
 
-        Padding slots are masked to ``-inf`` similarity, which maps to ``+inf``
-        distance, exactly reproducing the ``masked_fill(+inf)`` it replaces.
+        Padding slots are masked to ``-inf`` similarity, i.e. ``+inf`` distance.
         """
         if not self.unit_norm_keys:
             cd = torch.cdist(q, keys).masked_fill_(~valid, float("inf"))
@@ -623,15 +595,9 @@ class DND:
         still cannot fit.  The ordering is the point: with queries outermost
         the inner loop runs exactly once for any realistic
         (num_actions, capacity), which skips the cat/topk/gather merge
-        entirely.
-
-        The previous capacity-outermost version ran that merge once per
-        capacity chunk, and its byte budget counted only the ``cdist``
-        output.  The merge materialises ``(A, B, k_eff + chunk)`` in float32
-        *and* int64, so the true peak was 3-4x the budget: for the
-        episode-end bootstrap on H.E.R.O. (A=18, B≈4400, capacity=5e5) that
-        was 591 iterations of ~2.0 GB each, on top of the 2.3 GB key table
-        already resident on the same device.
+        entirely.  (With capacity outermost, the merge — which materialises
+        ``(A, B, k_eff + chunk)`` in float32 *and* int64 — would run once per
+        capacity chunk at 3-4x the ``cdist`` budget.)
 
         Parameters
         ----------
@@ -858,35 +824,17 @@ class DND:
 
         Returns the number of slots re-hashed (``train/dnd_rehashed``).
 
-        This used to **delist** moved slots instead — drop them from
-        ``_key_to_slot`` and never put them back — on the stated grounds that
-        re-hashing "would cost a GPU->CPU sync per touched slot per update".
-        That objection applies to the per-update location, not to this one:
-        ``flush_moved_slots`` already runs once per collector batch and already
-        pays exactly one sync per action to materialise its slot list, so
-        re-hashing here costs one extra batched ``_make_keys`` over ~1e3 rows.
-
-        Delisting was quietly fatal. Measured on Ms. Pac-Man, ~1,200 slots were
-        delisted per batch against ~198,000 total entries over a 270k-step run —
-        i.e. **every entry the kNN ever retrieved left the exact-match dict
-        permanently**. Two consequences, both visible in the logs:
-
-        1. The blend rule ``Q_i <- Q_i + alpha(Q^(N) - Q_i)`` (paper §3.3,
-           Eq. 4) can only fire on a key that is still listed, so it decayed
-           toward never firing — ``train/dnd_blend_rate`` collapsing toward 0
-           over a run is exactly this. That rule is NEC's headline mechanism
-           (§1: "rapidly updated estimates of the value function"), so losing
-           it reduces the DND to an append-only log of stale returns.
-        2. A re-encounter of a delisted state INSERTS A DUPLICATE rather than
-           updating the existing entry, so capacity is spent on near-identical
-           keys whose values then disagree.
+        Re-hashing (rather than dropping moved slots from ``_key_to_slot``)
+        keeps every retrieved entry eligible for the blend rule
+        ``Q_i <- Q_i + alpha(Q^(N) - Q_i)`` (paper §3.3, Eq. 4) and prevents a
+        re-encountered state from being inserted as a duplicate.  The cost is
+        one batched ``_make_keys`` over the moved rows per collector batch.
 
         Collision handling: two moved keys can quantise to the same bytes. The
         mapping must stay bijective (``_insert_novel`` pops ``k_to_s[old_key]``
         when it overwrites a slot), so the later slot wins the key and the
         earlier one is dropped from ``_slot_to_key``. A slot with no key is
-        simply unblendable until overwritten, which is the old behaviour for
-        that one slot rather than for all of them.
+        unblendable until overwritten.
         """
         total = 0
         for a in range(self.num_actions):
@@ -929,7 +877,7 @@ class DND:
         """Write N-step return estimates into the DND for one action.
 
         Existing entries (exact hash match): blend with DND learning rate α.
-        Novel entries: insert via ring buffer (evict oldest on overflow).
+        Novel entries: insert, evicting the least-recently-used slot when full.
 
         Rows are processed with sequential semantics, so duplicate keys
         within one call behave like repeated writes in the paper: the first
@@ -1019,16 +967,7 @@ class DND:
         # Slot selection: append while the table has room, then evict by LRU.
         #
         # Paper §3.3: "We overwrite the item that has least recently shown up
-        # as a neighbour when we reach the memory's maximum capacity." This was
-        # a plain FIFO ring buffer until the eviction regime actually became
-        # reachable: the old justification for FIFO was that
-        # ``dnd_capacity`` = 5e5 never fills inside a run (~4.5M agent steps),
-        # which stopped being true when capacity was cut to 5e4 — tables now
-        # fill at ~450k steps, and FIFO then evicts on a fixed timer regardless
-        # of usefulness. That is precisely what LRU exists to prevent: with the
-        # blend rule live, a frequently re-encountered state occupies ONE slot
-        # that is refreshed in value but never in insertion order, so FIFO
-        # discards exactly the best-estimated, most-reused entries first.
+        # as a neighbour when we reach the memory's maximum capacity."
         # While the table is filling, slots [0, size) are live and the write
         # pointer equals the size — the invariant __setstate__ also relies on.
         size = self._sizes[action]
@@ -1067,7 +1006,7 @@ class DND:
 
         # Kept only for the fill phase (ptr == size) and for __getstate__'s
         # rotation check, which must see 0 once full: with LRU the slot order
-        # is no longer insertion order, so there is nothing to rotate.
+        # is not insertion order, so there is nothing to rotate.
         self._sizes[action]      = min(size + n, self.capacity)
         self._write_ptrs[action] = self._sizes[action] % self.capacity
 
@@ -1106,8 +1045,8 @@ class DND:
                 action_lru.append(np.array([], dtype=np.int64))
                 continue
             if sz == self.capacity and ptr != 0:
-                # Only reachable for checkpoints written by the pre-LRU FIFO
-                # code, which left ptr != 0 on a full table. _lru must be
+                # Only reachable for checkpoints written with FIFO eviction,
+                # which leaves ptr != 0 on a full table. _lru must be
                 # rolled by the SAME shift or recency would be reattached to
                 # the wrong slots.
                 k_t = torch.roll(self.keys[a],         -ptr, dims=0)[:sz]
@@ -1182,9 +1121,8 @@ class DND:
             self.num_actions, self.capacity, embedding_dim,
             dtype=torch.float32, device=dev,
         )
-        # A pre-LRU checkpoint has no "action_lru"; those entries then keep -1
-        # and are evicted first, which is the correct fallback — nothing is
-        # known about their recency, and FIFO order is not a usable proxy.
+        # A checkpoint without "action_lru" leaves those entries at -1, so they
+        # are evicted first: nothing is known about their recency.
         lru_np = d.get("action_lru") or [None] * self.num_actions
         for a, (k_np, v_np) in enumerate(zip(d["action_keys"], d["action_values"])):
             sz = self._sizes[a]
@@ -1226,12 +1164,11 @@ class DNDPolicy(nn.Module):
     cannot argmax over ``inf`` — **plus independent uniform jitter per
     (state, action)**.
 
-    The jitter is load-bearing, not cosmetic, and this is the same defect and
-    the same fix as ``MFECAlgorithm``'s ``QECPolicy`` (see
+    The jitter is required, and mirrors ``MFECAlgorithm``'s ``QECPolicy`` (see
     ``tests/test_mfec_optimistic_tiebreak.py``).  Mapping every ``+inf`` onto a
     single constant makes the under-populated actions **exact ties**, and
-    argmax resolves ties by *lowest index*.  Measured on a 9-action Ms.
-    Pac-Man spec, 500 states, before this fix:
+    argmax resolves ties by *lowest index*.  Without jitter, on a 9-action
+    Ms. Pac-Man spec with 500 states:
 
         empty DND                       action 0 for 500/500
         actions 0-3 above k, 4-8 below  action 4 for 500/500
@@ -1243,7 +1180,7 @@ class DNDPolicy(nn.Module):
     that window, but the exposure is worst on the game with the most
     tables to fill (Frostbite, 18 actions).
 
-    Constraints if you touch this:
+    Constraints:
 
     * **The jitter cannot be small.** ``q_values`` is float32 and the ULP at
       1e9 is 64.0, so ``uniform(0, 1)`` jitter rounds straight back to exactly
@@ -1254,9 +1191,8 @@ class DNDPolicy(nn.Module):
       above ``StepTrainer._OPTIMISTIC_Q_THRESHOLD`` = 1e8, so these values are
       still kept out of ``train/q_values``.
     * **Only the ``+inf`` path is perturbed.**  Finite estimates pass through
-      ``torch.where`` untouched, so a DND that has information about a state is
-      exactly as deterministic as before — the guarantee that matters for
-      evaluation.  The draw uses the global torch RNG, so seeded runs stay
+      ``torch.where`` untouched, so a DND that has information about a state
+      stays deterministic — the guarantee that matters for evaluation.  The draw uses the global torch RNG, so seeded runs stay
       reproducible.
     """
 
@@ -1434,12 +1370,13 @@ class NECAlgorithm(BaseAlgorithm):
       (``configs/algorithm/embedding_network/``), so it is swapped with
       ``algorithm/embedding_network=<name>`` rather than by editing nested
       YAML.  Unlike MFEC's frozen ``src.encoders.Encoder``, this network is
-      trained end-to-end — every parameter it returns goes into Adam below.
+      trained end-to-end — every parameter it returns goes into the optimiser below.
     * ``replay_buffer`` is a no-arg factory returning a ``ReplayBuffer``.
-    * The optimizer covers the CNN embedding network only.  DND values are
-      updated by the in-place blend rule, not by gradient descent.
-    * Per-env carry-over (the ``_carry`` list) started as
-      ``MFECAlgorithm.step()``'s, but NEC's is a **bounded sliding window**:
+    * The optimizer covers the CNN embedding network only.  DND keys/values
+      are updated by the blend rule and a separate stateless sparse SGD step
+      (see ``DND.apply_gradient``).
+    * Per-env carry-over (the ``_carry`` list) follows
+      ``MFECAlgorithm.step()``, but NEC's is a **bounded sliding window**:
       a step's N-step return needs only ``r_t..r_{t+n-1}`` and the bootstrap
       state ``s_{t+n}``, not the episode end, so only the last ``n_step`` raw
       frames are retained.  See ``step()``.
@@ -1492,13 +1429,13 @@ class NECAlgorithm(BaseAlgorithm):
         # These four values (lr, alpha, eps, max_grad_norm=None) move TOGETHER
         # and must not be changed one at a time — see max_grad_norm below.
         #
-        # They replace torch's defaults (1e-4 / 0.99 / 1e-8 + clip 10), which
-        # made the DND unusable as a memory. NEC's premise (§6) is that "keys
-        # stored in the DND remain relatively stable"; measured on this repo's
-        # encoder, they were not. Encoder drift per collector batch, in units
-        # of the mean distance between distinct states:
+        # torch's defaults (1e-4 / 0.99 / 1e-8 + clip 10) make the DND unusable
+        # as a memory. NEC's premise (§6) is that "keys stored in the DND remain
+        # relatively stable"; with those defaults they are not. Encoder drift
+        # per collector batch, in units of the mean distance between distinct
+        # states:
         #
-        #     num_updates      old (1e-4/.99/1e-8/clip10)   this (1e-5/.90/.01)
+        #     num_updates    torch default (1e-4/.99/1e-8/clip10)   this (1e-5/.90/.01)
         #        25                    4.95x                      1.13x
         #       100                    4.97x                      1.66x
         #       400                    4.92x                      1.07x
@@ -1508,14 +1445,12 @@ class NECAlgorithm(BaseAlgorithm):
         # on (two random 64-d unit vectors sit at 1.41; mean inter-state
         # distance here is ~0.28), so a key written last batch pointed
         # essentially nowhere by the next one — the kNN retrieved neighbours
-        # whose stored returns belonged to unrelated states. That is what made
-        # `eval/dnd_top_weight` decay toward 1/k (a flat average over all k
-        # neighbours), `train/dnd_blend_rate` collapse, and `train/q_loss`
-        # rise instead of converge.
+        # whose stored returns belonged to unrelated states: `eval/dnd_top_weight`
+        # decays toward 1/k, `train/dnd_blend_rate` collapses, and
+        # `train/q_loss` rises instead of converging.
         #
-        # Second, the old drift is FLAT in num_updates — it saturates within
-        # ~25 updates — so lowering num_updates does not fix it and never did.
-        # Only these settings do.
+        # Second, the default-settings drift is FLAT in num_updates — it
+        # saturates within ~25 updates — so lowering num_updates does not fix it.
         lr:            float = 1e-5,
         rmsprop_alpha: float = 0.9,
         rmsprop_eps:   float = 0.01,
@@ -1524,19 +1459,17 @@ class NECAlgorithm(BaseAlgorithm):
         # Gradient clipping, DISABLED — neither the paper nor the reference
         # clips.
         #
-        # It cannot be re-enabled on its own. At the previous threshold of 10
-        # it bound on **100% of updates** (median raw grad norm ~1.7e3), which
-        # made it the de-facto step size rather than a safety net: every step
-        # became the same magnitude regardless of the gradient, so RMSProp with
-        # eps=1e-8 moved every parameter by ~lr on every update. That is the
-        # mechanism behind the saturating 4.9x drift above.
+        # It cannot be re-enabled on its own. At a threshold of 10 it binds on
+        # **100% of updates** (median raw grad norm ~1.7e3), which makes it
+        # the de-facto step size rather than a safety net: every step has the
+        # same magnitude, so RMSProp with eps=1e-8 moves every parameter by
+        # ~lr on every update — the mechanism behind the 4.9x drift above.
         #
-        # Clipping was load-bearing only because eps=1e-8 damps nothing:
-        # removing the clip while keeping eps=1e-8 removes both stabilisers at
-        # once and the loss diverges (measured: train/q_loss 1.5e3 -> 1.9e4 in
-        # three batches). The reference's eps=0.01 damps the step on its own,
-        # which is why the two changes ship together. Set a float to re-enable,
-        # but only alongside a re-examination of rmsprop_eps.
+        # With eps=1e-8 the clip is the only stabiliser: removing it while
+        # keeping eps=1e-8 makes the loss diverge (train/q_loss 1.5e3 -> 1.9e4
+        # in three batches). The reference's eps=0.01 damps the step on its
+        # own, so the two settings go together. Set a float to re-enable, but
+        # only alongside a re-examination of rmsprop_eps.
         max_grad_norm: float | None = None,
         # --- Exploration ---------------------------------------------------
         eps_start:        float = 1.0,
@@ -1545,12 +1478,11 @@ class NECAlgorithm(BaseAlgorithm):
         # Exploration rate used by get_policy() (evaluation).  NOT the
         # annealed training floor — this has to be big enough to actually
         # decorrelate episodes.  With repeat_action_probability=0.0 the ALE is
-        # deterministic and NoopResetEnv does not perturb Ms. Pac-Man's
-        # opening, so an episode of length L is bit-identical to pure argmax
-        # with probability (1 - eval_eps)^L:
+        # deterministic, and an episode of length L is pure argmax with
+        # probability (1 - eval_eps)^L:
         #
         #     eval_eps   L=600   random actions/episode
-        #     0.001      54.9%     0.6      <- was this; eval/return_min ~= max
+        #     0.001      54.9%     0.6      <- eval/return_min ~= max
         #     0.005       4.9%     3.0
         #     0.05        0.0%    30.0      <- Mnih et al. 2015 eval protocol
         #
@@ -1646,10 +1578,7 @@ class NECAlgorithm(BaseAlgorithm):
         # "Action spec shape does not match the action shape" at the first
         # evaluate().  An unbatched spec is correct for both callers: it
         # expands to [8] under the collector and compares equal at eval.
-        #
-        # Identical to the fix MFEC needed (commit a33fee3). NEC hit it only
-        # once get_policy() gained an e-greedy tail — a bare QValueActor never
-        # checks the spec, so the latent mismatch was invisible.
+        # MFECAlgorithm.setup() does the same.
         action_spec_unbatched = action_spec
         for _ in range(len(env_bs)):
             action_spec_unbatched = action_spec_unbatched[0]
@@ -1678,8 +1607,8 @@ class NECAlgorithm(BaseAlgorithm):
 
         # `eval_eps` and `eps_end` are independent knobs that nothing couples,
         # and they live in different config files (nec_atari.yaml vs the
-        # per-experiment override), so they can silently drift apart across a
-        # pair of commits.  When they do, the run trains one policy and scores
+        # per-experiment override), so they can silently drift apart.  When
+        # they do, the run trains one policy and scores
         # a different one: eval/return_mean comes in well below
         # train/episode_reward at the SAME episode length, and eval/return_min
         # sticks at random-play level, while every learning curve looks
@@ -1714,8 +1643,7 @@ class NECAlgorithm(BaseAlgorithm):
         """RMSProp over the embedding network — and only the embedding network.
 
         RMSProp per paper §4: "We used the RMSProp algorithm for gradient
-        descent training."  (This was Adam until the paper was re-checked.)
-        The DND's own keys/values are NOT in here: they are updated by a
+        descent training."  The DND's own keys/values are NOT in here: they are updated by a
         stateless sparse SGD step in ``_gradient_step``, because a stateful
         optimiser's per-slot moments go stale when the ring buffer overwrites
         a slot.  See :meth:`DND.apply_gradient`.
@@ -1726,7 +1654,7 @@ class NECAlgorithm(BaseAlgorithm):
         adapter + head.  This is an opt-in extension of the
         ``NECEmbeddingNetwork`` contract: a plain ``nn.Module`` (such as
         ``NatureEmbedding``) has no such attribute and gets the flat
-        ``parameters()`` list, bit-for-bit as before.
+        ``parameters()`` list.
 
         Shared by ``setup()`` and ``_load_training_state()``, which rebuilds
         the optimizer before restoring its state — they must construct the
@@ -1763,9 +1691,8 @@ class NECAlgorithm(BaseAlgorithm):
 
         The L2 normalisation is a **deviation from the paper and from the
         reference implementation** — neither normalises, and the paper never
-        mentions it (§3.1/§3.2 describe ``h`` as a plain CNN output; earlier
-        revisions of this file miscited "paper §2" for it, which says nothing
-        of the kind).  It is kept on measured grounds, not textual ones:
+        mentions it (§3.1/§3.2 describe ``h`` as a plain CNN output).  It is
+        used on measured grounds:
         ``NatureEmbedding``'s unconstrained ``nn.Linear`` head emits vectors of
         norm ~0.16 at init, which puts the mean squared distance to the k=50
         neighbours at ~6.5e-4 — i.e. ``kernel_delta`` = 1e-3 is **155% of it**
@@ -1779,7 +1706,7 @@ class NECAlgorithm(BaseAlgorithm):
         at all.  ``tests/test_nec_kernel_scale.py`` guards the property and
         records the Pong run that stayed pinned at -21 without it.
 
-        The honest alternative would be to fix the embedding *scale* instead
+        The alternative would be to fix the embedding *scale* instead
         (a larger head init, or ``kernel_delta`` calibrated to the observed
         distance distribution), which is what the paper's numbers assume.
 
@@ -1869,10 +1796,8 @@ class NECAlgorithm(BaseAlgorithm):
         - Raw observations are stored (not embeddings) so the window can be
           re-embedded with the CURRENT network on each step() call.
         - Consequence: the bootstrap Q and the embedding for step t are taken
-          ~n_step steps after t rather than at episode end, so both are
-          fresher than before. Same formula, different (better-conditioned)
-          inputs — returns are NOT bit-identical to the pre-window code.
-          Guarded by ``tests/test_nec_sliding_window.py``.
+          ~n_step steps after t rather than at episode end.  Guarded by
+          ``tests/test_nec_sliding_window.py``.
         - N-step returns are computed per-episode via lfilter + DND bootstrap.
         - Episodes ended by TRUNCATION (``done`` without ``terminated``, e.g.
           a StepCounter cutoff) bootstrap their return tail from the DND at
@@ -2092,7 +2017,7 @@ class NECAlgorithm(BaseAlgorithm):
             q_vals.append(mean_q)
 
         # Gradient steps moved stored keys, so their exact-match hashes are
-        # stale.  Delist them once per batch rather than once per update — the
+        # stale.  Re-hash them once per batch rather than once per update — the
         # cost is proportional to DISTINCT slots touched, so batching collapses
         # num_updates passes into one.
         rehashed = self.dnd.flush_moved_slots()
@@ -2109,17 +2034,16 @@ class NECAlgorithm(BaseAlgorithm):
         return metrics
 
     def _gradient_step(self) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """One minibatch gradient update on the embedding network.
+        """One minibatch gradient update on the embedding network and the DND.
 
         Samples (obs, action, n_step_return) from the replay buffer, re-embeds
         observations with the *current* embedding network, computes the
-        kernel-weighted Q̂ via differentiable indexing into DND.values, and
-        minimises MSE(Q̂, n_step_return_target).
+        kernel-weighted Q̂ over the retrieved neighbours, and minimises
+        MSE(Q̂, n_step_return_target).
 
-        Gradients flow through the embedding network (CNN parameters) via the
-        distance term ‖h − h_i‖² where h = embedding_net(obs).  The stored
-        DND values Q_i are frozen constants here; they are updated separately
-        by the in-place blend rule in step().
+        Gradients flow into the embedding network via the distance term
+        ‖h − h_i‖² where h = embedding_net(obs), and into the retrieved keys
+        h_i and values Q_i, which are updated by :meth:`DND.apply_gradient`.
 
         Known weakness (inherent to the paper's design, not a bug here): every
         state sampled from the replay buffer was ALSO written into DND[a] at
@@ -2157,16 +2081,11 @@ class NECAlgorithm(BaseAlgorithm):
         # Unit-norm: a REPO DEVIATION, not the paper. See _embed().
         h = nn.functional.normalize(h, dim=-1)
 
-        # NOTE: this stays a per-action Python loop (unlike estimate_all,
-        # which batches across actions via dnd.knn_all_actions). Batching it
-        # the same way would mean broadcasting every row's query against
-        # EVERY action's table instead of just the table for its own action
-        # — an up-to-num_actions-fold increase in raw distance computations
-        # against tables that can hold up to dnd_capacity entries each. That
-        # FLOP blow-up is not just a constant-overhead cost (unlike the
-        # kernel-launch overhead estimate_all's batching removes), so it can
-        # easily cost more than the saved launches recover. Measured ~3.8x
-        # slower on CPU when tried; left as the per-action loop here.
+        # Per-action loop (unlike estimate_all, which batches across actions
+        # via dnd.knn_all_actions): batching here would broadcast every query
+        # against EVERY action's table instead of just its own — up to
+        # num_actions-fold more distance computations (measured ~3.8x slower
+        # on CPU).
         q_hat_parts:  list[torch.Tensor] = []
         target_parts: list[torch.Tensor] = []
         # (action, slot indices, neighbour-key leaf, neighbour-value leaf) per
@@ -2174,16 +2093,11 @@ class NECAlgorithm(BaseAlgorithm):
         # backward().  See the scatter block below.
         dnd_pending: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-        # Group the minibatch by action with ONE host sync.
-        #
-        # This used to be `mask = (actions == a); n_a = int(mask.sum())` inside
-        # the loop, i.e. one GPU->CPU synchronisation *per action per update* —
-        # 3,600 per collector batch at num_actions=9, num_updates=400. Each one
-        # drains the CUDA pipeline behind whatever is queued (a knn_action that
-        # reads the whole 64 MB key table, plus the CNN backward), so the CPU
-        # can never run ahead and the per-update cost collapses to pure
-        # round-trip latency. Same argsort/bincount/offsets idiom step() uses
-        # for write_batch.
+        # Group the minibatch by action with ONE host sync.  A per-action
+        # `int(mask.sum())` would sync once per action per update (3,600 per
+        # collector batch at num_actions=9, num_updates=400), draining the
+        # CUDA pipeline each time.  Same argsort/bincount/offsets idiom step()
+        # uses for write_batch.
         order   = torch.argsort(actions, stable=True)
         counts  = torch.bincount(actions, minlength=self._num_actions)
         offsets = torch.zeros(
@@ -2260,8 +2174,8 @@ class NECAlgorithm(BaseAlgorithm):
         # Plain SGD, deliberately: a stateful optimiser (Adam/RMSProp) keeps
         # per-slot momentum, and the ring buffer overwrites slots underneath
         # it, so a freshly inserted entry would inherit the moments of whatever
-        # it evicted.  That is the failure that made an earlier attempt drive
-        # stored values negative.  Stateless SGD has nothing to go stale, and
+        # it evicted (observed to drive stored values negative).  Stateless SGD
+        # has nothing to go stale, and
         # it leaves untouched slots bit-identical instead of decaying all
         # num_actions x capacity of them on every step.
         for a, indices, nk, nv in dnd_pending:
@@ -2317,11 +2231,10 @@ class NECAlgorithm(BaseAlgorithm):
            peaked, the neighbours are close. Train longer / tune the DND.
         2. **The memory is not being used.** Judge this from
            ``dnd_top_weight`` only against the calibration below — **not**
-           against ``1/k``. An earlier version of this docstring claimed that
-           ``top_weight`` near ``1/k`` (0.02 at the paper's k=50) meant the
-           kernel had degenerated to a flat mean; that is wrong, and acting on
-           it costs a wrong diagnosis. Measured on 6000 real Ms. Pac-Man
-           frames, predicting held-out discounted return-to-go:
+           against ``1/k``: ``top_weight`` near ``1/k`` (0.02 at the paper's
+           k=50) does **not** by itself mean the kernel has degenerated to a
+           flat mean. Measured on 6000 real Ms. Pac-Man frames, predicting
+           held-out discounted return-to-go:
 
                retriever                     Pearson r   top_weight
                NEC embedding (shipped)         +0.50       0.025

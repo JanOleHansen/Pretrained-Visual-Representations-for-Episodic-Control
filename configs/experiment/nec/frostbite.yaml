@@ -9,7 +9,7 @@
 #
 # Game choice: Frostbite is one of the five games of Blundell et al. §4.1, is
 # named explicitly in Pritzel et al. §4 as a game where NEC's lack of reward
-# clipping is what produces the result, and AGENTS.md ("Which games MFEC can
+# clipping is what produces the result, and docs/DESIGN_NOTES.md ("Which games MFEC can
 # work on at all") measures it at a 22% raw-frame repeat rate with
 # exact_hit_rate 0.41 — the intersection of "MFEC demonstrably works" and "in
 # the Atari-100k 26", together with Ms. Pac-Man and Q*bert.

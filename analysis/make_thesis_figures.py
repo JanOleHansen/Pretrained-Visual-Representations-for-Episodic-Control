@@ -23,7 +23,7 @@ from matplotlib.ticker import FuncFormatter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The shared run loader (make_figures.py) sits next to this script in
-# analysis/; "DECK" is kept as the name for where it lives.
+# analysis/; DECK is that directory.
 DECK = HERE
 sys.path.insert(0, DECK)
 import make_figures as mf          # noqa: E402  (path must be set first)
@@ -97,12 +97,8 @@ def agg(s, col, enc, game, transform=None):
 
 
 # ------------------------------------------------------------------ figures
-# LAYOUT: panels are stacked vertically, each spanning the full \textwidth,
-# rather than sitting side by side.  At 430pt a two-up panel is ~2.9in wide and
-# six encoder arms crowd into it; one panel per row doubles the horizontal
-# resolution, which is where the curves actually separate.  \textheight is
-# 556pt (7.7in), so a two-row stack must stay under ~5.8in to leave room for
-# the caption on the same page.
+# Sizing for full-width panels stacked vertically.  \textheight is 556pt
+# (7.7in), so a stack must leave room for the caption on the same page.
 PANEL_H = 2.45          # inch, per stacked panel
 
 
@@ -130,7 +126,7 @@ def fig_curves(cv, meta, algo, games, fname, title=None):
     # of that and the legend is drawn once for the figure.  The y-axes stay
     # independent -- the three games differ by a factor of four in return, so a
     # shared y would flatten Frostbite into the axis -- and sharex is dropped
-    # with them because each panel now carries its own visible x-axis.
+    # with them because each panel carries its own visible x-axis.
     fig, axes = plt.subplots(1, len(games), squeeze=False,
                              figsize=(TEXTWIDTH_IN, 2.15))
     for ax, gm in zip(axes[0], games):
@@ -148,8 +144,7 @@ def fig_curves(cv, meta, algo, games, fname, title=None):
         ax.annotate("random play", (ax.get_xlim()[0], rnd), fontsize=6.5,
                     va="bottom", ha="left", alpha=0.6)
         ax.set_title(glabel(gm), loc="left", fontweight="bold")
-        # No upper headroom any more: it existed to keep an in-panel legend off
-        # the fastest arm, and the legend now sits under the figure.
+        # No upper headroom: the legend sits under the figure.
         ax.set_xlabel("agent steps")
         ax.xaxis.set_major_formatter(FuncFormatter(_ksteps))
     axes[0][0].set_ylabel("evaluation return")
@@ -173,11 +168,8 @@ def _grouped_bars(ax, s, encs, games, col, transform=None, ylabel=None):
     """Grouped bars: one cluster per GAME, one colored bar per encoder.
 
     The games form the x axis and the encoders are the compared series, because
-    the comparison this thesis makes is between encoders *within* a game.  The
-    earlier arrangement (a cluster per encoder, games distinguished by grey
-    fill) put the quantity of interest across clusters and coded it only by
-    lightness, which also made the figure read as monochrome beside the colored
-    learning curves.  Encoders keep the same color vocabulary they carry in
+    the comparison this thesis makes is between encoders *within* a game.
+    Encoders keep the same color vocabulary they carry in
     every other figure, so an arm is the same color throughout the document.
 
     The encoder axis stays FIXED within a cluster: an arm absent from `s`
@@ -239,8 +231,7 @@ def fig_hns(meta, games, fname):
     top = max(ax.get_ylim()[1] for ax in axes[:, 0])
     axes[0, 0].set_ylim(0, top * 1.16)
     # The encoder key goes under the figure rather than inside the top panel:
-    # with the encoders now the bar series there are six entries, which no
-    # longer fit beside the bars without covering them.
+    # six entries do not fit beside the bars without covering them.
     _arm_legend(fig, encs, y=0.055)
     fig.tight_layout(h_pad=1.0, rect=(0, 0.07, 1, 1))
     fig.savefig(os.path.join(FIGDIR, fname))
@@ -263,7 +254,7 @@ def fig_retrieval(meta, games, fname):
     hit = "sum::eval/memory_hit_rate"
 
     # Side by side rather than stacked: the two panels answer one question in
-    # two steps and the stacked version cost most of a page.  The game key stays
+    # two steps, and stacking costs most of a page.  The game key stays
     # inside the bar panel; the encoder key moves under the figure, where it
     # serves both panels instead of being redrawn in the scatter.
     fig, axes = plt.subplots(1, 2, squeeze=False, figsize=(TEXTWIDTH_IN, 2.5))
@@ -271,8 +262,8 @@ def fig_retrieval(meta, games, fname):
     _grouped_bars(ax, s, encs, gms, hit, ylabel="memory hit rate")
     ax.set_title("Neighbor retrieval (MFEC)", loc="left", fontweight="bold")
     ax.set_ylim(0, ax.get_ylim()[1] * 1.22)
-    # No in-panel legend any more: with the encoders carrying the bar colors,
-    # the shared key under the figure already names them for both panels.
+    # No in-panel legend: the shared key under the figure names the encoders
+    # for both panels.
 
     ax = axes[0, 1]
     mk = {"MsPacman": "o", "Qbert": "s", "Frostbite": "^"}
@@ -501,7 +492,7 @@ def main():
     os.makedirs(FIGDIR, exist_ok=True)
     # Only this script's own outputs are cleared.  The rliable figures live in
     # the same directory but are produced by make_rliable_figures.py (separate
-    # venv), and a blanket fig_*.pdf wipe silently deleted them.
+    # venv), so a blanket fig_*.pdf wipe would delete them.
     OWNED = {"fig_mfec_curves", "fig_nec_curves", "fig_hns", "fig_retrieval",
              "fig_summary", "tab_results", "tab_cost"}
     for f in os.listdir(FIGDIR):

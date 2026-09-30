@@ -717,7 +717,7 @@ def test_checkpoint_roundtrip_preserves_weights_and_param_groups(stub_timm):
 
 
 def test_the_whole_module_state_lives_in_state_dict(stub_timm):
-    """AGENTS.md §3a step 5: nothing outside state_dict() needs checkpointing.
+    """docs/DESIGN_NOTES.md §3a step 5: nothing outside state_dict() needs checkpointing.
 
     A fresh module of the same construction, loaded with the saved
     state_dict(), must reproduce the original's output exactly.

@@ -50,7 +50,7 @@ gym_kwargs:
 #
 # VecNorm is omitted for the usual MFEC reason: running statistics make the same
 # raw frame embed differently at different timesteps, driving
-# train/exact_hit_rate to 0.  See "VecNorm + MFEC incompatibility" in AGENTS.md.
+# train/exact_hit_rate to 0.  See "VecNorm + MFEC incompatibility" in docs/DESIGN_NOTES.md.
 transforms:
   - _target_: torchrl.envs.NoopResetEnv
     noops: 30

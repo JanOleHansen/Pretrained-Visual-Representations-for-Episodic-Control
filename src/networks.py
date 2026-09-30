@@ -161,7 +161,7 @@ class NECEmbeddingNetwork(Protocol):
     runtime and factories need not inherit from it.  It exists so the
     contract has one place to live, referenced from
     ``NECAlgorithm.__init__``, ``configs/algorithm/embedding_network/*.yaml``
-    and AGENTS.md ("Adding a new NEC embedding network").
+    and docs/DESIGN_NOTES.md ("Adding a new NEC embedding network").
 
     A conforming factory is any callable
 
@@ -185,7 +185,7 @@ class NECEmbeddingNetwork(Protocol):
     2. **All parameters trainable by default** (``requires_grad=True``).
        Unlike MFEC's frozen ``Encoder`` protocol (``src/encoders/base.py``),
        this network is optimised end-to-end: ``setup()`` hands
-       ``embedding_net.parameters()` straight to Adam, so a frozen
+       ``embedding_net.parameters()`` to the optimiser, so a frozen
        parameter is silently a dead parameter.  A factory MAY expose an
        opt-in freeze kwarg (see ``DINOv2Embedding``'s ``freeze_backbone``),
        but it must default to *not* frozen, and it must leave at least one
@@ -201,7 +201,7 @@ class NECEmbeddingNetwork(Protocol):
     4. No state beyond ``state_dict()`` — ``NECAlgorithm._get_training_state``
        checkpoints the network with ``embedding_net.state_dict()`` only.  A
        factory needing more must extend ``_get_training_state`` /
-       ``_load_training_state`` (see AGENTS.md).
+       ``_load_training_state`` (see docs/DESIGN_NOTES.md).
 
     Optional extension
     ------------------
@@ -870,8 +870,8 @@ class CLIPEmbedding(nn.Module):
     In NEC a learned ``nn.Linear(512, embedding_dim)`` head sits between the
     CLIP embedding and the DND, and NEC normalises *that* output.  So the
     DND's metric is cosine distance in the **head's** space, not in CLIP's,
-    and no amount of normalisation here recovers the guarantee.  Do not
-    describe this arm as "cosine kNN in CLIP space" — it is not.
+    and no amount of normalisation here recovers the guarantee: this arm is
+    not a cosine kNN in CLIP space.
 
     What it does buy is worth having anyway: it fixes the head's input to the
     unit sphere.  A pretrained ViT-B-32 emits projected vectors of norm ~10.7

@@ -16,7 +16,7 @@ eval curve could never show variance.  Measured on Ms. Pac-Man with one QEC:
 
 (That measurement is about *this particular policy* re-converging, and was later
 over-read into "``NoopResetEnv`` cannot change the start state", which is false —
-see "``num_eval_episodes`` was 1 for a wrong reason" in AGENTS.md.  It does not
+see "``num_eval_episodes`` was 1 for a wrong reason" in docs/DESIGN_NOTES.md.  It does not
 affect what this file tests, which is that ``eval_eps`` reaches the eval rollout
 at all.)
 

@@ -18,7 +18,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The shared run loader (make_figures.py) sits next to this script in
-# analysis/; "DECK" is kept as the name for where it lives.
+# analysis/; DECK is that directory.
 DECK = HERE
 sys.path.insert(0, DECK)
 import make_figures as mf                                       # noqa: E402

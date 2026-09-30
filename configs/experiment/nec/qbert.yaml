@@ -7,7 +7,7 @@
 # setting below is held IDENTICAL across all twelve arms so that game and encoder
 # are the only variables — do not tune one arm in isolation.
 #
-# Game choice: AGENTS.md ("Which games MFEC can work on at all") measures Q*bert
+# Game choice: docs/DESIGN_NOTES.md ("Which games MFEC can work on at all") measures Q*bert
 # at a 13% raw-frame repeat rate and exact_hit_rate 0.60, the highest of the
 # three. MFEC is the binding constraint on game choice for a joint MFEC/NEC
 # study; NEC's kernel-weighted read degrades gracefully where MFEC collapses,

@@ -26,7 +26,7 @@ class ResNetEncoder(Encoder):
         self.model.fc = nn.Identity()                     # -> (B, d) after avgpool
         self.image_size = image_size
 
-        self.model.eval()                    # CRITICAL — see gotcha below
+        self.model.eval()                    # eval(): BatchNorm must use running stats, or φ depends on the batch
         for p in self.model.parameters():
             p.requires_grad_(False)
 

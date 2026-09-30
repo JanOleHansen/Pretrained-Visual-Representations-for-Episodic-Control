@@ -9,7 +9,7 @@ constant, which made those actions exact ties — and ``QValueActor``'s argmax
 resolves ties by lowest index.
 
 This is the same defect ``tests/test_mfec_optimistic_tiebreak.py`` pins for
-MFEC.  It was left in NEC deliberately for a while (AGENTS.md recorded it as a
+MFEC.  It was left in NEC deliberately for a while (docs/DESIGN_NOTES.md recorded it as a
 known latent defect, on the grounds that the failure had only been *confirmed*
 experimentally for MFEC).  Confirmed for NEC too, on a 9-action Ms. Pac-Man
 spec over 500 states:

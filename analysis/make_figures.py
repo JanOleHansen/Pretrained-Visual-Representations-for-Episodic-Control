@@ -18,35 +18,13 @@ from matplotlib.ticker import FuncFormatter
 ENTITY_PROJECT = "LatentLab/torchrl-hydra-template"
 
 # --- MFEC validity filter -------------------------------------------------
-# Commit d74cc77 ("enforce FP32 precision for convolutions", 2026-08-19 10:52
-# +0200) pinned cudnn.allow_tf32=False.  Before it, MFEC's bit-exact key lookup
-# ran on TF32 convolutions and the memory could be left unreadable for any arm
-# with a convolution in phi (a ViT's patch embedding is a Conv2d too).
-#
-# This used to be enforced by DATE -- drop every MFEC run created on or before
-# TF32_FIX, random projections exempt.  That rule was wrong and is retired.
-# A date is a proxy; the damage it proxies for is directly measurable, and the
-# comment below it always said so: the TF32 failure signature is a memory hit
-# rate of identically 0.000, because an unreadable memory never hits.
-#
-# Measured against the cache (2026-08-26, 90/90 finished MFEC runs):
-#   * no run anywhere has memory_hit_rate == 0; the range is 0.0172 .. 0.3627,
-#     so no surviving run carries the damage signature at all;
-#   * the date rule dropped exactly three runs -- Qbert/CLIP seeds 42, 43, 44 --
-#     whose hit rates are 0.362 / 0.221 / 0.333, at or ABOVE the post-fix mean
-#     of every encoder (clip 0.151, dinov2 0.175, mae 0.138, rp 0.160,
-#     resnet 0.173).  Seed 42 is the single highest hit rate in the cache.
-#   * they are also the three highest-scoring seeds in that cell, so dropping
-#     them biased CLIP/Qbert from 1365 down to 1225 mean return (-11.5%), and
-#     left CLIP with a ragged matrix -- which excluded it from every rliable
-#     figure, the bootstrap needing a complete seed x game matrix.
-# The genuinely damaged runs were already gone; the rule was deleting healthy
-# data from the one arm the thesis calls its strongest a-priori candidate.
-#
-# The rule below is the measured one, applied UNIFORMLY to every arm (no
-# encoder exemptions): a run is invalid iff its memory was never readable.
-# Section 5.1 of the thesis states this criterion and its effect.
-TF32_FIX = "2026-08-19T08:52:59Z"   # retained: reported, no longer filters
+# MFEC's bit-exact key lookup is unreadable when phi runs on TF32 convolutions
+# (see pin_fp32_conv_precision in src/encoders/factory.py).  The failure
+# signature is a memory hit rate of identically 0.000, because an unreadable
+# memory never hits.  A run is therefore invalid iff its memory was never
+# readable; the rule is applied uniformly to every arm, with no encoder
+# exemptions.  Section 5.1 of the thesis states this criterion and its effect.
+TF32_FIX = "2026-08-19T08:52:59Z"   # time FP32 was pinned; informational only
 HIT_RATE = "sum::eval/memory_hit_rate"
 QEC_SIZE = "sum::train/qec_size"
 
@@ -392,11 +370,6 @@ def fig_retrieval(cache, meta, fname):
     ax.set_ylabel("memory hit rate")
     ax.set_title("Neighbour retrieval")
     ax.legend(frameon=False, ncol=3, fontsize=7)
-    # (A "no retrieval" call-out used to sit under ResNet here.  It described
-    # the pre-TF32-fix runs, whose hit rate was identically 0.000 because the
-    # key lookup was reading a memory it could not address.  On the refit runs
-    # ResNet retrieves as well as any arm -- 0.19 / 0.29 / 0.04 by game -- so
-    # the label is now simply false.  Do not restore it.)
 
     # right: hit rate vs. score, one point per (encoder, game)
     ax = axes[0][1]
@@ -607,7 +580,7 @@ def main():
     # to a visible PLACEHOLDER box when the file is absent.
     # Only this script's own outputs are cleared.  The rliable figures live in
     # the same directory but are produced by make_rliable_figures.py (separate
-    # venv), and a blanket fig_*.pdf wipe silently deleted them.
+    # venv), so a blanket fig_*.pdf wipe would delete them.
     OWNED = {"fig_mfec_curves", "fig_nec_curves", "fig_hns", "fig_retrieval",
              "fig_cost_perf",
              "tab_results", "tab_cost"}

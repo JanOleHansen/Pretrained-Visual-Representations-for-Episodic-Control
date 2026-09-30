@@ -129,7 +129,7 @@ def _collect_frames(
             break
     collector.shutdown()
 
-    return torch.cat(chunks, dim=0)[:num_frames]    #keep uint8 cast per minibatch in _fit() to save RAM
+    return torch.cat(chunks, dim=0)[:num_frames]    # stays uint8; _fit() casts per minibatch to save RAM
 
 
 def _fit(vae, optimizer, frames: torch.Tensor, device: torch.device, cfg: DictConfig) -> None:

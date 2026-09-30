@@ -34,7 +34,7 @@ def env_worker_device(num_envs: int, device: str) -> str:
     bit-identical floats on CPU and CUDA, and for MFEC/NEC that difference is
     not cosmetic: the episodic memory is keyed on the embedding, so a few ULP
     of drift turns every lookup into a miss.  See "Eval must preprocess
-    observations on the training env's device" in AGENTS.md.
+    observations on the training env's device" in docs/DESIGN_NOTES.md.
     """
     return "cpu" if num_envs > 1 else device
 
@@ -65,8 +65,8 @@ def make_env(
             (e.g. ``"gymnasium"``); if ``None`` torchrl picks the default.
         seed: master seed for this env group. Each of the ``num_envs`` workers
             gets its own stream derived from it, so workers still explore
-            differently but do so reproducibly. ``None`` keeps the old
-            entropy-seeded behaviour.
+            differently but do so reproducibly. ``None`` leaves the workers
+            entropy-seeded.
 
     Seeding note
     ------------

@@ -64,7 +64,7 @@ accumulates in float64 precisely to avoid this; a ViT cannot.  Run
 
 **on the GPU you will train on** before trusting a run: the ``key b/s`` column
 must read 1.000.  See "Exact-match keys must be invariant to batch shape" in
-AGENTS.md.
+docs/DESIGN_NOTES.md.
 """
 from __future__ import annotations
 

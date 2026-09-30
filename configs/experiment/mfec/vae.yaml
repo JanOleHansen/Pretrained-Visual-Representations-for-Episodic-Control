@@ -7,12 +7,10 @@
 # Pretrain the VAE first with src/train_vae.py, then pass its checkpoint here.
 #
 # ENV: uses the paper-faithful mfec pair, NOT mspacman_train_singleframe.
-# That config was written back when the MFEC Atari stacks still used
-# CatFrames N=4 and a single-frame variant had to be carved out.  It no longer
-# does: atari_mfec_train.yaml is ALREADY a single 84x84 grayscale frame, so
-# the VAE's paper-exact input (x in R^7056, in_channels=1) is satisfied by it
-# directly.  Meanwhile mspacman_train_singleframe is derived from the DQN-style
-# stack and drags in three things that are wrong here:
+# atari_mfec_train.yaml is ALREADY a single 84x84 grayscale frame, so the
+# VAE's paper-exact input (x in R^7056, in_channels=1) is satisfied by it
+# directly.  mspacman_train_singleframe is derived from the DQN-style stack and
+# drags in three things that are wrong here:
 #   * SignTransform  — rewards clipped to {-1,0,+1}, so the QEC would store
 #     pellet counts while every other arm stores true game score.  MFEC argmaxes
 #     over raw Monte-Carlo returns, so this also flattens a ghost (200-1600) to
@@ -54,19 +52,16 @@ trainer:
   eval_every_n_steps: 10_000
   # 5, matching every NEC experiment and configs/train.yaml's default, so each
   # eval/return_mean in the study carries the same sample size and the same
-  # standard error (a per-arm N is the failure mode AGENTS.md records for the
-  # NEC `nature` baseline, which ran 10 against the PVM arms' 5).
+  # standard error.
   #
-  # This was 1, justified by "eval_eps=0.0 makes every eval episode identical
-  # on a deterministic ALE".  That premise is FALSE.  NoopResetEnv draws 1-30
-  # noops per reset and Ms. Pac-Man is not insensitive to them: measured on
+  # Greedy eval (eval_eps=0.0) is not deterministic: NoopResetEnv draws 1-30
+  # noops per reset and Ms. Pac-Man is not insensitive to them (measured on
   # atari_mfec_eval_rgb, 7 of 8 resets give a different first observation, and
-  # one fixed action sequence returns [380, 170, 180, 340].  So every eval
-  # point was a single sample from a real distribution -- which is why
-  # eval/return_{min,mean,max} logged as one identical, wildly swinging curve
-  # and why eval/return_std was never defined (BaseTrainer omits it at N=1).
+  # one fixed action sequence returns [380, 170, 180, 340]).  N=1 would be a
+  # single sample from a real distribution, with eval/return_std undefined
+  # (BaseTrainer omits it at N=1).
   #
-  # eval_eps stays 0.0: that argument is separate and still stands (see
-  # configs/algorithm/mfec_atari.yaml -- eps at eval understates the policy
-  # ~30% because MFEC cannot absorb one off-trajectory action).
+  # eval_eps is 0.0 for a separate reason (see configs/algorithm/mfec_atari.yaml
+  # -- eps at eval understates the policy ~30% because MFEC cannot absorb one
+  # off-trajectory action).
   num_eval_episodes: 5

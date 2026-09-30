@@ -143,13 +143,8 @@ class MFECAlgorithm(BaseAlgorithm):
 
     ``eval_eps`` must be 0
     ----------------------
-    ``eval_eps`` used to default to the paper's 0.005 so that
-    ``num_eval_episodes`` produced more than one distinct sample — the ALE is
-    deterministic here (``repeat_action_probability=0.0``) and ``NoopResetEnv``
-    was believed not to change Ms. Pac-Man's score, so a greedy rollout would be
-    the same episode every time.  The ``NoopResetEnv`` half of that is wrong
-    (see below), and the cure was worse than the disease regardless.  Measured
-    on one QEC (Ms. Pac-Man, 51 k frames, 6 episodes each):
+    Evaluating with the paper's ε = 0.005 badly understates an MFEC policy.
+    Measured on one QEC (Ms. Pac-Man, 51 k frames, 6 episodes each):
 
         eval_eps=0.000   [1440, 1440, 1440, 1440, 1440, 1440]  mean 1440
         eval_eps=0.005   [ 490, 1440,  870,  550, 1440, 1440]  mean 1038
@@ -164,34 +159,23 @@ class MFECAlgorithm(BaseAlgorithm):
     * ``eval/return_max`` is the only statistic that reports the real score;
     * ``eval/return_min`` is the worst of N ε-derailments — an extreme order
       statistic of a heavy left tail.  It sits near the floor *by
-      construction* and can never improve however good the memory gets, which
-      is exactly how it looks on a real 1 M-frame run (min pinned at ~200
-      while max climbed past 4000);
+      construction* and can never improve however good the memory gets (on a
+      1 M-frame run: min pinned at ~200 while max climbs past 4000);
     * ``eval/return_std`` measures ε-sensitivity, not policy variability.
 
-    So ``eval_eps`` stays 0.0.  Nothing is lost: the ε=0.005 score the paper
-    reports is what the *collector* already produces, and it is logged as
-    ``train/episode_reward``.
+    So ``eval_eps`` is 0.0.  The ε=0.005 score the paper reports is what the
+    *collector* already produces, and it is logged as ``train/episode_reward``.
 
-    ``num_eval_episodes`` is a separate question — and the old answer was wrong
-    -----------------------------------------------------------------------
-    This used to conclude "at ``eval_eps=0.0`` every eval episode is identical,
-    so set ``num_eval_episodes: 1``".  It is not identical.  ``NoopResetEnv``
+    ``num_eval_episodes``
+    ---------------------
+    Even at ``eval_eps=0.0`` eval episodes are not identical.  ``NoopResetEnv``
     draws 1–30 no-ops on every reset and Ms. Pac-Man does not absorb them:
     measured on ``atari_mfec_eval_rgb``, **7 of 8 resets produce a different
     first observation**, and one fixed action sequence returns
-    ``[380, 170, 180, 340]``.  A greedy policy is closed-loop and may re-converge
-    where an open-loop action stream cannot, but the start state genuinely
-    varies, so ``N = 1`` was a single sample from a real distribution rather
-    than the whole of a degenerate one.
-
-    That is what produced the reported symptom: ``eval/return_{min,mean,max}``
-    logged as one identical curve swinging several hundred points between
-    adjacent eval steps, with ``eval/return_std`` never defined (``evaluate``
-    omits it at ``n = 1``).  Every MFEC experiment now sets
-    ``num_eval_episodes: 5``, matching the NEC experiments and
-    ``configs/train.yaml``'s default so every ``eval/return_mean`` in the study
-    carries the same standard error.
+    ``[380, 170, 180, 340]``.  ``N = 1`` is therefore a single sample from a
+    real distribution.  Every MFEC experiment sets ``num_eval_episodes: 5``,
+    matching the NEC experiments and ``configs/train.yaml``'s default, so
+    every ``eval/return_mean`` in the study carries the same standard error.
     """
 
     def __init__(
@@ -402,11 +386,9 @@ class MFECAlgorithm(BaseAlgorithm):
         # `device=` is NOT optional here, and passing `spec` does not cover it:
         # EGreedyModule builds its `eps` buffer from the `device` kwarg alone
         # (torchrl exploration.py) and `forward` raises if `action.device` and
-        # `eps.device` disagree.  Omitting it left eps on CPU for both modules.
-        # Training hid the bug — Collector(device=...) calls `.to()` on the
-        # explore policy and moved `greedy_module.eps` as a side effect — but
-        # `_policy` never reaches the collector, so `eval_greedy_module` stayed
-        # on CPU and the first evaluate() on GPU died on a cuda action.
+        # `eps.device` disagree.  The collector's `.to()` would move the
+        # training module's eps, but `_policy` never reaches the collector, so
+        # without it `eval_greedy_module` would stay on CPU and fail on GPU.
         self.greedy_module = EGreedyModule(
             spec=action_spec_unbatched,
             eps_init=self.eps_start,
@@ -416,8 +398,8 @@ class MFECAlgorithm(BaseAlgorithm):
         )
 
         # Constant eps for evaluation — NOT annealed, never `.step()`ed.
-        # eval_eps=0.0 makes this a no-op (`rand() < 0` is never true), which
-        # restores the old pure-argmax behaviour.
+        # eval_eps=0.0 makes this a no-op (`rand() < 0` is never true), i.e.
+        # pure argmax.
         self.eval_greedy_module = _EvalEGreedyModule(
             spec=action_spec_unbatched,
             eps_init=self.eval_eps,
@@ -441,8 +423,8 @@ class MFECAlgorithm(BaseAlgorithm):
 
     #: Observation bytes per encoder forward pass.  Chunking exists to bound
     #: peak memory when embedding a whole collector batch of pixel frames.
-    #: It must NOT be sized by ``num_envs`` (as it was until this was caught in
-    #: review): with frames_per_batch=1024 and num_envs=4 that is 256 forward
+    #: It is not sized by ``num_envs``: with frames_per_batch=1024 and
+    #: num_envs=4 that would be 256 forward
     #: passes of batch size 4, which is free for a random-projection matmul but
     #: leaves a GPU almost idle for a ViT and pays 256x the launch overhead.
     #: 64 MB of raw observation is ~166 frames of (3, 210, 160) float32 or
@@ -476,10 +458,10 @@ class MFECAlgorithm(BaseAlgorithm):
         """Process one batch of collected transitions and update QEC memory.
 
         MFEC has no neural-network parameters to optimise.  The update is:
-          1. Compute discounted Monte Carlo returns per env (Bug 1 fix).
-          2. Buffer partial episodes across batch boundaries (Bug 2 fix).
+          1. Compute discounted Monte Carlo returns per env.
+          2. Buffer partial episodes across batch boundaries.
           3. Exact-match states (hash lookup, O(1)) → max-aggregate the stored value.
-          4. Novel states → insert into the ring buffer via add_batch().
+          4. Novel states → insert via add_batch() (LRU eviction when full).
 
         The collector batch from SyncDataCollector with ParallelEnv(E, fn) has
         batch_size = (E, T).  Computing returns on the flat (E*T,) representation
@@ -613,8 +595,8 @@ class MFECAlgorithm(BaseAlgorithm):
         # train/exact_hit_rate is deliberately *absent* here rather than 0.0.
         # A Ms. Pac-Man episode is ~600 decisions and frames_per_batch is 1024
         # over 4 envs, so most batches close no episode and make no QEC
-        # queries; reporting 0.0 for those made the logged series oscillate
-        # between 0 and the real rate and read like a broken memory.  Omitting
+        # queries; reporting 0.0 for those would make the logged series
+        # oscillate between 0 and the real rate.  Omitting
         # the key leaves a gap, matching _IntervalStats' convention in
         # StepTrainer ("a genuine gap instead of a fabricated point").
         if not collect_states:
@@ -897,18 +879,17 @@ class QECPolicy(nn.Module):
     cannot argmax over ``inf`` — **plus independent uniform jitter per
     (state, action)**.
 
-    The jitter is load-bearing, not cosmetic.  Mapping every ``+inf`` onto a
-    single constant makes all untried actions exact ties, and ``argmax``
-    resolves ties by *lowest index*: with an empty QEC the policy emitted
-    action 0 for essentially every state, then action 1 once action 0's buffer
-    passed ``k``, and so on.  The agent played one fixed action per episode,
-    cycling 0..A-1, and seeded the QEC with A degenerate single-action
-    trajectories whose max-returns then persist forever (Eq. 1 never
-    decreases).  Jitter makes the argmax uniform over the untried set instead.
+    The jitter is required.  Mapping every ``+inf`` onto a single constant
+    makes all untried actions exact ties, and ``argmax`` resolves ties by
+    *lowest index*: with an empty QEC the policy would emit action 0 for
+    essentially every state, then action 1 once action 0's buffer passed
+    ``k``, and so on, seeding the QEC with A degenerate single-action
+    trajectories whose max-returns persist forever (Eq. 1 never decreases).
+    Jitter makes the argmax uniform over the untried set instead.
 
     Finite estimates are never perturbed, so a QEC that has real information
-    about a state is exactly as deterministic as before — which is the
-    guarantee that matters for evaluation.  The jitter draws from the global
+    about a state stays deterministic — the guarantee that matters for
+    evaluation.  The jitter draws from the global
     torch RNG, so seeded runs stay reproducible.
     """
 
@@ -969,14 +950,13 @@ class QECPolicy(nn.Module):
         return q_values.squeeze(0) if q_values.shape[0] == 1 else q_values
 
 
-# _EvalEGreedyModule moved to src/algorithms/eval_policy.py so NEC can use it
-# too (it has the identical determinism problem).  Re-exported under the old
-# private name so existing imports — tests/test_mfec_eval_policy.py — keep working.
+# Shared with NEC via src/algorithms/eval_policy.py; the private alias is
+# imported by tests/test_mfec_eval_policy.py.
 _EvalEGreedyModule = EvalEGreedyModule
 
 
 class _SharedPolicy(TensorDictSequential):
-    #Returns self on deepcopy so a single EGreedyModule is shared with the collector.
+    # Returns self on deepcopy so a single EGreedyModule is shared with the collector.
 
     def __deepcopy__(self, memo):
         memo[id(self)] = self
@@ -1030,8 +1010,8 @@ class QEC:
     #: It has to be relative: the quantity compared is an L2 distance in
     #: embedding space, and that space is chosen by the encoder.  A 64-d random
     #: projection of an 84×84 frame has ``‖φ(o)‖ ≈ 2``; a frozen DINOv2 or
-    #: ResNet embedding is 10–50× that.  The absolute ``1e-5`` this replaces
-    #: was effectively zero for every encoder.
+    #: ResNet embedding is 10–50× that, so a fixed absolute threshold such as
+    #: ``1e-5`` would be effectively zero for every encoder.
     #:
     #: The value is squeezed between two measured quantities.  Over 2.25 M
     #: frame pairs from a random rollout on Ms. Pac-Man (random projection,
@@ -1041,7 +1021,7 @@ class QEC:
     #:   * embedding drift from 1e-6 of per-pixel float noise:  7.8e-6
     #:
     #: ``3e-5 · (1 + ‖q‖) ≈ 9e-5`` sits ~12x under the first and ~11x over the
-    #: second.  Erring low is deliberate: with the eval env now built on the
+    #: second.  Erring low is deliberate: with the eval env built on the
     #: training env's device (see ``env_worker_device``) the drift this absorbs
     #: should be zero, so this is defence in depth — and merging two distinct
     #: states is a silently wrong Q value, while missing a rescue only costs
@@ -1272,9 +1252,9 @@ class QEC:
             # `x^2 + y^2 - 2xy` shortcut once either side exceeds 25 rows (it
             # always does here), and that cancels catastrophically at short
             # range: measured 4.2e-4 for a pair whose true distance is 2.8e-6.
-            # Ranking survives the error, a near-zero threshold does not — the
-            # absolute `< 1e-5` this replaces was below cdist's own noise floor
-            # and so fired essentially at random.  Recomputing the single
+            # Ranking survives the error, a near-zero threshold does not (an
+            # absolute `< 1e-5` would sit below cdist's own noise floor and
+            # fire essentially at random).  Recomputing the single
             # winner's distance directly is exact and costs O(miss x d).
             top1_dist = torch.linalg.vector_norm(
                 miss_q - self.states[a, idx[:, 0]], dim=-1
@@ -1515,9 +1495,8 @@ class QEC:
         self.reset_lookup_stats()   # __init__ is bypassed on unpickle
         self._key_scale  = d.get("key_scale", 1e5)   # default for old checkpoints
         self._sizes      = list(d["_sizes"])
-        # Pre-LRU checkpoints carry a "_write_ptrs" key; it is ignored — those
-        # arrays were saved rotated into write order, which seeds the LRU queue
-        # with the old FIFO ordering.  Nothing else about them changes.
+        # A "_write_ptrs" key (FIFO-era checkpoints) is ignored: those arrays
+        # are stored in write order, which seeds the LRU queue in that order.
 
         dev = self.device
         self.values = torch.empty(self.num_actions, self.capacity, dtype=torch.float64, device=dev)

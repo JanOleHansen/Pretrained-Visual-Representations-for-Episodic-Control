@@ -8,10 +8,9 @@ table. Everything else (``eval/hns``, ``eval/value_return_corr``,
 ``sys/gpu_mem_peak_gb``, ``time/elapsed_min``) is already logged per run; this
 script only pools them.
 
-It is deliberately robust to runs produced *before* ``eval/hns`` existed: when a
-run has no ``eval/hns`` in its summary it recomputes one from the final
-``eval/return_mean`` and the game's baseline (``src/utils/atari_scores.py``), so
-your existing runs need no re-running.
+When a run has no ``eval/hns`` in its summary, one is recomputed from the
+final ``eval/return_mean`` and the game's baseline
+(``src/utils/atari_scores.py``).
 
 Confidence intervals use a **stratified bootstrap** (resample seeds within each
 game, per Agarwal et al. 2021, "Deep RL at the Edge of the Statistical
